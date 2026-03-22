@@ -1,7 +1,7 @@
 import { createSignal, createMemo } from "solid-js";
 import type {
   ModRow, ModListCard, ModrinthResult, AestheticGroup, FunctionalGroup,
-  IncompatibilityRule, DownloadProgressItem, LauncherUiError, AccountSummary,
+  IncompatibilityRule, LinkRule, DownloadProgressItem, LauncherUiError, AccountSummary,
 } from "./lib/types";
 import { LAUNCH_STAGES } from "./lib/types";
 export { LAUNCH_STAGES } from "./lib/types";
@@ -87,6 +87,10 @@ export const [localJarRuleName, setLocalJarRuleName]             = createSignal(
 export const [appLoading, setAppLoading]                         = createSignal(true);
 /** Maps Modrinth project slug → icon URL, populated lazily after editor load. */
 export const [modIcons, setModIcons]                             = createSignal<Map<string, string>>(new Map());
+export const [savedLinks, setSavedLinks]                         = createSignal<LinkRule[]>([]);
+export const [draftLinks, setDraftLinks]                         = createSignal<LinkRule[]>([]);
+export const [linkModalOpen, setLinkModalOpen]                   = createSignal(false);
+export const [linkModalModIds, setLinkModalModIds]               = createSignal<string[]>([]);
 
 // ── Computed / Memos ──────────────────────────────────────────────────────────
 
@@ -235,6 +239,28 @@ export const conflictPairsForId = createMemo(() => {
     }
   }
   return byId;
+});
+
+export const linksByModId = createMemo(() => {
+  const map = new Map<string, Array<{ partnerId: string; direction: 'mutual' | 'requires' | 'required-by' }>>();
+  const links = savedLinks();
+  const fromTo = new Set(links.map(l => `${l.fromId}|${l.toId}`));
+  for (const link of links) {
+    const reverse = fromTo.has(`${link.toId}|${link.fromId}`);
+    const fromList = map.get(link.fromId) ?? [];
+    if (!fromList.some(e => e.partnerId === link.toId)) {
+      fromList.push({ partnerId: link.toId, direction: reverse ? 'mutual' : 'requires' });
+      map.set(link.fromId, fromList);
+    }
+    if (!reverse) {
+      const toList = map.get(link.toId) ?? [];
+      if (!toList.some(e => e.partnerId === link.fromId)) {
+        toList.push({ partnerId: link.fromId, direction: 'required-by' });
+        map.set(link.toId, toList);
+      }
+    }
+  }
+  return map;
 });
 
 export const groupNameByBlockId = createMemo(() => {
@@ -559,6 +585,36 @@ export function openIncompatibilityEditor() {
   setDraftIncompatibilities(savedIncompatibilities().map(r => ({ ...r })));
   setIncompatibilityFocusId(selectedIds()[0]);
   setIncompatibilityModalOpen(true);
+}
+
+export function openLinkModal() {
+  const ids = selectedIds();
+  if (ids.length < 2) return;
+  setDraftLinks(savedLinks().map(l => ({ ...l })));
+  setLinkModalModIds([...ids]);
+  setLinkModalOpen(true);
+}
+
+export function toggleDraftLink(fromId: string, toId: string) {
+  setDraftLinks(cur => {
+    const hasLink = cur.some(l => l.fromId === fromId && l.toId === toId);
+    if (hasLink) {
+      return cur.filter(l => !(l.fromId === fromId && l.toId === toId));
+    }
+    return [...cur, { fromId, toId }];
+  });
+}
+
+export function saveDraftLinks() {
+  setSavedLinks(draftLinks().map(l => ({ ...l })));
+  setLinkModalOpen(false);
+}
+
+export function removeLink(fromId: string, toId: string) {
+  setSavedLinks(cur => cur.filter(l => !(
+    (l.fromId === fromId && l.toId === toId) ||
+    (l.fromId === toId && l.toId === fromId)
+  )));
 }
 
 export function setPairConflictEnabled(baseId: string, otherId: string, enabled: boolean) {

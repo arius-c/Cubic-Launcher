@@ -34,6 +34,9 @@ import {
   modRowsState, rowMap, priorityParadoxDetected,
   setPairConflictEnabled, setPairWinner,
   incompatibilityFocusId,
+  /* Links */
+  linkModalOpen, setLinkModalOpen, linkModalModIds,
+  draftLinks, setDraftLinks, saveDraftLinks,
   /* Rename rule */
   renameRuleModalOpen, setRenameRuleModalOpen,
   renameRuleDraft, setRenameRuleDraft,
@@ -445,6 +448,103 @@ export function FunctionalGroupModal() {
         <div class="flex justify-end gap-2 border-t border-border px-6 py-4">
           <button onClick={() => setFunctionalGroupModalOpen(false)} class="rounded-md bg-secondary px-4 py-2 text-sm text-secondary-foreground hover:bg-secondary/80">Cancel</button>
           <button onClick={createFunctionalGroup} disabled={!newFunctionalGroupName().trim()} class="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50">Create</button>
+        </div>
+      </Modal>
+    </Show>
+  );
+}
+
+// ── Link Modal ────────────────────────────────────────────────────────────────
+export function LinkModal() {
+  const pairs = () => {
+    const ids = linkModalModIds();
+    const result: Array<[string, string]> = [];
+    for (let i = 0; i < ids.length; i++) {
+      for (let j = i + 1; j < ids.length; j++) {
+        result.push([ids[i], ids[j]]);
+      }
+    }
+    return result;
+  };
+
+  const hasLink = (from: string, to: string) =>
+    draftLinks().some(l => l.fromId === from && l.toId === to);
+
+  const setDirection = (a: string, b: string, dir: 'a-to-b' | 'mutual' | 'b-to-a' | 'none') => {
+    setDraftLinks(cur => {
+      const without = cur.filter(l => !(
+        (l.fromId === a && l.toId === b) || (l.fromId === b && l.toId === a)
+      ));
+      if (dir === 'none') return without;
+      if (dir === 'a-to-b') return [...without, { fromId: a, toId: b }];
+      if (dir === 'b-to-a') return [...without, { fromId: b, toId: a }];
+      return [...without, { fromId: a, toId: b }, { fromId: b, toId: a }];
+    });
+  };
+
+  const currentDir = (a: string, b: string): 'a-to-b' | 'mutual' | 'b-to-a' | 'none' => {
+    const ab = hasLink(a, b);
+    const ba = hasLink(b, a);
+    if (ab && ba) return 'mutual';
+    if (ab) return 'a-to-b';
+    if (ba) return 'b-to-a';
+    return 'none';
+  };
+
+  const toggleDir = (a: string, b: string, target: 'a-to-b' | 'mutual' | 'b-to-a') => {
+    const cur = currentDir(a, b);
+    setDirection(a, b, cur === target ? 'none' : target);
+  };
+
+  const dirBtnClass = (active: boolean) =>
+    active
+      ? "bg-primary/20 text-primary ring-1 ring-primary/30"
+      : "text-muted-foreground hover:bg-muted";
+
+  return (
+    <Show when={linkModalOpen()}>
+      <Modal onClose={() => setLinkModalOpen(false)}>
+        <ModalHeader title="Link Mods" description="Define dependency relationships between selected mods." onClose={() => setLinkModalOpen(false)} />
+        <div class="flex-1 overflow-y-auto p-6 space-y-3">
+          <For each={pairs()}>
+            {([a, b]) => {
+              const nameA = () => rowMap().get(a)?.name ?? a;
+              const nameB = () => rowMap().get(b)?.name ?? b;
+              return (
+                <div class="flex items-center gap-3 rounded-md border border-border bg-background p-3">
+                  <span class="min-w-0 flex-1 truncate text-sm font-medium text-foreground text-right">{nameA()}</span>
+                  <div class="flex shrink-0 items-center gap-1">
+                    <button
+                      onClick={() => toggleDir(a, b, 'a-to-b')}
+                      class={`rounded-md px-2 py-1 text-xs font-medium transition-colors ${dirBtnClass(currentDir(a, b) === 'a-to-b')}`}
+                      title={`${nameA()} requires ${nameB()}`}
+                    >
+                      &rarr;
+                    </button>
+                    <button
+                      onClick={() => toggleDir(a, b, 'mutual')}
+                      class={`rounded-md px-2 py-1 text-xs font-medium transition-colors ${dirBtnClass(currentDir(a, b) === 'mutual')}`}
+                      title={`${nameA()} and ${nameB()} require each other`}
+                    >
+                      &harr;
+                    </button>
+                    <button
+                      onClick={() => toggleDir(a, b, 'b-to-a')}
+                      class={`rounded-md px-2 py-1 text-xs font-medium transition-colors ${dirBtnClass(currentDir(a, b) === 'b-to-a')}`}
+                      title={`${nameB()} requires ${nameA()}`}
+                    >
+                      &larr;
+                    </button>
+                  </div>
+                  <span class="min-w-0 flex-1 truncate text-sm font-medium text-foreground">{nameB()}</span>
+                </div>
+              );
+            }}
+          </For>
+        </div>
+        <div class="flex justify-end gap-2 border-t border-border px-6 py-4">
+          <button onClick={() => setLinkModalOpen(false)} class="rounded-md bg-secondary px-4 py-2 text-sm text-secondary-foreground hover:bg-secondary/80">Cancel</button>
+          <button onClick={saveDraftLinks} class="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90">Save</button>
         </div>
       </Modal>
     </Show>

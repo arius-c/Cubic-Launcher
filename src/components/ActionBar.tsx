@@ -4,7 +4,7 @@ import {
   selectedCount, createAestheticGroup as createGroup, openIncompatibilityEditor,
   selectedTopLevelId, openAlternativesPanel, setFunctionalGroupModalOpen,
   functionalGroups, tagFilter, setTagFilter, toggleTagFilter, sortOrder, setSortOrder,
-  functionalGroupTagClass,
+  functionalGroupTagClass, openLinkModal,
 } from "../store";
 import { MaterialIcon, XIcon } from "./icons";
 
@@ -42,6 +42,15 @@ export function ActionBar(props: ActionBarProps) {
           >
             <MaterialIcon name="folder_special" size="md" />
             Add Tag
+          </button>
+          <button
+            onClick={openLinkModal}
+            disabled={selectedCount() < 2}
+            class="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-primary hover:text-white hover:bg-primary/40 rounded-lg border border-primary/30 transition-colors duration-75 disabled:opacity-50 disabled:cursor-not-allowed"
+            title={selectedCount() >= 2 ? "Link selected mods" : "Select 2 or more mods to link"}
+          >
+            <MaterialIcon name="link" size="md" />
+            Link
           </button>
           <button
             onClick={openIncompatibilityEditor}

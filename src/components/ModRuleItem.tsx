@@ -8,9 +8,11 @@ import {
   removeFunctionalGroupMember, tagFilter, functionalGroups, sortOrder, tagFilterForcedExpanded,
   toggleGroupCollapsed, removeAestheticGroup,
   editingGroupId, groupNameDraft, setGroupNameDraft, startGroupRename, commitGroupRename,
+  linksByModId, removeLink,
 } from "../store";
 import {
   ChevronRightIcon, ChevronDownIcon, AlertTriangleIcon, PackageIcon, XIcon, FolderOpenIcon,
+  MaterialIcon,
 } from "./icons";
 
 interface ModRuleItemProps {
@@ -336,54 +338,55 @@ export function ModRuleItem(props: ModRuleItemProps) {
     }
 
     // ── Pre-compute new state ─────────────────────────────────────────
+    // Always use interleaved ordering: walk the original alternatives array,
+    // emitting each group's (updated) blockIds on first encounter and ungrouped
+    // alts in their (updated) positions.  This preserves the relative layout of
+    // groups vs ungrouped alts so groups don't jump to the top.
+    const interleaved: string[] = [];
+    const seenGroups = new Set<string>();
+    const ungroupedSet = new Set(ungroupedIds);
+    for (const alt of (props.row.alternatives ?? [])) {
+      if (alt.id === fromId && !membership.has(fromId) && !ungroupedSet.has(fromId)) continue;
+      const gId = membership.get(alt.id);
+      if (gId) {
+        if (!seenGroups.has(gId)) {
+          seenGroups.add(gId);
+          const g = groups.find(gg => gg.id === gId);
+          if (g) interleaved.push(...g.blockIds);
+        }
+      } else if (ungroupedSet.has(alt.id)) {
+        interleaved.push(alt.id);
+      }
+    }
+    // Safety: add any groups not encountered in the walk
+    for (const g of groups) {
+      if (!seenGroups.has(g.id) && g.blockIds.length > 0) interleaved.push(...g.blockIds);
+    }
+    // Safety: add any ungrouped IDs not encountered
+    for (const id of ungroupedIds) {
+      if (!interleaved.includes(id)) interleaved.push(id);
+    }
+
+    // For TL-group targets, the dragged alt was appended to ungroupedIds above
+    // but needs to be repositioned relative to the target group.
     let newOrderedIds: string[];
     if (useTLOrdering && tlInsertTarget) {
-      // Build interleaved order: walk original alternatives, emit group blocks on first encounter,
-      // then insert the dragged ungrouped alt at the correct position relative to the target group.
-      const allGroupedIds = new Set(groups.flatMap(g => g.blockIds));
-      const otherAlts = (props.row.alternatives ?? [])
-        .map(a => a.id)
-        .filter(id => id !== fromId && !allGroupedIds.has(id));
-
-      // Build the interleaved list without the dragged alt
-      const interleaved: string[] = [];
-      const seenGroups = new Set<string>();
-      const origAlts = props.row.alternatives ?? [];
-      for (const alt of origAlts) {
-        if (alt.id === fromId) continue;
-        const gId = membership.get(alt.id);
-        if (gId) {
-          if (!seenGroups.has(gId)) {
-            seenGroups.add(gId);
-            const g = groups.find(gg => gg.id === gId);
-            if (g) interleaved.push(...g.blockIds);
-          }
-        } else if (otherAlts.includes(alt.id)) {
-          interleaved.push(alt.id);
-        }
-      }
-      // Also add groups not seen (shouldn't happen but safety)
-      for (const g of groups) {
-        if (!seenGroups.has(g.id)) interleaved.push(...g.blockIds);
-      }
-
-      // Find insertion point
+      const withoutDragged = interleaved.filter(id => id !== fromId);
       let insertIdx: number;
       const tg = groups.find(g => g.id === tlInsertTarget!.gId);
       if (tlInsertTarget.kind === 'before-group') {
         const firstMember = tg?.blockIds[0];
-        insertIdx = firstMember ? interleaved.indexOf(firstMember) : interleaved.length;
-        if (insertIdx < 0) insertIdx = interleaved.length;
+        insertIdx = firstMember ? withoutDragged.indexOf(firstMember) : withoutDragged.length;
+        if (insertIdx < 0) insertIdx = withoutDragged.length;
       } else {
-        // after-group
         const lastMember = tg?.blockIds[tg.blockIds.length - 1];
-        insertIdx = lastMember ? interleaved.indexOf(lastMember) + 1 : interleaved.length;
-        if (insertIdx < 0) insertIdx = interleaved.length;
+        insertIdx = lastMember ? withoutDragged.indexOf(lastMember) + 1 : withoutDragged.length;
+        if (insertIdx < 0) insertIdx = withoutDragged.length;
       }
-      interleaved.splice(insertIdx, 0, fromId);
-      newOrderedIds = interleaved;
+      withoutDragged.splice(insertIdx, 0, fromId);
+      newOrderedIds = withoutDragged;
     } else {
-      newOrderedIds = [...groups.flatMap(g => g.blockIds), ...ungroupedIds];
+      newOrderedIds = interleaved;
     }
 
     // Build new modRowsState with reordered alternatives
@@ -853,6 +856,38 @@ export function ModRuleItem(props: ModRuleItemProps) {
                   </button>
                 </span>
               )}
+            </For>
+
+            {/* Link tags */}
+            <For each={linksByModId().get(props.row.id) ?? []}>
+              {link => {
+                const partnerName = () => rowMap().get(link.partnerId)?.name ?? link.partnerId;
+                const icon = () => link.direction === 'mutual' ? '\u21C4' : link.direction === 'requires' ? '\u2192' : '\u2190';
+                const label = () => `${icon()} ${partnerName()}`;
+                const title = () => {
+                  if (link.direction === 'mutual') return `Linked with ${partnerName()} (mutual)`;
+                  if (link.direction === 'requires') return `Requires ${partnerName()}`;
+                  return `Required by ${partnerName()}`;
+                };
+                return (
+                  <span
+                    title={title()}
+                    class="inline-flex items-center gap-0.5 rounded-md border border-cyan-500/30 bg-cyan-500/10 px-1.5 py-0.5 text-[10px] font-medium text-cyan-400"
+                  >
+                    <MaterialIcon name="link" size="sm" class="-ml-0.5" />
+                    {label()}
+                    <button
+                      onClick={e => { e.stopPropagation(); removeLink(props.row.id, link.partnerId); }}
+                      onPointerDown={stopDragPropagation}
+                      onMouseDown={stopDragPropagation}
+                      class="ml-0.5 opacity-40 hover:opacity-100 transition-opacity"
+                      title={`Remove link with "${partnerName()}"`}
+                    >
+                      <XIcon class="h-2.5 w-2.5" />
+                    </button>
+                  </span>
+                );
+              }}
             </For>
           </div>
 

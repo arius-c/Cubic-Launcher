@@ -47,6 +47,13 @@ export type IncompatibilityRule = {
   loserId: string;
 };
 
+export type LinkRule = {
+  /** The mod that requires the other */
+  fromId: string;
+  /** The mod being required */
+  toId: string;
+};
+
 export type DownloadProgressItem = {
   filename: string;
   progress: number;

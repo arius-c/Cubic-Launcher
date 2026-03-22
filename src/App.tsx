@@ -244,7 +244,7 @@ import { LaunchPanel }       from "./components/LaunchPanel";
 import { AddModDialog }      from "./components/AddModDialog";
 import {
   CreateModlistModal, SettingsModal, AccountsModal,
-  FunctionalGroupModal, InstancePresentationModal, RenameRuleModal, IncompatibilitiesModal,
+  FunctionalGroupModal, LinkModal, InstancePresentationModal, RenameRuleModal, IncompatibilitiesModal,
   AlternativesPanel, ErrorCenter, ExportModal,
 } from "./components/Modals";
 
@@ -1064,6 +1064,7 @@ export default function App() {
       <SettingsModal onSave={handleSaveSettings} />
       <AccountsModal onSwitchAccount={handleSwitchAccount} />
       <FunctionalGroupModal />
+      <LinkModal />
       <InstancePresentationModal onSave={handleSavePresentation} />
       <RenameRuleModal onRename={handleRenameRule} />
       <IncompatibilitiesModal onSave={handleSaveIncompatibilities} />
