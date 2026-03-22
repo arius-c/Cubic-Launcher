@@ -91,6 +91,7 @@ export const [savedLinks, setSavedLinks]                         = createSignal<
 export const [draftLinks, setDraftLinks]                         = createSignal<LinkRule[]>([]);
 export const [linkModalOpen, setLinkModalOpen]                   = createSignal(false);
 export const [linkModalModIds, setLinkModalModIds]               = createSignal<string[]>([]);
+export const [linksOverviewOpen, setLinksOverviewOpen]           = createSignal(false);
 
 // ── Computed / Memos ──────────────────────────────────────────────────────────
 
@@ -578,6 +579,13 @@ export function createFunctionalGroup() {
 
   setFunctionalGroups(cur => [...cur, { id: `fg-${Date.now()}`, name, tone: functionalGroupTone(), modIds: selectedIds() }]);
   setFunctionalGroupModalOpen(false); setNewFunctionalGroupName("");
+}
+
+export function removeIncompatibility(modAId: string, modBId: string) {
+  setSavedIncompatibilities(cur => cur.filter(r =>
+    !((r.winnerId === modAId && r.loserId === modBId) ||
+      (r.winnerId === modBId && r.loserId === modAId))
+  ));
 }
 
 export function openIncompatibilityEditor() {

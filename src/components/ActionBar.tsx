@@ -1,10 +1,10 @@
-import { For, Show } from "solid-js";
+import { For, Show, createSignal } from "solid-js";
 import {
   setSelectedIds, search, setSearch,
   selectedCount, createAestheticGroup as createGroup, openIncompatibilityEditor,
   selectedTopLevelId, openAlternativesPanel, setFunctionalGroupModalOpen,
-  functionalGroups, tagFilter, setTagFilter, toggleTagFilter, sortOrder, setSortOrder,
-  functionalGroupTagClass, openLinkModal,
+  functionalGroups, tagFilter, setTagFilter, toggleTagFilter,
+  functionalGroupTagClass, openLinkModal, savedLinks, setLinksOverviewOpen,
 } from "../store";
 import { MaterialIcon, XIcon } from "./icons";
 
@@ -14,6 +14,8 @@ interface ActionBarProps {
 }
 
 export function ActionBar(props: ActionBarProps) {
+  const [tagsOpen, setTagsOpen] = createSignal(false);
+
   /* ── Contextual bar (when mods selected) ──────────────────────── */
   const ContextualBar = () => (
     <header class="h-14 bg-primary/20 border-b border-primary flex items-center px-6 justify-between shrink-0">
@@ -54,7 +56,9 @@ export function ActionBar(props: ActionBarProps) {
           </button>
           <button
             onClick={openIncompatibilityEditor}
-            class="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-primary hover:text-white hover:bg-primary/40 rounded-lg border border-primary/30 transition-colors duration-75"
+            disabled={selectedCount() !== 1}
+            class="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-primary hover:text-white hover:bg-primary/40 rounded-lg border border-primary/30 transition-colors duration-75 disabled:opacity-50 disabled:cursor-not-allowed"
+            title={selectedCount() === 1 ? "Manage incompatibilities" : "Select exactly one mod"}
           >
             <MaterialIcon name="warning" size="md" />
             Incompatibilities
@@ -83,62 +87,12 @@ export function ActionBar(props: ActionBarProps) {
   );
 
   /* ── Normal bar ───────────────────────────────────────────────── */
-  const sortBtn = (label: string, value: "default" | "name-az" | "name-za") => (
-    <button
-      onClick={() => setSortOrder(value)}
-      class={`px-2 py-0.5 rounded text-xs transition-colors duration-75 ${
-        sortOrder() === value
-          ? "bg-primary/20 text-primary font-medium"
-          : "text-textMuted hover:text-textMain"
-      }`}
-    >
-      {label}
-    </button>
-  );
-
-  const hasActiveFilters = () => tagFilter().size > 0 || sortOrder() !== "default";
+  const hasActiveFilters = () => tagFilter().size > 0;
 
   const NormalBar = () => (
     <div class="px-6 py-2 bg-bgPanel border-b border-borderColor shrink-0 flex items-center justify-between gap-3">
-      {/* Left: Sort + Tag filters + Add Mod */}
+      {/* Left: Add Mod + Sort + Tags dropdown + Links + Clear */}
       <div class="flex items-center gap-2 flex-wrap">
-        {/* Tag filter pills */}
-        <Show when={functionalGroups().length > 0}>
-          <For each={functionalGroups()}>
-            {g => {
-              const active = () => tagFilter().has(g.id);
-              return (
-                <button
-                  onClick={() => toggleTagFilter(g.id)}
-                  class={`${functionalGroupTagClass(g.tone)} cursor-pointer transition-opacity duration-75 ${active() ? "opacity-100" : "opacity-50 hover:opacity-80"}`}
-                  title={active() ? `Remove "${g.name}" filter` : `Show only "${g.name}" mods`}
-                >
-                  <Show when={active()}>
-                    <MaterialIcon name="filter_alt" size="sm" class="-ml-0.5" />
-                  </Show>
-                  {g.name}
-                </button>
-              );
-            }}
-          </For>
-        </Show>
-
-        {/* Clear filters */}
-        <Show when={hasActiveFilters()}>
-          <button
-            onClick={() => { setTagFilter(new Set<string>()); setSortOrder("default"); }}
-            class="flex items-center gap-1 px-2 py-0.5 rounded-md text-xs text-textMuted hover:text-white hover:bg-muted/40 border border-dashed border-borderColor transition-colors duration-75"
-            title="Reset all filters and sort"
-          >
-            <XIcon class="h-3 w-3" />
-            Clear
-          </button>
-        </Show>
-
-        <Show when={functionalGroups().length > 0}>
-          <div class="h-4 w-px bg-borderColor" />
-        </Show>
-
         {/* Add Mod */}
         <button
           onClick={props.onAddMod}
@@ -148,13 +102,76 @@ export function ActionBar(props: ActionBarProps) {
           Add Mod
         </button>
 
-        {/* Sort group */}
-        <div class="flex items-center gap-0.5 rounded-md border border-borderColor bg-bgDark px-1 py-0.5">
-          <MaterialIcon name="sort" size="sm" class="text-textMuted mr-0.5" />
-          {sortBtn("Default", "default")}
-          {sortBtn("A → Z", "name-az")}
-          {sortBtn("Z → A", "name-za")}
-        </div>
+        {/* Tags dropdown */}
+        <Show when={functionalGroups().length > 0}>
+          <div class="relative">
+            <button
+              onClick={() => setTagsOpen(o => !o)}
+              class={`flex items-center gap-1 px-2 py-0.5 rounded-md border text-xs transition-colors duration-75 ${
+                tagFilter().size > 0
+                  ? "border-primary bg-primary/10 text-primary"
+                  : "border-borderColor bg-bgDark text-textMuted hover:text-textMain"
+              }`}
+            >
+              <MaterialIcon name="label" size="sm" />
+              Tags
+              <Show when={tagFilter().size > 0}>
+                <span class="font-medium">({tagFilter().size})</span>
+              </Show>
+              <MaterialIcon name={tagsOpen() ? "expand_less" : "expand_more"} size="sm" />
+            </button>
+            <Show when={tagsOpen()}>
+              {/* Click-outside backdrop */}
+              <div class="fixed inset-0 z-40" onClick={() => setTagsOpen(false)} />
+              <div class="absolute left-0 top-full mt-1 z-50 min-w-[160px] bg-bgPanel border border-borderColor rounded-lg shadow-lg overflow-hidden">
+                <For each={functionalGroups()}>
+                  {g => {
+                    const active = () => tagFilter().has(g.id);
+                    return (
+                      <button
+                        onClick={() => toggleTagFilter(g.id)}
+                        class={`w-full flex items-center justify-between gap-2 px-3 py-2 text-sm transition-colors duration-75 ${
+                          active() ? "bg-primary/10" : "hover:bg-muted/20"
+                        }`}
+                      >
+                        <span class={functionalGroupTagClass(g.tone)}>
+                          {g.name}
+                        </span>
+                        <Show when={active()}>
+                          <MaterialIcon name="check" size="sm" class="text-primary shrink-0" />
+                        </Show>
+                      </button>
+                    );
+                  }}
+                </For>
+              </div>
+            </Show>
+          </div>
+        </Show>
+
+        {/* Links overview button */}
+        <Show when={savedLinks().length > 0}>
+          <button
+            onClick={() => setLinksOverviewOpen(true)}
+            class="flex items-center gap-1 px-2 py-0.5 rounded-md border border-cyan-500/30 bg-cyan-500/10 text-cyan-300 text-xs hover:bg-cyan-500/20 transition-colors duration-75"
+            title="View all link relations"
+          >
+            <MaterialIcon name="link" size="sm" />
+            Links ({savedLinks().length})
+          </button>
+        </Show>
+
+        {/* Clear filters */}
+        <Show when={hasActiveFilters()}>
+          <button
+            onClick={() => setTagFilter(new Set<string>())}
+            class="flex items-center gap-1 px-2 py-0.5 rounded-md text-xs text-textMuted hover:text-white hover:bg-muted/40 border border-dashed border-borderColor transition-colors duration-75"
+            title="Reset all filters and sort"
+          >
+            <XIcon class="h-3 w-3" />
+            Clear
+          </button>
+        </Show>
       </div>
 
       {/* Right: Search */}

@@ -1,6 +1,6 @@
-import { For, Show, createSignal } from "solid-js";
+import { For } from "solid-js";
 import {
-  modListCards, selectedModListName, modRowsState,
+  modListCards, selectedModListName,
   setCreateModlistModalOpen, selectedMcVersion, selectedModLoader,
 } from "../store";
 import { MaterialIcon } from "./icons";
@@ -26,7 +26,6 @@ export function Sidebar(props: SidebarProps) {
         <For each={modListCards()}>
           {(ml) => {
             const isActive = () => selectedModListName() === ml.name;
-            const ruleCount = () => isActive() ? modRowsState().length : 0;
 
             return (
               <button

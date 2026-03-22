@@ -27,7 +27,7 @@ import {
   newFunctionalGroupName, setNewFunctionalGroupName,
   functionalGroupTone, setFunctionalGroupTone,
   createFunctionalGroup, selectedModListName,
-  aestheticGroups, setAestheticGroups, resolveToTopLevelId, nextAestheticGroupName,
+  aestheticGroups, setAestheticGroups, nextAestheticGroupName,
   /* Incompatibilities */
   incompatibilityModalOpen, setIncompatibilityModalOpen,
   focusedIncompatibilityMod, draftIncompatibilities,
@@ -37,6 +37,8 @@ import {
   /* Links */
   linkModalOpen, setLinkModalOpen, linkModalModIds,
   draftLinks, setDraftLinks, saveDraftLinks,
+  savedLinks, setSavedLinks,
+  linksOverviewOpen, setLinksOverviewOpen,
   /* Rename rule */
   renameRuleModalOpen, setRenameRuleModalOpen,
   renameRuleDraft, setRenameRuleDraft,
@@ -545,6 +547,126 @@ export function LinkModal() {
         <div class="flex justify-end gap-2 border-t border-border px-6 py-4">
           <button onClick={() => setLinkModalOpen(false)} class="rounded-md bg-secondary px-4 py-2 text-sm text-secondary-foreground hover:bg-secondary/80">Cancel</button>
           <button onClick={saveDraftLinks} class="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90">Save</button>
+        </div>
+      </Modal>
+    </Show>
+  );
+}
+
+// ── Links Overview ────────────────────────────────────────────────────────────
+export function LinksOverviewModal() {
+  /** Deduplicated pairs derived from savedLinks. */
+  const pairs = () => {
+    const links = savedLinks();
+    const seen = new Set<string>();
+    const result: Array<{ a: string; b: string }> = [];
+    for (const link of links) {
+      const key = [link.fromId, link.toId].sort().join("|");
+      if (!seen.has(key)) {
+        seen.add(key);
+        const [a, b] = [link.fromId, link.toId].sort();
+        result.push({ a, b });
+      }
+    }
+    return result;
+  };
+
+  const nameOf = (id: string) => rowMap().get(id)?.name ?? id;
+
+  const hasLink = (from: string, to: string) =>
+    savedLinks().some(l => l.fromId === from && l.toId === to);
+
+  const currentDir = (a: string, b: string): 'a-to-b' | 'mutual' | 'b-to-a' | 'none' => {
+    const ab = hasLink(a, b);
+    const ba = hasLink(b, a);
+    if (ab && ba) return 'mutual';
+    if (ab) return 'a-to-b';
+    if (ba) return 'b-to-a';
+    return 'none';
+  };
+
+  const setDirection = (a: string, b: string, dir: 'a-to-b' | 'mutual' | 'b-to-a' | 'none') => {
+    setSavedLinks(cur => {
+      const without = cur.filter(l =>
+        !((l.fromId === a && l.toId === b) || (l.fromId === b && l.toId === a))
+      );
+      if (dir === 'none') return without;
+      if (dir === 'a-to-b') return [...without, { fromId: a, toId: b }];
+      if (dir === 'b-to-a') return [...without, { fromId: b, toId: a }];
+      return [...without, { fromId: a, toId: b }, { fromId: b, toId: a }];
+    });
+  };
+
+  const toggleDir = (a: string, b: string, target: 'a-to-b' | 'mutual' | 'b-to-a') => {
+    const cur = currentDir(a, b);
+    setDirection(a, b, cur === target ? 'none' : target);
+  };
+
+  const dirBtnClass = (active: boolean) =>
+    active
+      ? "bg-primary/20 text-primary ring-1 ring-primary/30"
+      : "text-muted-foreground hover:bg-muted";
+
+  return (
+    <Show when={linksOverviewOpen()}>
+      <Modal onClose={() => setLinksOverviewOpen(false)} maxWidth="max-w-lg">
+        <ModalHeader
+          title="Link Relations"
+          description="All dependency links defined across your mod list."
+          onClose={() => setLinksOverviewOpen(false)}
+        />
+        <div class="flex-1 overflow-y-auto p-4 space-y-2 max-h-96">
+          <Show
+            when={pairs().length > 0}
+            fallback={<p class="text-center text-sm text-muted-foreground py-6">No links defined.</p>}
+          >
+            <For each={pairs()}>
+              {({ a, b }) => (
+                <div class="flex items-center gap-3 rounded-md border border-border bg-background p-3">
+                  <span class="min-w-0 flex-1 truncate text-sm font-medium text-foreground text-right">{nameOf(a)}</span>
+                  <div class="flex shrink-0 items-center gap-1">
+                    <button
+                      onClick={() => toggleDir(a, b, 'a-to-b')}
+                      class={`rounded-md px-2 py-1 text-xs font-medium transition-colors ${dirBtnClass(currentDir(a, b) === 'a-to-b')}`}
+                      title={`${nameOf(a)} requires ${nameOf(b)}`}
+                    >
+                      &rarr;
+                    </button>
+                    <button
+                      onClick={() => toggleDir(a, b, 'mutual')}
+                      class={`rounded-md px-2 py-1 text-xs font-medium transition-colors ${dirBtnClass(currentDir(a, b) === 'mutual')}`}
+                      title={`${nameOf(a)} and ${nameOf(b)} require each other`}
+                    >
+                      &harr;
+                    </button>
+                    <button
+                      onClick={() => toggleDir(a, b, 'b-to-a')}
+                      class={`rounded-md px-2 py-1 text-xs font-medium transition-colors ${dirBtnClass(currentDir(a, b) === 'b-to-a')}`}
+                      title={`${nameOf(b)} requires ${nameOf(a)}`}
+                    >
+                      &larr;
+                    </button>
+                  </div>
+                  <span class="min-w-0 flex-1 truncate text-sm font-medium text-foreground">{nameOf(b)}</span>
+                  <button
+                    onClick={() => setDirection(a, b, 'none')}
+                    class="shrink-0 flex h-6 w-6 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive"
+                    title="Remove link"
+                  >
+                    <XIcon class="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              )}
+            </For>
+          </Show>
+        </div>
+        <div class="flex justify-end border-t border-border px-4 py-3">
+          <button
+            onClick={() => setLinksOverviewOpen(false)}
+            class="rounded-md bg-secondary px-4 py-2 text-sm text-secondary-foreground hover:bg-secondary/80"
+          >
+            Close
+          </button>
         </div>
       </Modal>
     </Show>

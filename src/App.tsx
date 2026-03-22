@@ -15,7 +15,8 @@ import {
   setSettingsModalOpen, localJarRuleName, setLocalJarRuleName,
   setGlobalSettings, setModlistOverrides,
   upsertDownloadProgress, pushUiError, resetLaunchUiState,
-  aestheticGroups, functionalGroups, setAestheticGroups, setFunctionalGroups, setSavedIncompatibilities,
+  aestheticGroups, functionalGroups, setAestheticGroups, setFunctionalGroups,
+  savedIncompatibilities, setSavedIncompatibilities,
   draftIncompatibilities, setIncompatibilityModalOpen,
   instancePresentation, setInstancePresentation,
   exportOptions, setExportModalOpen, setInstancePresentationOpen,
@@ -237,6 +238,11 @@ function serializeGroupsLayout(aGroups: AestheticGroup[], fGroups: FunctionalGro
     })),
   });
 }
+
+function serializeIncompatibilities(rules: Array<{ winnerId: string; loserId: string }>) {
+  return JSON.stringify([...rules].sort((a, b) => `${a.winnerId}|${a.loserId}`.localeCompare(`${b.winnerId}|${b.loserId}`)));
+}
+
 import { Header }            from "./components/Header";
 import { Sidebar }           from "./components/Sidebar";
 import { ModListEditor }     from "./components/ModListEditor";
@@ -244,7 +250,7 @@ import { LaunchPanel }       from "./components/LaunchPanel";
 import { AddModDialog }      from "./components/AddModDialog";
 import {
   CreateModlistModal, SettingsModal, AccountsModal,
-  FunctionalGroupModal, LinkModal, InstancePresentationModal, RenameRuleModal, IncompatibilitiesModal,
+  FunctionalGroupModal, LinkModal, LinksOverviewModal, InstancePresentationModal, RenameRuleModal, IncompatibilitiesModal,
   AlternativesPanel, ErrorCenter, ExportModal,
 } from "./components/Modals";
 
@@ -474,6 +480,8 @@ async function fetchModIcons(rows: ModRow[]) {
 export default function App() {
   const [groupLayoutReady, setGroupLayoutReady] = createSignal(false);
   const [lastSavedGroupLayout, setLastSavedGroupLayout] = createSignal("");
+  const [incompatReady, setIncompatReady] = createSignal(false);
+  const [lastSavedIncompat, setLastSavedIncompat] = createSignal("");
 
   createEffect(() => {
     const modlistName = selectedModListName();
@@ -492,6 +500,23 @@ export default function App() {
     }).catch(err => {
       setLastSavedGroupLayout("");
       pushUiError({ title: "Could not save groups", message: "The mod-list group layout could not be persisted.", detail: String(err), severity: "error", scope: "launch" });
+    });
+  });
+
+  createEffect(() => {
+    const modlistName = selectedModListName();
+    const ready = incompatReady();
+    const serialized = serializeIncompatibilities(savedIncompatibilities());
+
+    if (!ready || !modlistName || !isTauri() || serialized === lastSavedIncompat()) return;
+
+    setLastSavedIncompat(serialized);
+    const rules = savedIncompatibilities().map(r => ({ winnerId: r.winnerId, loserId: r.loserId }));
+    void invoke("save_incompatibilities_command", {
+      input: { modlistName, rules },
+    }).catch(err => {
+      setLastSavedIncompat("");
+      pushUiError({ title: "Could not save incompatibilities", message: "The incompatibility rules could not be persisted.", detail: String(err), severity: "error", scope: "launch" });
     });
   });
 
@@ -530,6 +555,8 @@ export default function App() {
         await loadModlistGroups(firstList, editorSnapshot?.rows ?? modRowsState());
         setLastSavedGroupLayout(serializeGroupsLayout(aestheticGroups(), functionalGroups()));
         setGroupLayoutReady(true);
+        setLastSavedIncompat(serializeIncompatibilities(savedIncompatibilities()));
+        setIncompatReady(true);
         appendDebugTrace("app.boot", {
           phase: "editor-loaded",
           firstList,
@@ -589,6 +616,7 @@ export default function App() {
     setSelectedModListName(name);
     setSelectedIds([]);
     setGroupLayoutReady(false);
+    setIncompatReady(false);
     if (!isTauri()) return;
     await loadShellSnapshot(name);
     const editorSnapshot = await loadEditorSnapshot(name, true);
@@ -596,6 +624,8 @@ export default function App() {
     await loadModlistGroups(name, editorSnapshot?.rows ?? modRowsState());
     setLastSavedGroupLayout(serializeGroupsLayout(aestheticGroups(), functionalGroups()));
     setGroupLayoutReady(true);
+    setLastSavedIncompat(serializeIncompatibilities(savedIncompatibilities()));
+    setIncompatReady(true);
     void fetchModIcons(modRowsState());
   };
 
@@ -762,6 +792,8 @@ export default function App() {
       await loadModlistGroups(name, editorSnapshot?.rows ?? modRowsState());
       setLastSavedGroupLayout(serializeGroupsLayout(aestheticGroups(), functionalGroups()));
       setGroupLayoutReady(true);
+      setLastSavedIncompat(serializeIncompatibilities(savedIncompatibilities()));
+      setIncompatReady(true);
     } catch (err) {
       pushUiError({ title: "Failed to create mod list", message: `'${name}' could not be created.`, detail: String(err), severity: "error", scope: "launch" });
     } finally {
@@ -919,6 +951,7 @@ export default function App() {
 
     if (!isTauri() || !selectedModListName()) {
       setSavedIncompatibilities(rules.map(rule => ({ ...rule })));
+      setLastSavedIncompat(serializeIncompatibilities(rules));
       setIncompatibilityModalOpen(false);
       return;
     }
@@ -931,6 +964,7 @@ export default function App() {
         },
       });
       setSavedIncompatibilities(rules.map(rule => ({ ...rule })));
+      setLastSavedIncompat(serializeIncompatibilities(rules));
       setIncompatibilityModalOpen(false);
       await loadEditorSnapshot(selectedModListName());
     } catch (err) {
@@ -1065,6 +1099,7 @@ export default function App() {
       <AccountsModal onSwitchAccount={handleSwitchAccount} />
       <FunctionalGroupModal />
       <LinkModal />
+      <LinksOverviewModal />
       <InstancePresentationModal onSave={handleSavePresentation} />
       <RenameRuleModal onRename={handleRenameRule} />
       <IncompatibilitiesModal onSave={handleSaveIncompatibilities} />

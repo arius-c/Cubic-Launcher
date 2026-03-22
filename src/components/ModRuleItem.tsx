@@ -8,7 +8,7 @@ import {
   removeFunctionalGroupMember, tagFilter, functionalGroups, sortOrder, tagFilterForcedExpanded,
   toggleGroupCollapsed, removeAestheticGroup,
   editingGroupId, groupNameDraft, setGroupNameDraft, startGroupRename, commitGroupRename,
-  linksByModId, removeLink,
+  linksByModId, removeLink, removeIncompatibility,
 } from "../store";
 import {
   ChevronRightIcon, ChevronDownIcon, AlertTriangleIcon, PackageIcon, XIcon, FolderOpenIcon,
@@ -818,13 +818,21 @@ export function ModRuleItem(props: ModRuleItemProps) {
                   return (
                     <span
                       title={wins() ? `Wins against ${otherName()}` : `Loses to ${otherName()}`}
-                      class={`inline-flex items-center rounded-md px-1.5 py-0.5 text-[10px] font-medium ring-1 ${
+                      class={`inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] font-medium ring-1 ${
                         wins()
                           ? "bg-green-500/10 text-green-500 ring-green-500/30"
                           : "bg-red-500/10 text-red-500 ring-red-500/30"
                       }`}
                     >
                       {otherName()}
+                      <button
+                        onClick={e => { e.stopPropagation(); removeIncompatibility(props.row.id, otherId()); }}
+                        onPointerDown={stopDragPropagation}
+                        class="opacity-60 hover:opacity-100 transition-opacity"
+                        title="Remove incompatibility"
+                      >
+                        <XIcon class="h-2.5 w-2.5" />
+                      </button>
                     </span>
                   );
                 }}

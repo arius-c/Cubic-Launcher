@@ -81,8 +81,8 @@ export function AddModDialog(props: AddModDialogProps) {
   // Reset added/adding state when dialog opens
   createEffect(() => {
     if (addModModalOpen()) {
-      setAddedIds(new Set());
-      setAddingIds(new Set());
+      setAddedIds(new Set<string>());
+      setAddingIds(new Set<string>());
       if (!addModSearch()) setSearchResults(MOCK_MODRINTH);
     }
   });
@@ -97,7 +97,7 @@ export function AddModDialog(props: AddModDialogProps) {
   const close = () => {
     setAddModModalOpen(false);
     setAddModSearch("");
-    setAddedIds(new Set());
+    setAddedIds(new Set<string>());
   };
 
   return (
