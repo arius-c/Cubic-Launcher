@@ -1,0 +1,555 @@
+use std::collections::HashMap;
+
+use anyhow::{bail, Context, Result};
+
+use crate::modrinth::{DependencyType, ModrinthClient, ModrinthVersion};
+use crate::resolver::ResolutionTarget;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DependencyRequest {
+    pub parent_mod_id: String,
+    pub selector: DependencySelector,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DependencySelector {
+    ProjectId { project_id: String },
+    VersionId { version_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedDependency {
+    pub dependency_id: String,
+    pub version_id: String,
+    pub jar_filename: String,
+    pub download_url: String,
+    pub file_hash: Option<String>,
+    pub date_published: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DependencyLink {
+    pub parent_mod_id: String,
+    pub dependency_id: String,
+    pub specific_version: Option<String>,
+    pub jar_filename: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DependencyResolution {
+    pub resolved_dependencies: Vec<ResolvedDependency>,
+    pub links: Vec<DependencyLink>,
+}
+
+#[derive(Debug, Clone)]
+struct DependencyCandidate {
+    parent_mod_id: String,
+    selector: DependencySelector,
+    resolved_dependency: ResolvedDependency,
+}
+
+pub fn collect_required_dependency_requests(
+    parent_versions: &[ModrinthVersion],
+) -> Result<Vec<DependencyRequest>> {
+    let mut requests = Vec::new();
+
+    for parent_version in parent_versions {
+        for dependency in &parent_version.dependencies {
+            if dependency.dependency_type != DependencyType::Required {
+                continue;
+            }
+
+            let selector = if let Some(version_id) = dependency
+                .version_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                DependencySelector::VersionId {
+                    version_id: version_id.to_string(),
+                }
+            } else if let Some(project_id) = dependency
+                .project_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                DependencySelector::ProjectId {
+                    project_id: project_id.to_string(),
+                }
+            } else {
+                bail!(
+                    "required dependency for parent '{}' is missing both project_id and version_id",
+                    parent_version.project_id
+                );
+            };
+
+            requests.push(DependencyRequest {
+                parent_mod_id: parent_version.project_id.clone(),
+                selector,
+            });
+        }
+    }
+
+    Ok(requests)
+}
+
+pub fn resolve_dependency_requests(
+    requests: &[DependencyRequest],
+    mut fetch_latest_compatible: impl FnMut(&str) -> Result<Option<ModrinthVersion>>,
+    mut fetch_exact_version: impl FnMut(&str) -> Result<Option<ModrinthVersion>>,
+) -> Result<DependencyResolution> {
+    let mut candidates = Vec::with_capacity(requests.len());
+
+    for request in requests {
+        let version = match &request.selector {
+            DependencySelector::ProjectId { project_id } => fetch_latest_compatible(project_id)
+                .with_context(|| {
+                    format!(
+                        "failed to resolve compatible dependency version for project '{}'",
+                        project_id
+                    )
+                })?
+                .with_context(|| {
+                    format!(
+                        "no compatible dependency version found for project '{}'",
+                        project_id
+                    )
+                })?,
+            DependencySelector::VersionId { version_id } => fetch_exact_version(version_id)
+                .with_context(|| {
+                    format!(
+                        "failed to resolve exact dependency version '{}'",
+                        version_id
+                    )
+                })?
+                .with_context(|| {
+                    format!("dependency version '{}' could not be found", version_id)
+                })?,
+        };
+
+        candidates.push(build_dependency_candidate(request, version)?);
+    }
+
+    finalize_dependency_resolution(candidates)
+}
+
+pub async fn resolve_required_dependencies_with_client(
+    parent_versions: &[ModrinthVersion],
+    target: &ResolutionTarget,
+    client: &ModrinthClient,
+) -> Result<DependencyResolution> {
+    let requests = collect_required_dependency_requests(parent_versions)?;
+    let mut candidates = Vec::with_capacity(requests.len());
+
+    for request in &requests {
+        let version = match &request.selector {
+            DependencySelector::ProjectId { project_id } => client
+                .fetch_latest_compatible_version(project_id, target)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to resolve compatible dependency version for project '{}'",
+                        project_id
+                    )
+                })?
+                .with_context(|| {
+                    format!(
+                        "no compatible dependency version found for project '{}'",
+                        project_id
+                    )
+                })?,
+            DependencySelector::VersionId { version_id } => client
+                .fetch_version(version_id)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to resolve exact dependency version '{}'",
+                        version_id
+                    )
+                })?
+                .with_context(|| {
+                    format!("dependency version '{}' could not be found", version_id)
+                })?,
+        };
+
+        candidates.push(build_dependency_candidate(request, version)?);
+    }
+
+    finalize_dependency_resolution(candidates)
+}
+
+fn build_dependency_candidate(
+    request: &DependencyRequest,
+    version: ModrinthVersion,
+) -> Result<DependencyCandidate> {
+    let primary_file = version.primary_file().with_context(|| {
+        format!(
+            "dependency version '{}' for project '{}' does not expose any downloadable file",
+            version.id, version.project_id
+        )
+    })?;
+
+    Ok(DependencyCandidate {
+        parent_mod_id: request.parent_mod_id.clone(),
+        selector: request.selector.clone(),
+        resolved_dependency: ResolvedDependency {
+            dependency_id: version.project_id.clone(),
+            version_id: version.id.clone(),
+            jar_filename: primary_file.filename.clone(),
+            download_url: primary_file.url.clone(),
+            file_hash: primary_file.hashes.get("sha1").cloned(),
+            date_published: version.date_published.clone(),
+        },
+    })
+}
+
+fn finalize_dependency_resolution(
+    candidates: Vec<DependencyCandidate>,
+) -> Result<DependencyResolution> {
+    let mut newest_by_dependency: HashMap<String, ResolvedDependency> = HashMap::new();
+
+    for candidate in &candidates {
+        let dependency_id = candidate.resolved_dependency.dependency_id.clone();
+
+        match newest_by_dependency.get(&dependency_id) {
+            Some(existing)
+                if existing.date_published >= candidate.resolved_dependency.date_published => {}
+            _ => {
+                newest_by_dependency.insert(dependency_id, candidate.resolved_dependency.clone());
+            }
+        }
+    }
+
+    let mut resolved_dependencies = newest_by_dependency.into_values().collect::<Vec<_>>();
+    resolved_dependencies.sort_by(|left, right| left.dependency_id.cmp(&right.dependency_id));
+
+    let selected_by_dependency = resolved_dependencies
+        .iter()
+        .map(|dependency| (dependency.dependency_id.clone(), dependency.clone()))
+        .collect::<HashMap<_, _>>();
+
+    let mut deduplicated_links = HashMap::new();
+    for candidate in candidates {
+        let selected_dependency = selected_by_dependency
+            .get(&candidate.resolved_dependency.dependency_id)
+            .with_context(|| {
+                format!(
+                    "selected dependency '{}' missing from finalized resolution",
+                    candidate.resolved_dependency.dependency_id
+                )
+            })?;
+
+        let specific_version = match candidate.selector {
+            DependencySelector::ProjectId { .. } => None,
+            DependencySelector::VersionId { .. } => Some(selected_dependency.version_id.clone()),
+        };
+
+        deduplicated_links.insert(
+            (
+                candidate.parent_mod_id.clone(),
+                selected_dependency.dependency_id.clone(),
+            ),
+            DependencyLink {
+                parent_mod_id: candidate.parent_mod_id,
+                dependency_id: selected_dependency.dependency_id.clone(),
+                specific_version,
+                jar_filename: selected_dependency.jar_filename.clone(),
+            },
+        );
+    }
+
+    let mut links = deduplicated_links.into_values().collect::<Vec<_>>();
+    links.sort_by(|left, right| {
+        left.parent_mod_id
+            .cmp(&right.parent_mod_id)
+            .then(left.dependency_id.cmp(&right.dependency_id))
+    });
+
+    Ok(DependencyResolution {
+        resolved_dependencies,
+        links,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use crate::modrinth::ModrinthVersion;
+
+    use super::{
+        collect_required_dependency_requests, resolve_dependency_requests, DependencyLink,
+        DependencyRequest, DependencyResolution, DependencySelector,
+    };
+
+    fn version_from_json(json: &str) -> ModrinthVersion {
+        serde_json::from_str(json).expect("json should deserialize")
+    }
+
+    fn parent_version_with_mixed_dependencies() -> ModrinthVersion {
+        version_from_json(
+            r#"
+            {
+              "id": "parent-version",
+              "project_id": "create",
+              "version_number": "1.0.0",
+              "name": "Create",
+              "game_versions": ["1.21.1"],
+              "loaders": ["fabric"],
+              "date_published": "2024-07-01T00:00:00.000Z",
+              "dependencies": [
+                {
+                  "version_id": null,
+                  "project_id": "fabric-api",
+                  "dependency_type": "required",
+                  "file_name": null
+                },
+                {
+                  "version_id": "exact-lib-version",
+                  "project_id": "exact-lib",
+                  "dependency_type": "required",
+                  "file_name": null
+                },
+                {
+                  "version_id": null,
+                  "project_id": "optional-lib",
+                  "dependency_type": "optional",
+                  "file_name": null
+                },
+                {
+                  "version_id": null,
+                  "project_id": "conflict-lib",
+                  "dependency_type": "incompatible",
+                  "file_name": null
+                }
+              ],
+              "files": [
+                {
+                  "hashes": { "sha1": "parent-hash" },
+                  "url": "https://cdn.modrinth.com/data/create/create.jar",
+                  "filename": "create.jar",
+                  "primary": true,
+                  "size": 123
+                }
+              ]
+            }
+            "#,
+        )
+    }
+
+    fn dependency_version(
+        project_id: &str,
+        version_id: &str,
+        published_at: &str,
+        filename: &str,
+    ) -> ModrinthVersion {
+        version_from_json(&format!(
+            r#"{{
+              "id": "{version_id}",
+              "project_id": "{project_id}",
+              "version_number": "1.0.0",
+              "name": "{project_id}",
+              "game_versions": ["1.21.1"],
+              "loaders": ["fabric"],
+              "date_published": "{published_at}",
+              "dependencies": [],
+              "files": [
+                {{
+                  "hashes": {{ "sha1": "{version_id}-sha1" }},
+                  "url": "https://cdn.modrinth.com/data/{project_id}/{filename}",
+                  "filename": "{filename}",
+                  "primary": true,
+                  "size": 100
+                }}
+              ]
+            }}"#
+        ))
+    }
+
+    #[test]
+    fn collects_only_required_dependencies() {
+        let requests =
+            collect_required_dependency_requests(&[parent_version_with_mixed_dependencies()])
+                .expect("dependency requests should collect");
+
+        assert_eq!(
+            requests,
+            vec![
+                DependencyRequest {
+                    parent_mod_id: "create".into(),
+                    selector: DependencySelector::ProjectId {
+                        project_id: "fabric-api".into(),
+                    },
+                },
+                DependencyRequest {
+                    parent_mod_id: "create".into(),
+                    selector: DependencySelector::VersionId {
+                        version_id: "exact-lib-version".into(),
+                    },
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn resolves_exact_version_dependencies_via_version_lookup() {
+        let requests = vec![DependencyRequest {
+            parent_mod_id: "create".into(),
+            selector: DependencySelector::VersionId {
+                version_id: "geckolib-4-2".into(),
+            },
+        }];
+
+        let resolution = resolve_dependency_requests(
+            &requests,
+            |_project_id| Ok(None),
+            |version_id| {
+                Ok((version_id == "geckolib-4-2").then(|| {
+                    dependency_version(
+                        "geckolib",
+                        "geckolib-4-2",
+                        "2024-08-01T10:00:00.000Z",
+                        "geckolib-4.2.jar",
+                    )
+                }))
+            },
+        )
+        .expect("dependency resolution should succeed");
+
+        assert_eq!(resolution.resolved_dependencies.len(), 1);
+        assert_eq!(
+            resolution.resolved_dependencies[0].dependency_id,
+            "geckolib"
+        );
+        assert_eq!(
+            resolution.resolved_dependencies[0].version_id,
+            "geckolib-4-2"
+        );
+        assert_eq!(
+            resolution.links,
+            vec![DependencyLink {
+                parent_mod_id: "create".into(),
+                dependency_id: "geckolib".into(),
+                specific_version: Some("geckolib-4-2".into()),
+                jar_filename: "geckolib-4.2.jar".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn keeps_only_the_newest_duplicate_dependency_version() {
+        let requests = vec![
+            DependencyRequest {
+                parent_mod_id: "mod-a".into(),
+                selector: DependencySelector::VersionId {
+                    version_id: "geckolib-4-0".into(),
+                },
+            },
+            DependencyRequest {
+                parent_mod_id: "mod-b".into(),
+                selector: DependencySelector::VersionId {
+                    version_id: "geckolib-4-2".into(),
+                },
+            },
+        ];
+
+        let versions = HashMap::from([
+            (
+                "geckolib-4-0",
+                dependency_version(
+                    "geckolib",
+                    "geckolib-4-0",
+                    "2024-05-01T10:00:00.000Z",
+                    "geckolib-4.0.jar",
+                ),
+            ),
+            (
+                "geckolib-4-2",
+                dependency_version(
+                    "geckolib",
+                    "geckolib-4-2",
+                    "2024-08-01T10:00:00.000Z",
+                    "geckolib-4.2.jar",
+                ),
+            ),
+        ]);
+
+        let resolution = resolve_dependency_requests(
+            &requests,
+            |_project_id| Ok(None),
+            |version_id| Ok(versions.get(version_id).cloned()),
+        )
+        .expect("dependency resolution should succeed");
+
+        assert_eq!(resolution.resolved_dependencies.len(), 1);
+        assert_eq!(
+            resolution.resolved_dependencies[0].version_id,
+            "geckolib-4-2"
+        );
+        assert_eq!(
+            resolution.links,
+            vec![
+                DependencyLink {
+                    parent_mod_id: "mod-a".into(),
+                    dependency_id: "geckolib".into(),
+                    specific_version: Some("geckolib-4-2".into()),
+                    jar_filename: "geckolib-4.2.jar".into(),
+                },
+                DependencyLink {
+                    parent_mod_id: "mod-b".into(),
+                    dependency_id: "geckolib".into(),
+                    specific_version: Some("geckolib-4-2".into()),
+                    jar_filename: "geckolib-4.2.jar".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn project_id_dependencies_keep_null_specific_version() {
+        let requests = vec![DependencyRequest {
+            parent_mod_id: "create".into(),
+            selector: DependencySelector::ProjectId {
+                project_id: "fabric-api".into(),
+            },
+        }];
+
+        let resolution = resolve_dependency_requests(
+            &requests,
+            |project_id| {
+                Ok((project_id == "fabric-api").then(|| {
+                    dependency_version(
+                        "fabric-api",
+                        "fabric-api-0.100.0",
+                        "2024-08-15T10:00:00.000Z",
+                        "fabric-api-0.100.0.jar",
+                    )
+                }))
+            },
+            |_version_id| Ok(None),
+        )
+        .expect("dependency resolution should succeed");
+
+        assert_eq!(
+            resolution,
+            DependencyResolution {
+                resolved_dependencies: vec![super::ResolvedDependency {
+                    dependency_id: "fabric-api".into(),
+                    version_id: "fabric-api-0.100.0".into(),
+                    jar_filename: "fabric-api-0.100.0.jar".into(),
+                    download_url: "https://cdn.modrinth.com/data/fabric-api/fabric-api-0.100.0.jar"
+                        .into(),
+                    file_hash: Some("fabric-api-0.100.0-sha1".into()),
+                    date_published: "2024-08-15T10:00:00.000Z".into(),
+                }],
+                links: vec![DependencyLink {
+                    parent_mod_id: "create".into(),
+                    dependency_id: "fabric-api".into(),
+                    specific_version: None,
+                    jar_filename: "fabric-api-0.100.0.jar".into(),
+                }],
+            }
+        );
+    }
+}
