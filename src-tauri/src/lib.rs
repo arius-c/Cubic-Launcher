@@ -18,6 +18,7 @@ pub mod loader_metadata;
 pub mod microsoft_auth;
 pub mod mod_cache;
 pub mod modlist_assets;
+pub mod minecraft_downloader;
 pub mod modlist_manager;
 pub mod modrinth;
 pub mod offline_account;
@@ -67,12 +68,16 @@ pub fn run() {
             editor_data::add_nested_alternative_command,
             editor_data::remove_alternative_command,
             modlist_manager::create_modlist_command,
+            modlist_manager::delete_modlist_command,
             modlist_manager::copy_local_jar_command,
             modlist_assets::load_modlist_presentation_command,
             modlist_assets::save_modlist_presentation_command,
             modlist_assets::load_modlist_groups_command,
             modlist_assets::save_modlist_groups_command,
             modlist_assets::export_modlist_command,
+            modlist_assets::read_image_as_data_url_command,
+            minecraft_downloader::fetch_minecraft_versions_command,
+            minecraft_downloader::start_minecraft_predownload_command,
             launch_preview::start_launch_command
         ])
         .run(tauri::generate_context!())

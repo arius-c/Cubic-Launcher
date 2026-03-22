@@ -14,7 +14,7 @@ import {
   PackageIcon, ChevronDownIcon, ChevronRightIcon, FolderOpenIcon,
   PencilIcon, ExternalLinkIcon, XIcon,
 } from "./icons";
-import { setInstancePresentationOpen, setExportModalOpen } from "../store";
+import { setInstancePresentationOpen, setExportModalOpen, instancePresentation } from "../store";
 
 interface Props {
   onAddMod: () => void;
@@ -516,22 +516,22 @@ export function ModListEditor(props: Props) {
         <div class="shrink-0 border-b border-border bg-card/50 px-4 py-3">
           <div class="flex items-start justify-between gap-4">
             <div class="min-w-0 flex-1">
-              <h2 class="text-lg font-semibold text-foreground">{activeModList()!.name}</h2>
+              <h2 class="text-lg font-semibold text-foreground">{instancePresentation().iconLabel || activeModList()!.name}</h2>
               <p class="text-sm text-muted-foreground">{activeModList()!.description}</p>
               <div class="mt-1.5 flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
                 <span>{modRowsState().length} rule{modRowsState().length !== 1 ? "s" : ""}</span>
                 <span>·</span>
-                <span>by {activeAccount()?.gamertag ?? "—"}</span>
+                <span>by {instancePresentation().iconAccent || activeAccount()?.gamertag || "—"}</span>
               </div>
             </div>
             <div class="flex shrink-0 items-center gap-1">
               <button
                 onClick={() => setInstancePresentationOpen(true)}
                 class="flex h-8 items-center gap-1.5 rounded-md px-2.5 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-                title="Edit notes and icon for this mod list"
+                title="Edit settings for this mod list"
               >
                 <PencilIcon class="h-3.5 w-3.5" />
-                Notes
+                Settings
               </button>
               <button
                 onClick={() => setExportModalOpen(true)}

@@ -1,8 +1,9 @@
 import { For, Show, createSignal } from "solid-js";
-import { MINECRAFT_VERSIONS, MOD_LOADERS } from "../lib/types";
+import { MOD_LOADERS } from "../lib/types";
 import {
   selectedMcVersion, setSelectedMcVersion,
   selectedModLoader, setSelectedModLoader,
+  minecraftVersions,
   launchState, launchProgress, activeLaunchStage,
   launchLogs, logViewerOpen, setLogViewerOpen,
   activeAccount, accounts, setAccountsModalOpen,
@@ -12,6 +13,8 @@ import { MaterialIcon, Loader2Icon, XIcon } from "./icons";
 interface LaunchPanelProps {
   onLaunch: () => void;
   onSwitchAccount: (id: string) => Promise<void>;
+  onVersionChange?: (version: string) => void;
+  onLoaderChange?: (loader: string) => void;
 }
 
 export function LaunchPanel(props: LaunchPanelProps) {
@@ -150,7 +153,7 @@ export function LaunchPanel(props: LaunchPanelProps) {
               <MaterialIcon name="extension" size="sm" class="opacity-70" />
               <select
                 value={selectedModLoader()}
-                onChange={e => setSelectedModLoader(e.currentTarget.value)}
+                onChange={e => { props.onLoaderChange ? props.onLoaderChange(e.currentTarget.value) : setSelectedModLoader(e.currentTarget.value); }}
                 class="bg-transparent border-none text-sm text-textMain font-medium focus:outline-none cursor-pointer"
               >
                 <For each={MOD_LOADERS as unknown as string[]}>
@@ -162,10 +165,10 @@ export function LaunchPanel(props: LaunchPanelProps) {
               <span class="text-xs text-textMuted">Minecraft</span>
               <select
                 value={selectedMcVersion()}
-                onChange={e => setSelectedMcVersion(e.currentTarget.value)}
+                onChange={e => { props.onVersionChange ? props.onVersionChange(e.currentTarget.value) : setSelectedMcVersion(e.currentTarget.value); }}
                 class="bg-transparent border-none text-xs text-textMuted focus:outline-none cursor-pointer"
               >
-                <For each={MINECRAFT_VERSIONS as unknown as string[]}>
+                <For each={minecraftVersions()}>
                   {v => <option value={v} class="bg-bgPanel">{v}</option>}
                 </For>
               </select>
@@ -183,7 +186,7 @@ export function LaunchPanel(props: LaunchPanelProps) {
                 ? "text-primary border-primary"
                 : "text-textMuted hover:text-white hover:bg-bgHover"
             }`}
-            title="Show Log"
+            title="Logs"
           >
             <MaterialIcon name="terminal" size="md" />
           </button>

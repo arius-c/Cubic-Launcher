@@ -17,6 +17,11 @@ export type ModListCard = {
   status: "Ready" | "Resolving" | "Offline";
   accent: string;
   description: string;
+  iconImage?: string;
+  iconLabel?: string;
+  iconAccent?: string;
+  mcVersion?: string;
+  modLoader?: string;
 };
 
 export type ModrinthResult = {
@@ -52,6 +57,23 @@ export type LinkRule = {
   fromId: string;
   /** The mod being required */
   toId: string;
+};
+
+export type VersionRule = {
+  id: string;
+  modId: string;
+  kind: 'exclude' | 'only';
+  mcVersions: string[];
+  loader: string;
+};
+
+export type CustomConfig = {
+  id: string;
+  modId: string;
+  mcVersions: string[];
+  loader: string;
+  targetPath: string;
+  files: string[];
 };
 
 export type DownloadProgressItem = {
@@ -113,6 +135,8 @@ export type ShellSnapshot = {
     custom_jvm_args?: string | null;
     profiler_enabled?: boolean | null;
     wrapper_command?: string | null;
+    minecraft_version?: string | null;
+    mod_loader?: string | null;
   };
 };
 
@@ -141,8 +165,7 @@ export type ProcessExitEvent = {
 
 // ── Static constants ──────────────────────────────────────────────────────────
 
-export const MINECRAFT_VERSIONS = ["1.21.1", "1.20.6", "1.20.4", "1.19.4"] as const;
-export const MOD_LOADERS = ["Fabric", "NeoForge", "Forge", "Quilt"] as const;
+export const MOD_LOADERS = ["Fabric", "NeoForge", "Forge", "Quilt", "Vanilla"] as const;
 
 export const LAUNCH_STAGES: LaunchResolutionStage[] = [
   { label: "Resolve Rules",   detail: "Evaluating Mod-list rules, exclusions and fallback order.", progress: 18 },

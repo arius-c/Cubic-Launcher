@@ -25,6 +25,8 @@ pub struct ShellModListSummary {
     pub description: String,
     pub author: Option<String>,
     pub rule_count: usize,
+    pub minecraft_version: Option<String>,
+    pub mod_loader: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -53,6 +55,8 @@ pub struct ShellModListOverrides {
     pub custom_jvm_args: Option<String>,
     pub profiler_enabled: Option<bool>,
     pub wrapper_command: Option<String>,
+    pub minecraft_version: Option<String>,
+    pub mod_loader: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -75,6 +79,10 @@ pub struct ShellModListOverridesInput {
     pub custom_jvm_args: Option<String>,
     pub profiler_enabled: Option<bool>,
     pub wrapper_command: Option<String>,
+    #[serde(default)]
+    pub minecraft_version: Option<String>,
+    #[serde(default)]
+    pub mod_loader: Option<String>,
 }
 
 #[tauri::command]
@@ -133,14 +141,26 @@ pub fn load_shell_snapshot_from_root(
         )
     })?;
 
-    let modlists = load_modlist_summaries(launcher_paths.modlists_dir())?;
+    let raw_modlists = load_modlist_summaries(launcher_paths.modlists_dir())?;
     let selected_modlist_name = selected_modlist_name
         .map(ToString::to_string)
-        .or_else(|| modlists.first().map(|modlist| modlist.name.clone()));
+        .or_else(|| raw_modlists.first().map(|modlist| modlist.name.clone()));
     let active_account = load_active_account_summary(&connection)?;
     let global_settings = load_global_settings(&connection)?;
     let selected_modlist_overrides =
         load_modlist_overrides(&connection, selected_modlist_name.as_deref())?;
+
+    let version_loaders = load_all_modlist_version_loaders(&connection)?;
+    let modlists: Vec<ShellModListSummary> = raw_modlists
+        .into_iter()
+        .map(|mut s| {
+            if let Some((ver, loader)) = version_loaders.get(&s.name) {
+                s.minecraft_version = ver.clone();
+                s.mod_loader = loader.clone();
+            }
+            s
+        })
+        .collect();
 
     Ok(ShellSnapshot {
         modlists,
@@ -148,6 +168,33 @@ pub fn load_shell_snapshot_from_root(
         global_settings,
         selected_modlist_overrides,
     })
+}
+
+fn load_all_modlist_version_loaders(
+    connection: &Connection,
+) -> Result<HashMap<String, (Option<String>, Option<String>)>> {
+    let mut stmt = connection.prepare(
+        "SELECT modlist_name, key, value FROM modlist_settings \
+         WHERE key IN ('minecraft_version', 'mod_loader')",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut map: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
+    for row in rows {
+        let (name, key, value) = row?;
+        let entry = map.entry(name).or_default();
+        if key == "minecraft_version" {
+            entry.0 = Some(value);
+        } else if key == "mod_loader" {
+            entry.1 = Some(value);
+        }
+    }
+    Ok(map)
 }
 
 fn load_modlist_summaries(modlists_dir: &Path) -> Result<Vec<ShellModListSummary>> {
@@ -174,6 +221,8 @@ fn load_modlist_summaries(modlists_dir: &Path) -> Result<Vec<ShellModListSummary
                 description: modlist.description,
                 author: Some(modlist.author),
                 rule_count: modlist.rules.len(),
+                minecraft_version: None,
+                mod_loader: None,
             });
         } else if let Some(name) = path.file_name().and_then(|value| value.to_str()) {
             summaries.push(ShellModListSummary {
@@ -181,6 +230,8 @@ fn load_modlist_summaries(modlists_dir: &Path) -> Result<Vec<ShellModListSummary
                 description: String::new(),
                 author: None,
                 rule_count: 0,
+                minecraft_version: None,
+                mod_loader: None,
             });
         }
     }
@@ -240,6 +291,8 @@ fn load_modlist_overrides(
         custom_jvm_args: values.get("custom_jvm_args").cloned(),
         profiler_enabled: parse_bool_setting(&values, "profiler_enabled"),
         wrapper_command: values.get("wrapper_command").cloned(),
+        minecraft_version: values.get("minecraft_version").cloned(),
+        mod_loader: values.get("mod_loader").cloned(),
     })
 }
 
@@ -290,6 +343,12 @@ pub fn save_modlist_overrides(
     }
     if let Some(value) = &overrides.wrapper_command {
         values.push(("wrapper_command", value.clone()));
+    }
+    if let Some(value) = &overrides.minecraft_version {
+        values.push(("minecraft_version", value.clone()));
+    }
+    if let Some(value) = &overrides.mod_loader {
+        values.push(("mod_loader", value.clone()));
     }
 
     replace_modlist_settings(connection, &overrides.modlist_name, &values)
@@ -571,6 +630,8 @@ mod tests {
                 custom_jvm_args: Some("-Dbeta=true".into()),
                 profiler_enabled: Some(false),
                 wrapper_command: Some("mangohud".into()),
+                minecraft_version: None,
+                mod_loader: None,
             },
         )
         .expect("modlist overrides should save");

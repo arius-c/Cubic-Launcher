@@ -86,6 +86,43 @@ pub fn create_modlist_from_root(
 }
 
 // ---------------------------------------------------------------------------
+// Delete Mod-list
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn delete_modlist_command(
+    launcher_paths: State<'_, LauncherPaths>,
+    modlist_name: String,
+) -> Result<(), String> {
+    delete_modlist_from_root(launcher_paths.root_dir(), &modlist_name)
+        .map_err(|error| error.to_string())
+}
+
+pub fn delete_modlist_from_root(root_dir: &Path, modlist_name: &str) -> Result<()> {
+    let name = modlist_name.trim();
+    if name.is_empty() {
+        bail!("mod-list name cannot be empty");
+    }
+
+    let launcher_paths = LauncherPaths::new(root_dir.to_path_buf());
+    let modlist_dir = launcher_paths.modlists_dir().join(name);
+
+    if !modlist_dir.exists() {
+        bail!("mod-list '{}' does not exist", name);
+    }
+
+    std::fs::remove_dir_all(&modlist_dir).with_context(|| {
+        format!(
+            "failed to delete mod-list '{}' at {}",
+            name,
+            modlist_dir.display()
+        )
+    })?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Copy Local JAR
 // ---------------------------------------------------------------------------
 

@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{Emitter, State};
 
 use crate::app_shell::{load_shell_snapshot_from_root, ShellGlobalSettings, ShellModListOverrides};
+use crate::minecraft_downloader::{ensure_minecraft_version, extract_natives};
 use crate::dependencies::{resolve_required_dependencies_with_client, DependencyLink};
 use crate::instance_configs::{prepare_instance_config_directory, CachedConfigPlacement};
 use crate::instance_mods::{prepare_instance_mods_directory, CachedModJar};
@@ -277,6 +278,31 @@ async fn run_launch_pipeline(
     emit_progress(
         &app_handle,
         "resolving",
+        58,
+        "Download Minecraft",
+        &format!(
+            "Ensuring Minecraft {} client, libraries and assets are cached.",
+            target.minecraft_version
+        ),
+    )?;
+
+    let mc_data = ensure_minecraft_version(
+        &http_client,
+        &target.minecraft_version,
+        &launcher_paths,
+        |label, detail| {
+            let _ = emit_log(
+                &app_handle,
+                ProcessLogStream::Stdout,
+                format!("[MC] {label}: {detail}"),
+            );
+        },
+    )
+    .await?;
+
+    emit_progress(
+        &app_handle,
+        "resolving",
         74,
         "Prepare Instance",
         "Refreshing mods, loader libraries, configs and launch metadata.",
@@ -285,17 +311,11 @@ async fn run_launch_pipeline(
     let instance_root = build_instance_root(&launcher_paths, &modlist_name, &target);
     let instance_mods_dir = instance_root.join("mods");
     let instance_config_dir = instance_root.join("config");
-    let instance_assets_dir = instance_root.join("assets");
     let instance_natives_dir = instance_root.join("natives");
     let instance_library_dir = instance_root.join("libraries");
-    let instance_minecraft_dir = instance_root.join("minecraft");
 
-    std::fs::create_dir_all(&instance_assets_dir)
-        .with_context(|| format!("failed to create {}", instance_assets_dir.display()))?;
     std::fs::create_dir_all(&instance_natives_dir)
         .with_context(|| format!("failed to create {}", instance_natives_dir.display()))?;
-    std::fs::create_dir_all(&instance_minecraft_dir)
-        .with_context(|| format!("failed to create {}", instance_minecraft_dir.display()))?;
 
     prepare_instance_mods_directory(
         launcher_paths.mods_cache_dir(),
@@ -314,13 +334,22 @@ async fn run_launch_pipeline(
     let loader_library_paths =
         materialize_loader_libraries(&http_client, &instance_library_dir, &loader_metadata).await?;
 
+    extract_natives(&mc_data.native_paths, &instance_natives_dir)?;
+
+    if target.mod_loader == ModLoader::Vanilla {
+        loader_metadata.main_class = mc_data.main_class.clone();
+        loader_metadata.game_arguments = mc_data.game_arguments.clone();
+        loader_metadata.jvm_arguments = mc_data.jvm_arguments.clone();
+    }
+
     let player_identity = load_player_identity(&launcher_paths)?;
     let placeholders = LaunchPlaceholders::new(
         &player_identity,
         &modlist_name,
         &target,
         &instance_root,
-        &instance_assets_dir,
+        &mc_data.assets_dir,
+        &mc_data.asset_index_id,
         &instance_library_dir,
         &instance_natives_dir,
     );
@@ -333,20 +362,13 @@ async fn run_launch_pipeline(
         format!("[Java] Using {}", java_binary_path.display()),
     )?;
 
-    let client_jar_path = instance_minecraft_dir.join("client.jar");
-    if !client_jar_path.exists() {
-        bail!(
-            "Minecraft client jar is missing at {}. Automatic vanilla client acquisition is not implemented yet.",
-            client_jar_path.display()
-        );
-    }
-
     let prepared_command = build_launch_command(&JavaLaunchRequest {
         java_binary_path: java_binary_path.clone(),
         working_directory: instance_root.clone(),
         classpath_entries: {
-            let mut entries = loader_library_paths;
-            entries.push(client_jar_path);
+            let mut entries = mc_data.library_paths.clone();
+            entries.extend(loader_library_paths);
+            entries.push(mc_data.client_jar_path.clone());
             entries
         },
         loader_metadata,
@@ -424,6 +446,7 @@ impl LaunchPlaceholders {
         target: &ResolutionTarget,
         game_directory: &Path,
         assets_root: &Path,
+        asset_index_id: &str,
         library_directory: &Path,
         natives_directory: &Path,
     ) -> Self {
@@ -437,7 +460,7 @@ impl LaunchPlaceholders {
             ),
             game_directory: game_directory.display().to_string(),
             assets_root: assets_root.display().to_string(),
-            assets_index_name: target.minecraft_version.clone(),
+            assets_index_name: asset_index_id.to_string(),
             auth_uuid: player_identity.uuid.clone(),
             auth_access_token: player_identity.access_token.clone(),
             user_type: player_identity.user_type.clone(),
@@ -468,6 +491,7 @@ fn parse_mod_loader(value: &str) -> Result<ModLoader> {
         "quilt" => Ok(ModLoader::Quilt),
         "forge" => Ok(ModLoader::Forge),
         "neoforge" => Ok(ModLoader::NeoForge),
+        "vanilla" => Ok(ModLoader::Vanilla),
         other => bail!("unsupported mod loader '{other}'"),
     }
 }
@@ -1115,6 +1139,8 @@ mod tests {
             custom_jvm_args: Some("-Dmodlist=true".into()),
             profiler_enabled: Some(false),
             wrapper_command: Some("mangohud".into()),
+            minecraft_version: None,
+            mod_loader: None,
         }
     }
 
@@ -1188,6 +1214,7 @@ mod tests {
             },
             PathBuf::from("game-dir").as_path(),
             PathBuf::from("assets-root").as_path(),
+            "1.21",
             PathBuf::from("libraries-root").as_path(),
             PathBuf::from("natives-root").as_path(),
         );

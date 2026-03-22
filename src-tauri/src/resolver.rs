@@ -16,6 +16,7 @@ pub enum ModLoader {
     NeoForge,
     Forge,
     Quilt,
+    Vanilla,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

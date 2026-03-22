@@ -2,6 +2,7 @@ import { createSignal, createMemo } from "solid-js";
 import type {
   ModRow, ModListCard, ModrinthResult, AestheticGroup, FunctionalGroup,
   IncompatibilityRule, LinkRule, DownloadProgressItem, LauncherUiError, AccountSummary,
+  VersionRule, CustomConfig,
 } from "./lib/types";
 import { LAUNCH_STAGES } from "./lib/types";
 export { LAUNCH_STAGES } from "./lib/types";
@@ -32,6 +33,7 @@ export const MOCK_MODRINTH: ModrinthResult[] = [
 export const [modListCards, setModListCards]                     = createSignal<ModListCard[]>([]);
 export const [selectedModListName, setSelectedModListName]       = createSignal<string>("");
 export const [search, setSearch]                                 = createSignal("");
+export const [minecraftVersions, setMinecraftVersions]           = createSignal<string[]>(["1.21.1", "1.20.6", "1.20.4", "1.19.4"]);
 export const [selectedMcVersion, setSelectedMcVersion]           = createSignal("1.21.1");
 export const [selectedModLoader, setSelectedModLoader]           = createSignal<string>("Fabric");
 export const [launchState, setLaunchState]                       = createSignal<"idle" | "resolving" | "ready" | "running">("idle");
@@ -48,7 +50,7 @@ export const [accounts, setAccounts]                             = createSignal<
 export const [activeAccountId, setActiveAccountId]               = createSignal<string>("");
 export const [instancePresentationOpen, setInstancePresentationOpen] = createSignal(false);
 export const [verificationModalOpen, setVerificationModalOpen]   = createSignal(false);
-export const [instancePresentation, setInstancePresentation]     = createSignal({ iconLabel: "ML", iconAccent: "", notes: "" });
+export const [instancePresentation, setInstancePresentation]     = createSignal({ iconLabel: "ML", iconAccent: "", notes: "", iconImage: "" });
 export const [exportModalOpen, setExportModalOpen]               = createSignal(false);
 export const [exportOptions, setExportOptions]                   = createSignal({ rulesJson: true, modJars: false, configFiles: false, resourcePacks: false, otherFiles: false });
 export const [settingsModalOpen, setSettingsModalOpen]           = createSignal(false);
@@ -92,6 +94,9 @@ export const [draftLinks, setDraftLinks]                         = createSignal<
 export const [linkModalOpen, setLinkModalOpen]                   = createSignal(false);
 export const [linkModalModIds, setLinkModalModIds]               = createSignal<string[]>([]);
 export const [linksOverviewOpen, setLinksOverviewOpen]           = createSignal(false);
+export const [versionRules, setVersionRules]                     = createSignal<VersionRule[]>([]);
+export const [customConfigs, setCustomConfigs]                   = createSignal<CustomConfig[]>([]);
+export const [advancedPanelModId, setAdvancedPanelModId]         = createSignal<string | null>(null);
 
 // ── Computed / Memos ──────────────────────────────────────────────────────────
 
@@ -220,6 +225,23 @@ export const functionalGroupsByBlockId = createMemo(() => {
       map.set(id, cur);
     }
   }
+  return map;
+});
+
+export const advancedPanelMod = createMemo(() => {
+  const id = advancedPanelModId();
+  return id ? (rowMap().get(id) ?? null) : null;
+});
+
+export const parentIdByChildId = createMemo(() => {
+  const map = new Map<string, string>();
+  function walk(rows: ModRow[], pid: string | null) {
+    for (const row of rows) {
+      if (pid !== null) map.set(row.id, pid);
+      walk(row.alternatives ?? [], row.id);
+    }
+  }
+  walk(modRowsState(), null);
   return map;
 });
 
@@ -667,4 +689,40 @@ export function resetLaunchUiState() {
   setLaunchStageLabel(LAUNCH_STAGES[0].label); setLaunchStageDetail(LAUNCH_STAGES[0].detail);
   setLaunchLogs([]);
   setDownloadItems([]);
+}
+
+export function addModToFunctionalGroup(groupId: string, modId: string) {
+  setFunctionalGroups(cur => cur.map(g =>
+    g.id === groupId && !g.modIds.includes(modId) ? { ...g, modIds: [...g.modIds, modId] } : g
+  ));
+}
+
+export function createFunctionalGroupForMod(name: string, modId: string) {
+  const trimmed = name.trim();
+  if (!trimmed) return;
+  setFunctionalGroups(cur => [...cur, { id: `fg-${Date.now()}`, name: trimmed, tone: "violet", modIds: [modId] }]);
+}
+
+export function addVersionRule(rule: Omit<VersionRule, 'id'>) {
+  setVersionRules(cur => [...cur, { ...rule, id: `vr-${Date.now()}` }]);
+}
+
+export function removeVersionRule(id: string) {
+  setVersionRules(cur => cur.filter(r => r.id !== id));
+}
+
+export function updateVersionRule(id: string, patch: Partial<Omit<VersionRule, 'id' | 'modId'>>) {
+  setVersionRules(cur => cur.map(r => r.id === id ? { ...r, ...patch } : r));
+}
+
+export function addCustomConfig(modId: string) {
+  setCustomConfigs(cur => [...cur, { id: `cc-${Date.now()}`, modId, mcVersions: [], loader: 'any', targetPath: '', files: [] }]);
+}
+
+export function removeCustomConfig(id: string) {
+  setCustomConfigs(cur => cur.filter(c => c.id !== id));
+}
+
+export function updateCustomConfig(id: string, patch: Partial<Omit<CustomConfig, 'id' | 'modId'>>) {
+  setCustomConfigs(cur => cur.map(c => c.id === id ? { ...c, ...patch } : c));
 }

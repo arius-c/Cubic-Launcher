@@ -1,7 +1,7 @@
-import { For } from "solid-js";
+import { For, Show } from "solid-js";
 import {
   modListCards, selectedModListName,
-  setCreateModlistModalOpen, selectedMcVersion, selectedModLoader,
+  setCreateModlistModalOpen, minecraftVersions,
 } from "../store";
 import { MaterialIcon } from "./icons";
 
@@ -37,12 +37,16 @@ export function Sidebar(props: SidebarProps) {
                 }`}
               >
                 {/* Instance icon/thumbnail */}
-                <div class={`w-10 h-10 rounded-lg shadow-sm flex-shrink-0 flex items-center justify-center ${
-                  isActive() ? "bg-primary" : "bg-muted"
+                <div class={`w-10 h-10 rounded-lg shadow-sm flex-shrink-0 flex items-center justify-center overflow-hidden ${
+                  ml.iconImage ? "" : (isActive() ? "bg-primary" : "bg-muted")
                 }`}>
-                  <span class="text-white font-bold text-sm">
-                    {ml.name.slice(0, 2).toUpperCase()}
-                  </span>
+                  <Show when={ml.iconImage} fallback={
+                    <span class="text-white font-bold text-sm">
+                      {(ml.iconLabel || ml.name).slice(0, 2).toUpperCase()}
+                    </span>
+                  }>
+                    <img src={ml.iconImage} class="block w-10 h-10 object-cover rounded-lg" alt="" />
+                  </Show>
                 </div>
 
                 {/* Instance info (hidden on mobile) */}
@@ -50,10 +54,10 @@ export function Sidebar(props: SidebarProps) {
                   <span class={`text-sm font-medium truncate transition-colors duration-75 ${
                     isActive() ? "text-white" : "text-textMuted group-hover:text-white"
                   }`}>
-                    {ml.name}
+                    {ml.iconLabel || ml.name}
                   </span>
                   <span class="text-xs text-textMuted truncate">
-                    {selectedModLoader()} {selectedMcVersion()}
+                    {ml.modLoader || "Fabric"} {ml.mcVersion || minecraftVersions()[0] || "1.21.1"}
                   </span>
                 </div>
               </button>

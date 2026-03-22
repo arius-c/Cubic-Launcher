@@ -55,6 +55,18 @@ impl LoaderMetadataClient {
                 self.fetch_prism_metadata(minecraft_version, PrismPackageUid::NeoForge)
                     .await
             }
+            ModLoader::Vanilla => Ok(LoaderMetadata {
+                mod_loader: ModLoader::Vanilla,
+                minecraft_version: minecraft_version.to_string(),
+                loader_version: minecraft_version.to_string(),
+                // main_class, game_arguments, and jvm_arguments are filled in from
+                // MinecraftVersionData inside launch_preview after MC download.
+                main_class: String::new(),
+                libraries: vec![],
+                jvm_arguments: vec![],
+                game_arguments: vec![],
+                min_java_version: None,
+            }),
         }
     }
 

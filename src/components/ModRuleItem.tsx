@@ -9,6 +9,7 @@ import {
   toggleGroupCollapsed, removeAestheticGroup,
   editingGroupId, groupNameDraft, setGroupNameDraft, startGroupRename, commitGroupRename,
   linksByModId, removeLink, removeIncompatibility,
+  setAdvancedPanelModId, selectedCount,
 } from "../store";
 import {
   ChevronRightIcon, ChevronDownIcon, AlertTriangleIcon, PackageIcon, XIcon, FolderOpenIcon,
@@ -937,6 +938,18 @@ export function ModRuleItem(props: ModRuleItemProps) {
               Ungroup
             </button>
           </Show>
+
+          <button
+            onClick={e => { e.stopPropagation(); setAdvancedPanelModId(props.row.id); }}
+            onPointerDown={stopDragPropagation}
+            onMouseDown={stopDragPropagation}
+            disabled={selectedCount() >= 2}
+            class="flex h-7 items-center gap-1 rounded-md px-2 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-40 disabled:cursor-not-allowed"
+            title="Advanced mod settings"
+          >
+            <MaterialIcon name="settings" size="sm" />
+            Advanced
+          </button>
         </div>
       </div>
 

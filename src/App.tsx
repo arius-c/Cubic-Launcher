@@ -3,11 +3,11 @@ import { invoke } from "@tauri-apps/api/core";
 import { appendDebugTrace, clearDebugTrace } from "./lib/debugTrace";
 
 import {
-  setModListCards, selectedModListName, setSelectedModListName,
+  modListCards, setModListCards, selectedModListName, setSelectedModListName,
   modRowsState, setModRowsState, setAccounts, setActiveAccountId,
   setLaunchState, setLaunchProgress, setLaunchStageLabel, setLaunchStageDetail,
-  setLaunchLogs, setLogViewerOpen, setLauncherErrors,
-  globalSettings, modlistOverrides, selectedMcVersion, selectedModLoader,
+  setLaunchLogs, setLauncherErrors,
+  globalSettings, modlistOverrides, selectedMcVersion, setSelectedMcVersion, selectedModLoader, setSelectedModLoader,
   createModlistName, createModlistDescription, setCreateModlistModalOpen,
   setCreateModlistBusy, createModlistBusy,
   renameRuleDraft, renameRuleTargetId, setRenameRuleModalOpen,
@@ -16,16 +16,18 @@ import {
   setGlobalSettings, setModlistOverrides,
   upsertDownloadProgress, pushUiError, resetLaunchUiState,
   aestheticGroups, functionalGroups, setAestheticGroups, setFunctionalGroups,
+  versionRules, setVersionRules, customConfigs, setCustomConfigs,
   savedIncompatibilities, setSavedIncompatibilities,
   draftIncompatibilities, setIncompatibilityModalOpen,
   instancePresentation, setInstancePresentation,
   exportOptions, setExportModalOpen, setInstancePresentationOpen,
   alternativesPanelParent, setAlternativesPanelParentId,
   launchState, selectedModList, setAppLoading, setModIcons, modIcons,
+  minecraftVersions, setMinecraftVersions,
   LAUNCH_STAGES, wait,
   DEMO_MOD_LISTS, DEMO_ACCOUNTS,
 } from "./store";
-import type { AestheticGroup, FunctionalGroup, ModRow } from "./lib/types";
+import type { AestheticGroup, FunctionalGroup, ModRow, VersionRule, CustomConfig } from "./lib/types";
 
 // ── Row state helpers ─────────────────────────────────────────────────────────
 
@@ -221,7 +223,7 @@ function remapFunctionalGroups(groups: FunctionalGroup[], idRemap: Map<string, s
   }));
 }
 
-function serializeGroupsLayout(aGroups: AestheticGroup[], fGroups: FunctionalGroup[]) {
+function serializeGroupsLayout(aGroups: AestheticGroup[], fGroups: FunctionalGroup[], vRules: VersionRule[], cConfigs: CustomConfig[]) {
   return JSON.stringify({
     aestheticGroups: aGroups.map(group => ({
       id: group.id,
@@ -236,6 +238,8 @@ function serializeGroupsLayout(aGroups: AestheticGroup[], fGroups: FunctionalGro
       tone: group.tone,
       modIds: [...group.modIds],
     })),
+    versionRules: vRules,
+    customConfigs: cConfigs,
   });
 }
 
@@ -253,10 +257,14 @@ import {
   FunctionalGroupModal, LinkModal, LinksOverviewModal, InstancePresentationModal, RenameRuleModal, IncompatibilitiesModal,
   AlternativesPanel, ErrorCenter, ExportModal,
 } from "./components/Modals";
+import { AdvancedModPanel } from "./components/AdvancedModPanel";
 
 // ─────────────────────────────────────────────────────────────────────────────
 
 const isTauri = () => "__TAURI_INTERNALS__" in window;
+
+// ── Per-modlist version/loader cache (prevents bleed when switching modlists) ──
+const modlistVersionLoaderCache = new Map<string, { version: string; loader: string }>();
 
 // ── Backend data loaders ──────────────────────────────────────────────────────
 
@@ -266,14 +274,27 @@ async function loadShellSnapshot(preferredName?: string | null) {
       selectedModlistName: preferredName ?? null,
     });
 
-    // Always update mod list cards — even if empty (clears stale state)
-    const cards = (snap.modlists ?? []).map((m: any) => ({
-      name: m.name,
-      status: "Ready" as const,
-      accent: "from-primary/30 via-primary/10 to-transparent",
-      description: m.description || (m.rule_count > 0 ? `${m.rule_count} rules` : "Empty mod list"),
-    }));
+    // Always update mod list cards — preserve any cached icon data already loaded
+    const existing = modListCards();
+    const cards = (snap.modlists ?? []).map((m: any) => {
+      const prev = existing.find(c => c.name === m.name);
+      return {
+        name: m.name,
+        status: "Ready" as const,
+        accent: "from-primary/30 via-primary/10 to-transparent",
+        description: m.description || (m.rule_count > 0 ? `${m.rule_count} rules` : "Empty mod list"),
+        iconImage: prev?.iconImage,
+        iconLabel: prev?.iconLabel,
+        iconAccent: prev?.iconAccent,
+        mcVersion: m.minecraft_version ?? undefined,
+        modLoader: m.mod_loader ?? undefined,
+      };
+    });
     setModListCards(cards);
+
+    // Load icon images for any cards that don't have them yet
+    const needLoad = cards.filter((c: { iconLabel?: string }) => !c.iconLabel).map((c: { name: string }) => c.name);
+    if (needLoad.length > 0) void loadAllCardIcons(needLoad);
 
     // Select the preferred list or the first one
     if (cards.length > 0) {
@@ -325,6 +346,11 @@ async function loadShellSnapshot(preferredName?: string | null) {
         wrapperEnabled: ov.wrapper_command != null,
         wrapperCommand: ov.wrapper_command ?? cur.wrapperCommand,
       }));
+      const resolvedVersion = ov.minecraft_version ?? minecraftVersions()[0] ?? "1.21.1";
+      const resolvedLoader = ov.mod_loader ?? "Fabric";
+      setSelectedMcVersion(resolvedVersion);
+      setSelectedModLoader(resolvedLoader);
+      if (preferredName) modlistVersionLoaderCache.set(preferredName, { version: resolvedVersion, loader: resolvedLoader });
     }
 
     return snap;
@@ -360,27 +386,45 @@ async function loadEditorSnapshot(modlistName: string, resetGroups = false) {
   }
 }
 
+async function loadAllCardIcons(names: string[]) {
+  if (!isTauri() || names.length === 0) return;
+  await Promise.all(names.map(async name => {
+    try {
+      const p: any = await invoke("load_modlist_presentation_command", { modlistName: name });
+      const iconImage: string = p.iconImage ?? "";
+      const iconLabel: string = p.iconLabel ?? "";
+      const iconAccent: string = p.iconAccent ?? "";
+      setModListCards(cards => cards.map(c => c.name === name ? { ...c, iconImage, iconLabel, iconAccent } : c));
+    } catch (_) { /* silently skip */ }
+  }));
+}
+
 async function loadModlistPresentation(modlistName: string) {
   if (!modlistName) {
-    setInstancePresentation({ iconLabel: "ML", iconAccent: "", notes: "" });
+    setInstancePresentation({ iconLabel: "ML", iconAccent: "", notes: "", iconImage: "" });
     return null;
   }
 
   if (!isTauri()) {
-    setInstancePresentation({ iconLabel: buildDefaultIconLabel(modlistName), iconAccent: "", notes: "" });
+    setInstancePresentation({ iconLabel: buildDefaultIconLabel(modlistName), iconAccent: "", notes: "", iconImage: "" });
     return null;
   }
 
   try {
     const presentation: any = await invoke("load_modlist_presentation_command", { modlistName });
+    const iconImage = presentation.iconImage ?? "";
+    const iconLabel = presentation.iconLabel ?? buildDefaultIconLabel(modlistName);
+    const iconAccent = presentation.iconAccent ?? "";
     setInstancePresentation({
-      iconLabel: presentation.iconLabel ?? buildDefaultIconLabel(modlistName),
-      iconAccent: presentation.iconAccent ?? "",
+      iconLabel,
+      iconAccent,
       notes: presentation.notes ?? "",
+      iconImage,
     });
+    setModListCards(cards => cards.map(c => c.name === modlistName ? { ...c, iconImage, iconLabel, iconAccent } : c));
     return presentation;
   } catch (err) {
-    setInstancePresentation({ iconLabel: buildDefaultIconLabel(modlistName), iconAccent: "", notes: "" });
+    setInstancePresentation({ iconLabel: buildDefaultIconLabel(modlistName), iconAccent: "", notes: "", iconImage: "" });
     pushUiError({ title: "Could not load notes", message: `Saved notes for '${modlistName}' could not be loaded.`, detail: String(err), severity: "error", scope: "launch" });
     return null;
   }
@@ -390,12 +434,16 @@ async function loadModlistGroups(modlistName: string, rows: ModRow[]) {
   if (!modlistName) {
     setAestheticGroups([]);
     setFunctionalGroups([]);
+    setVersionRules([]);
+    setCustomConfigs([]);
     return null;
   }
 
   if (!isTauri()) {
     setAestheticGroups([]);
     setFunctionalGroups([]);
+    setVersionRules([]);
+    setCustomConfigs([]);
     return null;
   }
 
@@ -426,10 +474,30 @@ async function loadModlistGroups(modlistName: string, rows: ModRow[]) {
 
     setAestheticGroups(nextAestheticGroups);
     setFunctionalGroups(nextFunctionalGroups);
+
+    setVersionRules((layout.versionRules ?? []).map((r: any) => ({
+      id: r.id,
+      modId: r.modId,
+      kind: r.kind === 'only' ? 'only' as const : 'exclude' as const,
+      mcVersions: r.mcVersions ?? [],
+      loader: r.loader ?? 'any',
+    })).filter((r: any) => availableIds.has(r.modId)));
+
+    setCustomConfigs((layout.customConfigs ?? []).map((c: any) => ({
+      id: c.id,
+      modId: c.modId,
+      mcVersions: c.mcVersions ?? [],
+      loader: c.loader ?? 'any',
+      targetPath: c.targetPath ?? '',
+      files: c.files ?? [],
+    })).filter((c: any) => availableIds.has(c.modId)));
+
     return layout;
   } catch (err) {
     setAestheticGroups([]);
     setFunctionalGroups([]);
+    setVersionRules([]);
+    setCustomConfigs([]);
     pushUiError({ title: "Could not load groups", message: `Saved groups for '${modlistName}' could not be loaded.`, detail: String(err), severity: "error", scope: "launch" });
     return null;
   }
@@ -486,7 +554,7 @@ export default function App() {
   createEffect(() => {
     const modlistName = selectedModListName();
     const ready = groupLayoutReady();
-    const serialized = serializeGroupsLayout(aestheticGroups(), functionalGroups());
+    const serialized = serializeGroupsLayout(aestheticGroups(), functionalGroups(), versionRules(), customConfigs());
 
     if (!ready || !modlistName || !isTauri() || serialized === lastSavedGroupLayout()) return;
 
@@ -496,6 +564,8 @@ export default function App() {
         modlistName,
         aestheticGroups: aestheticGroups(),
         functionalGroups: functionalGroups(),
+        versionRules: versionRules(),
+        customConfigs: customConfigs(),
       },
     }).catch(err => {
       setLastSavedGroupLayout("");
@@ -547,13 +617,18 @@ export default function App() {
       });
       setAppLoading(false);
 
+      // Fetch Minecraft version list and start background pre-download
+      try {
+        const versions = await invoke<string[]>("fetch_minecraft_versions_command");
+        if (versions.length > 0) setMinecraftVersions(versions);
+      } catch (_) { /* keep the hardcoded fallback list */ }
       // Load editor data + icons for the selected mod list
       const firstList = snap?.modlists?.[0]?.name ?? "";
       if (firstList) {
         const editorSnapshot = await loadEditorSnapshot(firstList);
         await loadModlistPresentation(firstList);
         await loadModlistGroups(firstList, editorSnapshot?.rows ?? modRowsState());
-        setLastSavedGroupLayout(serializeGroupsLayout(aestheticGroups(), functionalGroups()));
+        setLastSavedGroupLayout(serializeGroupsLayout(aestheticGroups(), functionalGroups(), versionRules(), customConfigs()));
         setGroupLayoutReady(true);
         setLastSavedIncompat(serializeIncompatibilities(savedIncompatibilities()));
         setIncompatReady(true);
@@ -592,7 +667,6 @@ export default function App() {
       unlisteners.push(await listen<any>("minecraft-log", ev => {
         if (ev.payload) {
           setLaunchLogs(c => [...c, `[${ev.payload.stream}] ${ev.payload.line}`]);
-          setLogViewerOpen(true);
         }
       }));
 
@@ -617,12 +691,25 @@ export default function App() {
     setSelectedIds([]);
     setGroupLayoutReady(false);
     setIncompatReady(false);
+    // Immediately show cached presentation data so there's no flicker
+    const cached = modListCards().find(c => c.name === name);
+    if (cached?.iconLabel !== undefined) {
+      setInstancePresentation(cur => ({
+        ...cur,
+        iconLabel: cached.iconLabel ?? cur.iconLabel,
+        iconAccent: cached.iconAccent ?? cur.iconAccent,
+        iconImage: cached.iconImage ?? cur.iconImage,
+      }));
+    }
+    // Restore cached version/loader immediately — prevents bleed from previous modlist
+    const cachedVL = modlistVersionLoaderCache.get(name);
+    if (cachedVL) { setSelectedMcVersion(cachedVL.version); setSelectedModLoader(cachedVL.loader); }
     if (!isTauri()) return;
     await loadShellSnapshot(name);
     const editorSnapshot = await loadEditorSnapshot(name, true);
     await loadModlistPresentation(name);
     await loadModlistGroups(name, editorSnapshot?.rows ?? modRowsState());
-    setLastSavedGroupLayout(serializeGroupsLayout(aestheticGroups(), functionalGroups()));
+    setLastSavedGroupLayout(serializeGroupsLayout(aestheticGroups(), functionalGroups(), versionRules(), customConfigs()));
     setGroupLayoutReady(true);
     setLastSavedIncompat(serializeIncompatibilities(savedIncompatibilities()));
     setIncompatReady(true);
@@ -790,7 +877,7 @@ export default function App() {
       const editorSnapshot = await loadEditorSnapshot(name);
       await loadModlistPresentation(name);
       await loadModlistGroups(name, editorSnapshot?.rows ?? modRowsState());
-      setLastSavedGroupLayout(serializeGroupsLayout(aestheticGroups(), functionalGroups()));
+      setLastSavedGroupLayout(serializeGroupsLayout(aestheticGroups(), functionalGroups(), versionRules(), customConfigs()));
       setGroupLayoutReady(true);
       setLastSavedIncompat(serializeIncompatibilities(savedIncompatibilities()));
       setIncompatReady(true);
@@ -933,6 +1020,8 @@ export default function App() {
             customJvmArgs: ov.customArgsEnabled ? ov.customJvmArgs : null,
             profilerEnabled: ov.profilerEnabled ? ov.profilerActive : null,
             wrapperCommand: ov.wrapperEnabled ? ov.wrapperCommand : null,
+            minecraftVersion: selectedMcVersion() || null,
+            modLoader: selectedModLoader() || null,
           },
         });
       }
@@ -941,6 +1030,39 @@ export default function App() {
     } catch (err) {
       pushUiError({ title: "Settings not saved", message: "The settings could not be written to disk.", detail: String(err), severity: "error", scope: "launch" });
     }
+  };
+
+  const saveVersionLoader = async (modlistName: string, version: string, loader: string) => {
+    if (!isTauri() || !modlistName) return;
+    const ov = modlistOverrides();
+    await invoke("save_modlist_overrides_command", {
+      overrides: {
+        modlistName,
+        minRamMb: ov.minRamEnabled ? ov.minRamMb : null,
+        maxRamMb: ov.maxRamEnabled ? ov.maxRamMb : null,
+        customJvmArgs: ov.customArgsEnabled ? ov.customJvmArgs : null,
+        profilerEnabled: ov.profilerEnabled ? ov.profilerActive : null,
+        wrapperCommand: ov.wrapperEnabled ? ov.wrapperCommand : null,
+        minecraftVersion: version || null,
+        modLoader: loader || null,
+      },
+    }).catch(() => {});
+  };
+
+  const handleVersionChange = (version: string) => {
+    const modlistName = selectedModListName();
+    setSelectedMcVersion(version);
+    modlistVersionLoaderCache.set(modlistName, { version, loader: selectedModLoader() });
+    setModListCards(cards => cards.map(c => c.name === modlistName ? { ...c, mcVersion: version } : c));
+    void saveVersionLoader(modlistName, version, selectedModLoader());
+  };
+
+  const handleLoaderChange = (loader: string) => {
+    const modlistName = selectedModListName();
+    setSelectedModLoader(loader);
+    modlistVersionLoaderCache.set(modlistName, { version: selectedMcVersion(), loader });
+    setModListCards(cards => cards.map(c => c.name === modlistName ? { ...c, modLoader: loader } : c));
+    void saveVersionLoader(modlistName, selectedMcVersion(), loader);
   };
 
   const handleSaveIncompatibilities = async () => {
@@ -988,12 +1110,55 @@ export default function App() {
           iconLabel: presentation.iconLabel,
           iconAccent: presentation.iconAccent,
           notes: presentation.notes,
+          iconImage: presentation.iconImage || null,
         },
       });
       setInstancePresentationOpen(false);
       await loadModlistPresentation(selectedModListName());
     } catch (err) {
-      pushUiError({ title: "Could not save notes", message: "The mod-list notes and icon settings could not be persisted.", detail: String(err), severity: "error", scope: "launch" });
+      pushUiError({ title: "Could not save settings", message: "The mod-list settings could not be persisted.", detail: String(err), severity: "error", scope: "launch" });
+    }
+  };
+
+  const handleDeleteModList = async () => {
+    const name = selectedModListName();
+    if (!name) return;
+
+    if (!isTauri()) {
+      setInstancePresentationOpen(false);
+      return;
+    }
+
+    try {
+      await invoke("delete_modlist_command", { modlistName: name });
+      setInstancePresentationOpen(false);
+      // Reload shell to refresh mod-list sidebar
+      const snap: any = await invoke("load_shell_snapshot_command");
+      const cards = (snap.modlists ?? []).map((m: any) => ({
+        name: m.name,
+        status: "Ready" as const,
+        accent: "from-primary/30 via-primary/10 to-transparent",
+        description: m.description || (m.rule_count > 0 ? `${m.rule_count} rules` : "Empty mod list"),
+      }));
+      setModListCards(cards);
+      void loadAllCardIcons(cards.map((c: { name: string }) => c.name));
+      const next = cards[0]?.name ?? null;
+      if (next) {
+        setSelectedModListName(next);
+        const editorSnapshot = await loadEditorSnapshot(next, true);
+        await loadModlistPresentation(next);
+        await loadModlistGroups(next, editorSnapshot?.rows ?? modRowsState());
+        setLastSavedGroupLayout(serializeGroupsLayout(aestheticGroups(), functionalGroups(), versionRules(), customConfigs()));
+        setGroupLayoutReady(true);
+        setLastSavedIncompat(serializeIncompatibilities(savedIncompatibilities()));
+        setIncompatReady(true);
+      } else {
+        setSelectedModListName("");
+        setInstancePresentation({ iconLabel: "ML", iconAccent: "", notes: "", iconImage: "" });
+        setModRowsState([]);
+      }
+    } catch (err) {
+      pushUiError({ title: "Could not delete mod-list", message: "The mod-list could not be deleted.", detail: String(err), severity: "error", scope: "launch" });
     }
   };
 
@@ -1088,7 +1253,7 @@ export default function App() {
             onDeleteSelected={handleDeleteSelected}
             onReorder={orderedIds => void handleReorderRules(orderedIds)}
           />
-          <LaunchPanel onLaunch={handleLaunch} onSwitchAccount={handleSwitchAccount} />
+          <LaunchPanel onLaunch={handleLaunch} onSwitchAccount={handleSwitchAccount} onVersionChange={handleVersionChange} onLoaderChange={handleLoaderChange} />
         </div>
       </div>
 
@@ -1100,7 +1265,8 @@ export default function App() {
       <FunctionalGroupModal />
       <LinkModal />
       <LinksOverviewModal />
-      <InstancePresentationModal onSave={handleSavePresentation} />
+      <AdvancedModPanel />
+      <InstancePresentationModal onSave={handleSavePresentation} onDelete={handleDeleteModList} />
       <RenameRuleModal onRename={handleRenameRule} />
       <IncompatibilitiesModal onSave={handleSaveIncompatibilities} />
       <AlternativesPanel onSave={handleSaveAlternativeOrder} onAddAlternative={handleAddAlternative} onRemoveAlternative={handleRemoveAlternative} />

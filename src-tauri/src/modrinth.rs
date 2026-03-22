@@ -224,6 +224,7 @@ impl ModLoader {
             ModLoader::NeoForge => "neoforge",
             ModLoader::Forge => "forge",
             ModLoader::Quilt => "quilt",
+            ModLoader::Vanilla => "vanilla",
         }
     }
 }

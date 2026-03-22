@@ -61,6 +61,22 @@ impl LauncherPaths {
         &self.java_runtimes_dir
     }
 
+    pub fn mc_cache_dir(&self) -> PathBuf {
+        self.cache_dir.join("minecraft")
+    }
+
+    pub fn mc_version_dir(&self, version: &str) -> PathBuf {
+        self.mc_cache_dir().join(version)
+    }
+
+    pub fn mc_libraries_dir(&self) -> PathBuf {
+        self.mc_cache_dir().join("libraries")
+    }
+
+    pub fn mc_assets_dir(&self) -> PathBuf {
+        self.mc_cache_dir().join("assets")
+    }
+
     pub fn create_required_directories(&self) -> Result<()> {
         for directory in [
             &self.root_dir,

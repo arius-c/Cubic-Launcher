@@ -338,39 +338,98 @@ export function AccountsModal(props: { onSwitchAccount: (id: string) => Promise<
   );
 }
 
-// ── Icon & Notes ───────────────────────────────────────────────────────────────
-export function InstancePresentationModal(props: { onSave: () => Promise<void> }) {
+// ── Settings (formerly Icon & Notes) ──────────────────────────────────────────
+const isTauriEnv = () => "__TAURI_INTERNALS__" in window;
+
+export function InstancePresentationModal(props: { onSave: () => Promise<void>; onDelete: () => Promise<void> }) {
+  // Local draft — initialised from global state whenever the modal opens
+  const [draft, setDraft] = createSignal({ ...instancePresentation() });
   const [saving, setSaving] = createSignal(false);
+  const [confirmDelete, setConfirmDelete] = createSignal(false);
+  const [deleting, setDeleting] = createSignal(false);
+
+  // Reset draft each time the modal opens
+  createEffect(() => {
+    if (instancePresentationOpen()) {
+      setDraft({ ...instancePresentation() });
+      setConfirmDelete(false);
+    }
+  });
+
+  const close = () => {
+    setInstancePresentationOpen(false);
+    setConfirmDelete(false);
+  };
 
   const handleSave = async () => {
     if (saving()) return;
     setSaving(true);
     try {
+      // Commit draft to global state, then persist
+      setInstancePresentation(draft());
       await props.onSave();
     } finally {
       setSaving(false);
     }
   };
 
+  const handleDelete = async () => {
+    if (deleting()) return;
+    setDeleting(true);
+    try {
+      await props.onDelete();
+    } finally {
+      setDeleting(false);
+      setConfirmDelete(false);
+    }
+  };
+
+  const pickIcon = async () => {
+    if (!isTauriEnv()) return;
+    try {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const { invoke: inv } = await import("@tauri-apps/api/core");
+      const selected = await open({
+        multiple: false,
+        filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg", "webp", "gif"] }],
+      });
+      if (typeof selected === "string") {
+        const dataUrl: string = await inv("read_image_as_data_url_command", { path: selected });
+        setDraft(cur => ({ ...cur, iconImage: dataUrl }));
+      }
+    } catch (_) {
+      // user cancelled or no dialog support
+    }
+  };
+
   return (
     <Show when={instancePresentationOpen()}>
-      <Modal onClose={() => setInstancePresentationOpen(false)}>
-        <ModalHeader title="Icon & Notes" description="Customize the mod-list card identity and save private notes for this pack." onClose={() => setInstancePresentationOpen(false)} />
+      <Modal onClose={close}>
+        <ModalHeader title="Settings" description="Customize the mod-list card identity and save private notes for this pack." onClose={close} />
         <div class="grid gap-6 p-6 md:grid-cols-[220px,1fr]">
           <div class="rounded-lg border border-border bg-background p-4">
             <p class="mb-3 text-xs font-medium uppercase tracking-wider text-muted-foreground">Preview</p>
             <div class="flex flex-col items-center rounded-lg border border-border bg-card px-4 py-6 text-center">
-              <div class="flex h-20 w-20 items-center justify-center rounded-2xl bg-primary/15 text-2xl font-semibold text-primary shadow-inner">
-                {(instancePresentation().iconLabel.trim() || "ML").slice(0, 3).toUpperCase()}
-              </div>
-              <Show when={instancePresentation().iconAccent.trim()}>
+              <button
+                onClick={() => void pickIcon()}
+                class="relative flex h-20 w-20 items-center justify-center rounded-2xl bg-primary/15 text-2xl font-semibold text-primary shadow-inner overflow-hidden hover:ring-2 hover:ring-primary transition-all"
+                title="Click to set a custom icon image"
+              >
+                <Show when={draft().iconImage} fallback={
+                  <span>{(draft().iconLabel.trim() || "ML").toUpperCase()}</span>
+                }>
+                  <img src={draft().iconImage} class="absolute inset-0 h-full w-full object-cover" alt="icon" />
+                </Show>
+                <span class="absolute inset-0 flex items-center justify-center bg-black/40 opacity-0 hover:opacity-100 transition-opacity text-xs text-white font-medium">Edit</span>
+              </button>
+              <Show when={draft().iconAccent.trim()}>
                 <p class="mt-3 text-xs uppercase tracking-[0.18em] text-primary/80">
-                  {instancePresentation().iconAccent}
+                  {draft().iconAccent}
                 </p>
               </Show>
-              <Show when={instancePresentation().notes.trim()}>
-                <p class="mt-3 line-clamp-4 text-xs text-muted-foreground">
-                  {instancePresentation().notes}
+              <Show when={draft().notes.trim()}>
+                <p class="mt-3 text-xs text-muted-foreground whitespace-pre-wrap break-words text-left w-full line-clamp-4">
+                  {draft().notes}
                 </p>
               </Show>
             </div>
@@ -378,43 +437,68 @@ export function InstancePresentationModal(props: { onSave: () => Promise<void> }
 
           <div class="space-y-4">
             <div>
-              <label class="mb-1.5 block text-sm font-medium text-foreground">Icon Label</label>
+              <label class="mb-1.5 block text-sm font-medium text-foreground">Name</label>
               <input
                 type="text"
-                value={instancePresentation().iconLabel}
-                onInput={e => setInstancePresentation(current => ({ ...current, iconLabel: e.currentTarget.value.slice(0, 3).toUpperCase() }))}
-                placeholder="ML"
+                value={draft().iconLabel}
+                onInput={e => setDraft(cur => ({ ...cur, iconLabel: e.currentTarget.value }))}
+                placeholder="My Mod List"
                 class="w-full rounded-md border border-input bg-input px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
                 autofocus
               />
-              <p class="mt-1 text-xs text-muted-foreground">Shown as the compact mod-list badge.</p>
             </div>
             <div>
-              <label class="mb-1.5 block text-sm font-medium text-foreground">Accent Label</label>
+              <label class="mb-1.5 block text-sm font-medium text-foreground">Created by</label>
               <input
                 type="text"
-                value={instancePresentation().iconAccent}
-                onInput={e => setInstancePresentation(current => ({ ...current, iconAccent: e.currentTarget.value }))}
-                placeholder="Skyline"
+                value={draft().iconAccent}
+                onInput={e => setDraft(cur => ({ ...cur, iconAccent: e.currentTarget.value }))}
+                placeholder="Author name"
                 class="w-full rounded-md border border-input bg-input px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
               />
-              <p class="mt-1 text-xs text-muted-foreground">Optional short accent shown beneath the badge preview.</p>
             </div>
             <div>
               <label class="mb-1.5 block text-sm font-medium text-foreground">Notes</label>
               <textarea
                 rows={8}
-                value={instancePresentation().notes}
-                onInput={e => setInstancePresentation(current => ({ ...current, notes: e.currentTarget.value }))}
+                value={draft().notes}
+                onInput={e => setDraft(cur => ({ ...cur, notes: e.currentTarget.value }))}
                 placeholder="Remember shader requirements, server notes, or version-specific caveats..."
-                class="w-full resize-none rounded-md border border-input bg-input px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+                class="w-full resize-none rounded-md border border-input bg-input px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring whitespace-pre-wrap break-words"
               />
             </div>
           </div>
         </div>
-        <div class="flex justify-end gap-2 border-t border-border px-6 py-4">
-          <button onClick={() => setInstancePresentationOpen(false)} class="rounded-md bg-secondary px-4 py-2 text-sm text-secondary-foreground hover:bg-secondary/80">Cancel</button>
-          <button onClick={() => void handleSave()} disabled={saving()} class="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50">{saving() ? "Saving..." : "Save Notes"}</button>
+        <div class="flex items-center justify-between gap-2 border-t border-border px-6 py-4">
+          <Show when={confirmDelete()} fallback={
+            <button
+              onClick={() => setConfirmDelete(true)}
+              class="rounded-md bg-red-900/40 px-4 py-2 text-sm text-red-300 hover:bg-red-900/70 border border-red-700/40 transition-colors"
+            >
+              Delete Mod-list
+            </button>
+          }>
+            <div class="flex items-center gap-2">
+              <span class="text-sm text-red-400">Are you sure? This cannot be undone.</span>
+              <button
+                onClick={() => void handleDelete()}
+                disabled={deleting()}
+                class="rounded-md bg-red-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-red-700 disabled:opacity-50"
+              >
+                {deleting() ? "Deleting..." : "Yes, delete"}
+              </button>
+              <button
+                onClick={() => setConfirmDelete(false)}
+                class="rounded-md bg-secondary px-3 py-1.5 text-sm text-secondary-foreground hover:bg-secondary/80"
+              >
+                Cancel
+              </button>
+            </div>
+          </Show>
+          <div class="flex gap-2 ml-auto">
+            <button onClick={close} class="rounded-md bg-secondary px-4 py-2 text-sm text-secondary-foreground hover:bg-secondary/80">Cancel</button>
+            <button onClick={() => void handleSave()} disabled={saving()} class="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50">{saving() ? "Saving..." : "Save Settings"}</button>
+          </div>
         </div>
       </Modal>
     </Show>

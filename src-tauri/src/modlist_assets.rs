@@ -4,6 +4,7 @@ use std::io::{Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
 use tauri::State;
 use zip::write::FileOptions;
@@ -20,6 +21,8 @@ pub struct ModlistPresentation {
     pub icon_label: String,
     pub icon_accent: String,
     pub notes: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon_image: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,9 +47,34 @@ pub struct PersistedFunctionalGroup {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PersistedVersionRule {
+    pub id: String,
+    pub mod_id: String,
+    pub kind: String,
+    pub mc_versions: Vec<String>,
+    pub loader: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistedCustomConfig {
+    pub id: String,
+    pub mod_id: String,
+    pub mc_versions: Vec<String>,
+    pub loader: String,
+    pub target_path: String,
+    pub files: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ModlistGroupLayout {
     pub aesthetic_groups: Vec<PersistedAestheticGroup>,
     pub functional_groups: Vec<PersistedFunctionalGroup>,
+    #[serde(default)]
+    pub version_rules: Vec<PersistedVersionRule>,
+    #[serde(default)]
+    pub custom_configs: Vec<PersistedCustomConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -56,6 +84,8 @@ pub struct SaveModlistPresentationInput {
     pub icon_label: String,
     pub icon_accent: String,
     pub notes: String,
+    #[serde(default)]
+    pub icon_image: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -76,6 +106,10 @@ pub struct SaveModlistGroupsInput {
     pub modlist_name: String,
     pub aesthetic_groups: Vec<PersistedAestheticGroup>,
     pub functional_groups: Vec<PersistedFunctionalGroup>,
+    #[serde(default)]
+    pub version_rules: Vec<PersistedVersionRule>,
+    #[serde(default)]
+    pub custom_configs: Vec<PersistedCustomConfig>,
 }
 
 #[tauri::command]
@@ -122,6 +156,30 @@ pub fn export_modlist_command(
     export_modlist_from_root(launcher_paths.root_dir(), &input).map_err(|error| error.to_string())
 }
 
+#[tauri::command]
+pub fn read_image_as_data_url_command(path: String) -> Result<String, String> {
+    read_image_as_data_url(&path).map_err(|e| e.to_string())
+}
+
+fn read_image_as_data_url(path: &str) -> Result<String> {
+    let p = std::path::Path::new(path);
+    let ext = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("png")
+        .to_lowercase();
+    let mime = match ext.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "ico" => "image/x-icon",
+        _ => "image/png",
+    };
+    let bytes = fs::read(p).with_context(|| format!("failed to read image at {}", p.display()))?;
+    let b64 = BASE64.encode(&bytes);
+    Ok(format!("data:{mime};base64,{b64}"))
+}
+
 pub fn load_modlist_presentation_from_root(
     root_dir: &Path,
     modlist_name: &str,
@@ -154,6 +212,7 @@ pub fn save_modlist_presentation_from_root(
         icon_label: normalize_icon_label(&input.icon_label, &input.modlist_name),
         icon_accent: input.icon_accent.trim().to_string(),
         notes: input.notes.trim().to_string(),
+        icon_image: input.icon_image.clone().filter(|s| !s.is_empty()),
     };
     let presentation_path = modlist_presentation_path(root_dir, &input.modlist_name);
 
@@ -205,6 +264,8 @@ pub fn save_modlist_groups_from_root(
     let layout = ModlistGroupLayout {
         aesthetic_groups: input.aesthetic_groups.clone(),
         functional_groups: input.functional_groups.clone(),
+        version_rules: input.version_rules.clone(),
+        custom_configs: input.custom_configs.clone(),
     };
     let layout_path = modlist_group_layout_path(root_dir, &input.modlist_name);
 
@@ -372,6 +433,7 @@ fn default_presentation(modlist_name: &str) -> ModlistPresentation {
         icon_label: normalize_icon_label("", modlist_name),
         icon_accent: String::new(),
         notes: String::new(),
+        icon_image: None,
     }
 }
 
@@ -379,6 +441,8 @@ fn default_group_layout() -> ModlistGroupLayout {
     ModlistGroupLayout {
         aesthetic_groups: Vec::new(),
         functional_groups: Vec::new(),
+        version_rules: Vec::new(),
+        custom_configs: Vec::new(),
     }
 }
 
@@ -590,6 +654,7 @@ mod tests {
             icon_label: "sp".into(),
             icon_accent: "Aurora".into(),
             notes: "Bring shaders and minimap.".into(),
+            icon_image: None,
         };
 
         save_modlist_presentation_from_root(&root_dir, &input).expect("presentation should save");
@@ -602,6 +667,7 @@ mod tests {
                 icon_label: "SP".into(),
                 icon_accent: "Aurora".into(),
                 notes: "Bring shaders and minimap.".into(),
+                icon_image: None,
             }
         );
 
@@ -621,6 +687,8 @@ mod tests {
             ModlistGroupLayout {
                 aesthetic_groups: Vec::new(),
                 functional_groups: Vec::new(),
+                version_rules: Vec::new(),
+                custom_configs: Vec::new(),
             }
         );
 
@@ -645,6 +713,8 @@ mod tests {
                 tone: "violet".into(),
                 mod_ids: vec!["rule-0-sodium".into(), "rule-1-lithium".into()],
             }],
+            version_rules: Vec::new(),
+            custom_configs: Vec::new(),
         };
 
         save_modlist_groups_from_root(&root_dir, &input).expect("groups should save");
@@ -655,6 +725,8 @@ mod tests {
             ModlistGroupLayout {
                 aesthetic_groups: input.aesthetic_groups,
                 functional_groups: input.functional_groups,
+                version_rules: Vec::new(),
+                custom_configs: Vec::new(),
             }
         );
 
