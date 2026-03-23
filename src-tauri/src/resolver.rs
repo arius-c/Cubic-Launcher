@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use anyhow::Result;
 
-use crate::rules::{FallbackStrategy, ModList, ModReference, RuleOption};
+use crate::rules::{ModList, ModReference, Rule};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolutionTarget {
@@ -34,6 +34,7 @@ pub struct ResolvedRule {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuleOutcome {
     Resolved {
+        /// 0 = primary mods were used, 1+ = Nth alternative was used.
         option_index: usize,
         mods: Vec<ModReference>,
     },
@@ -66,50 +67,15 @@ pub fn resolve_modlist(
     let mut resolved_rules = Vec::with_capacity(modlist.rules.len());
 
     for rule in &modlist.rules {
-        let mut rule_outcome = RuleOutcome::Unresolved {
-            reason: RuleFailureReason::NoOptionsAvailable,
-        };
-
-        for (option_index, option) in rule.options.iter().enumerate() {
-            if option_is_excluded(option, &active_mods) {
-                rule_outcome = RuleOutcome::Unresolved {
-                    reason: RuleFailureReason::ExcludedByActiveMods,
-                };
-
-                if option.fallback_strategy == FallbackStrategy::Abort {
-                    break;
-                }
-
-                continue;
-            }
-
-            if option_group_is_compatible(option, target, compatibility_checker)? {
-                let resolved_mods = option.mods.clone();
-
-                for mod_reference in &resolved_mods {
-                    active_mods.insert(mod_reference.id.clone());
-                }
-
-                rule_outcome = RuleOutcome::Resolved {
-                    option_index,
-                    mods: resolved_mods,
-                };
-
-                break;
-            }
-
-            rule_outcome = RuleOutcome::Unresolved {
-                reason: RuleFailureReason::IncompatibleGroup,
-            };
-
-            if option.fallback_strategy == FallbackStrategy::Abort {
-                break;
+        let outcome = try_resolve_rule(rule, 0, &active_mods, target, compatibility_checker)?;
+        if let RuleOutcome::Resolved { ref mods, .. } = outcome {
+            for m in mods {
+                active_mods.insert(m.id.clone());
             }
         }
-
         resolved_rules.push(ResolvedRule {
             rule_name: rule.rule_name.clone(),
-            outcome: rule_outcome,
+            outcome,
         });
     }
 
@@ -119,24 +85,82 @@ pub fn resolve_modlist(
     })
 }
 
-fn option_is_excluded(option: &RuleOption, active_mods: &HashSet<String>) -> bool {
-    option
-        .exclude_if_present
+/// Try to resolve a rule. `option_index` tracks which position this rule occupies
+/// in the fallback chain: 0 = primary, 1 = first alternative, 2 = second, etc.
+fn try_resolve_rule(
+    rule: &Rule,
+    option_index: usize,
+    active_mods: &HashSet<String>,
+    target: &ResolutionTarget,
+    checker: &impl CompatibilityChecker,
+) -> Result<RuleOutcome> {
+    // 1. Is this rule excluded by an already-active mod?
+    if rule_is_excluded(rule, active_mods) {
+        return try_alternatives(
+            rule,
+            option_index,
+            active_mods,
+            target,
+            checker,
+            RuleFailureReason::ExcludedByActiveMods,
+        );
+    }
+
+    // 2. Are all mods in this rule compatible with the target?
+    if !all_mods_compatible(&rule.mods, target, checker)? {
+        return try_alternatives(
+            rule,
+            option_index,
+            active_mods,
+            target,
+            checker,
+            RuleFailureReason::IncompatibleGroup,
+        );
+    }
+
+    // 3. Resolved — primary mods are active.
+    Ok(RuleOutcome::Resolved {
+        option_index,
+        mods: rule.mods.clone(),
+    })
+}
+
+/// Iterate alternatives in order, returning the first that resolves successfully.
+fn try_alternatives(
+    rule: &Rule,
+    base_index: usize,
+    active_mods: &HashSet<String>,
+    target: &ResolutionTarget,
+    checker: &impl CompatibilityChecker,
+    fallback_reason: RuleFailureReason,
+) -> Result<RuleOutcome> {
+    for (i, alt) in rule.alternatives.iter().enumerate() {
+        let outcome = try_resolve_rule(alt, base_index + i + 1, active_mods, target, checker)?;
+        if matches!(outcome, RuleOutcome::Resolved { .. }) {
+            return Ok(outcome);
+        }
+    }
+    Ok(RuleOutcome::Unresolved {
+        reason: fallback_reason,
+    })
+}
+
+fn rule_is_excluded(rule: &Rule, active_mods: &HashSet<String>) -> bool {
+    rule.exclude_if_present
         .iter()
         .any(|mod_id| active_mods.contains(mod_id))
 }
 
-fn option_group_is_compatible(
-    option: &RuleOption,
+fn all_mods_compatible(
+    mods: &[ModReference],
     target: &ResolutionTarget,
-    compatibility_checker: &impl CompatibilityChecker,
+    checker: &impl CompatibilityChecker,
 ) -> Result<bool> {
-    for mod_reference in &option.mods {
-        if !compatibility_checker.is_compatible(mod_reference, target)? {
+    for mod_reference in mods {
+        if !checker.is_compatible(mod_reference, target)? {
             return Ok(false);
         }
     }
-
     Ok(true)
 }
 
@@ -146,7 +170,7 @@ mod tests {
 
     use anyhow::Result;
 
-    use crate::rules::{FallbackStrategy, ModList, ModReference, ModSource, Rule, RuleOption};
+    use crate::rules::{ModList, ModReference, ModSource, Rule};
 
     use super::{
         resolve_modlist, CompatibilityChecker, ModLoader, ResolutionTarget, RuleFailureReason,
@@ -194,30 +218,33 @@ mod tests {
         }
     }
 
+    fn simple_rule(name: &str, mod_id: &str) -> Rule {
+        Rule {
+            rule_name: name.into(),
+            mods: vec![modrinth_mod(mod_id)],
+            exclude_if_present: vec![],
+            alternatives: vec![],
+            links: vec![],
+            version_rules: vec![],
+            custom_configs: vec![],
+        }
+    }
+
     #[test]
-    fn continues_to_next_option_when_first_option_is_incompatible() {
+    fn continues_to_alternative_when_primary_is_incompatible() {
         let modlist = ModList {
             modlist_name: "Test Pack".into(),
             author: "ActiveGamertag".into(),
             description: "Test".into(),
+            groups_meta: vec![],
             rules: vec![Rule {
                 rule_name: "Rendering".into(),
-                options: vec![
-                    RuleOption {
-                        mods: vec![modrinth_mod("sodium")],
-                        exclude_if_present: vec![],
-                        fallback_strategy: FallbackStrategy::Continue,
-                        option_name: None,
-                        alternatives: vec![],
-                    },
-                    RuleOption {
-                        mods: vec![modrinth_mod("rubidium")],
-                        exclude_if_present: vec![],
-                        fallback_strategy: FallbackStrategy::Continue,
-                        option_name: None,
-                        alternatives: vec![],
-                    },
-                ],
+                mods: vec![modrinth_mod("sodium")],
+                exclude_if_present: vec![],
+                alternatives: vec![simple_rule("Rubidium", "rubidium")],
+                links: vec![],
+                version_rules: vec![],
+                custom_configs: vec![],
             }],
         };
 
@@ -238,40 +265,58 @@ mod tests {
     }
 
     #[test]
-    fn aborts_rule_when_excluded_option_uses_abort_strategy() {
+    fn rule_stays_unresolved_when_excluded_and_no_alternatives() {
         let modlist = ModList {
             modlist_name: "Test Pack".into(),
             author: "ActiveGamertag".into(),
             description: "Test".into(),
+            groups_meta: vec![],
             rules: vec![
-                Rule {
-                    rule_name: "Rendering".into(),
-                    options: vec![RuleOption {
-                        mods: vec![modrinth_mod("sodium")],
-                        exclude_if_present: vec![],
-                        fallback_strategy: FallbackStrategy::Continue,
-                        option_name: None,
-                        alternatives: vec![],
-                    }],
-                },
+                simple_rule("Primary Renderer", "sodium"),
                 Rule {
                     rule_name: "Conflicting Mod".into(),
-                    options: vec![
-                        RuleOption {
-                            mods: vec![modrinth_mod("mod-b")],
-                            exclude_if_present: vec!["sodium".into()],
-                            fallback_strategy: FallbackStrategy::Abort,
-                            option_name: None,
-                            alternatives: vec![],
-                        },
-                        RuleOption {
-                            mods: vec![modrinth_mod("mod-b-alt")],
-                            exclude_if_present: vec![],
-                            fallback_strategy: FallbackStrategy::Continue,
-                            option_name: None,
-                            alternatives: vec![],
-                        },
-                    ],
+                    mods: vec![modrinth_mod("mod-b")],
+                    exclude_if_present: vec!["sodium".into()],
+                    alternatives: vec![],
+                    links: vec![],
+                    version_rules: vec![],
+                    custom_configs: vec![],
+                },
+            ],
+        };
+
+        let checker =
+            FakeCompatibilityChecker::with([("sodium", true), ("mod-b", true)]);
+
+        let result =
+            resolve_modlist(&modlist, &target(), &checker).expect("resolution should work");
+
+        assert_eq!(
+            result.resolved_rules[1].outcome,
+            RuleOutcome::Unresolved {
+                reason: RuleFailureReason::ExcludedByActiveMods,
+            }
+        );
+        assert!(!result.active_mods.contains("mod-b"));
+    }
+
+    #[test]
+    fn falls_back_to_alternative_when_excluded() {
+        let modlist = ModList {
+            modlist_name: "Test Pack".into(),
+            author: "ActiveGamertag".into(),
+            description: "Test".into(),
+            groups_meta: vec![],
+            rules: vec![
+                simple_rule("Primary Renderer", "sodium"),
+                Rule {
+                    rule_name: "Conflicting Mod".into(),
+                    mods: vec![modrinth_mod("mod-b")],
+                    exclude_if_present: vec!["sodium".into()],
+                    alternatives: vec![simple_rule("Alt Mod", "mod-b-alt")],
+                    links: vec![],
+                    version_rules: vec![],
+                    custom_configs: vec![],
                 },
             ],
         };
@@ -287,12 +332,13 @@ mod tests {
 
         assert_eq!(
             result.resolved_rules[1].outcome,
-            RuleOutcome::Unresolved {
-                reason: RuleFailureReason::ExcludedByActiveMods,
+            RuleOutcome::Resolved {
+                option_index: 1,
+                mods: vec![modrinth_mod("mod-b-alt")],
             }
         );
+        assert!(result.active_mods.contains("mod-b-alt"));
         assert!(!result.active_mods.contains("mod-b"));
-        assert!(!result.active_mods.contains("mod-b-alt"));
     }
 
     #[test]
@@ -301,24 +347,15 @@ mod tests {
             modlist_name: "Test Pack".into(),
             author: "ActiveGamertag".into(),
             description: "Test".into(),
+            groups_meta: vec![],
             rules: vec![Rule {
                 rule_name: "Rendering".into(),
-                options: vec![
-                    RuleOption {
-                        mods: vec![modrinth_mod("optifine"), modrinth_mod("optifabric")],
-                        exclude_if_present: vec![],
-                        fallback_strategy: FallbackStrategy::Continue,
-                        option_name: None,
-                        alternatives: vec![],
-                    },
-                    RuleOption {
-                        mods: vec![modrinth_mod("sodium")],
-                        exclude_if_present: vec![],
-                        fallback_strategy: FallbackStrategy::Continue,
-                        option_name: None,
-                        alternatives: vec![],
-                    },
-                ],
+                mods: vec![modrinth_mod("optifine"), modrinth_mod("optifabric")],
+                exclude_if_present: vec![],
+                alternatives: vec![simple_rule("Sodium", "sodium")],
+                links: vec![],
+                version_rules: vec![],
+                custom_configs: vec![],
             }],
         };
 
@@ -342,36 +379,26 @@ mod tests {
     }
 
     #[test]
-    fn aborts_rule_when_incompatible_group_uses_abort_strategy() {
+    fn rule_stays_unresolved_when_incompatible_and_no_alternatives() {
         let modlist = ModList {
             modlist_name: "Test Pack".into(),
             author: "ActiveGamertag".into(),
             description: "Test".into(),
+            groups_meta: vec![],
             rules: vec![Rule {
                 rule_name: "Rendering".into(),
-                options: vec![
-                    RuleOption {
-                        mods: vec![modrinth_mod("optifine"), modrinth_mod("optifabric")],
-                        exclude_if_present: vec![],
-                        fallback_strategy: FallbackStrategy::Abort,
-                        option_name: None,
-                        alternatives: vec![],
-                    },
-                    RuleOption {
-                        mods: vec![modrinth_mod("sodium")],
-                        exclude_if_present: vec![],
-                        fallback_strategy: FallbackStrategy::Continue,
-                        option_name: None,
-                        alternatives: vec![],
-                    },
-                ],
+                mods: vec![modrinth_mod("optifine"), modrinth_mod("optifabric")],
+                exclude_if_present: vec![],
+                alternatives: vec![],
+                links: vec![],
+                version_rules: vec![],
+                custom_configs: vec![],
             }],
         };
 
         let checker = FakeCompatibilityChecker::with([
             ("optifine", true),
             ("optifabric", false),
-            ("sodium", true),
         ]);
 
         let result =
@@ -392,41 +419,26 @@ mod tests {
             modlist_name: "Test Pack".into(),
             author: "ActiveGamertag".into(),
             description: "Test".into(),
+            groups_meta: vec![],
             rules: vec![
-                Rule {
-                    rule_name: "Primary Renderer".into(),
-                    options: vec![RuleOption {
-                        mods: vec![modrinth_mod("sodium")],
-                        exclude_if_present: vec![],
-                        fallback_strategy: FallbackStrategy::Continue,
-                        option_name: None,
-                        alternatives: vec![],
-                    }],
-                },
+                simple_rule("Primary Renderer", "sodium"),
                 Rule {
                     rule_name: "Secondary Renderer".into(),
-                    options: vec![
-                        RuleOption {
-                            mods: vec![modrinth_mod("embeddium")],
-                            exclude_if_present: vec!["sodium".into()],
-                            fallback_strategy: FallbackStrategy::Continue,
-                            option_name: None,
-                            alternatives: vec![],
-                        },
-                        RuleOption {
-                            mods: vec![modrinth_mod("iris")],
-                            exclude_if_present: vec![],
-                            fallback_strategy: FallbackStrategy::Continue,
-                            option_name: None,
-                            alternatives: vec![],
-                        },
-                    ],
+                    mods: vec![modrinth_mod("embeddium")],
+                    exclude_if_present: vec!["sodium".into()],
+                    alternatives: vec![simple_rule("Iris", "iris")],
+                    links: vec![],
+                    version_rules: vec![],
+                    custom_configs: vec![],
                 },
             ],
         };
 
-        let checker =
-            FakeCompatibilityChecker::with([("sodium", true), ("embeddium", true), ("iris", true)]);
+        let checker = FakeCompatibilityChecker::with([
+            ("sodium", true),
+            ("embeddium", true),
+            ("iris", true),
+        ]);
 
         let result =
             resolve_modlist(&modlist, &target(), &checker).expect("resolution should work");

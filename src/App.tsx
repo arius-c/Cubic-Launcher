@@ -16,7 +16,6 @@ import {
   setGlobalSettings, setModlistOverrides,
   upsertDownloadProgress, pushUiError, resetLaunchUiState,
   aestheticGroups, functionalGroups, setAestheticGroups, setFunctionalGroups,
-  versionRules, setVersionRules, customConfigs, setCustomConfigs,
   savedIncompatibilities, setSavedIncompatibilities,
   draftIncompatibilities, setIncompatibilityModalOpen,
   instancePresentation, setInstancePresentation,
@@ -27,7 +26,7 @@ import {
   LAUNCH_STAGES, wait,
   DEMO_MOD_LISTS, DEMO_ACCOUNTS,
 } from "./store";
-import type { AestheticGroup, FunctionalGroup, ModRow, VersionRule, CustomConfig } from "./lib/types";
+import type { AestheticGroup, FunctionalGroup, ModRow } from "./lib/types";
 
 // ── Row state helpers ─────────────────────────────────────────────────────────
 
@@ -223,24 +222,22 @@ function remapFunctionalGroups(groups: FunctionalGroup[], idRemap: Map<string, s
   }));
 }
 
-function serializeGroupsLayout(aGroups: AestheticGroup[], fGroups: FunctionalGroup[], vRules: VersionRule[], cConfigs: CustomConfig[]) {
+function serializeGroupsLayout(fGroups: FunctionalGroup[]) {
   return JSON.stringify({
-    aestheticGroups: aGroups.map(group => ({
-      id: group.id,
-      name: group.name,
-      collapsed: group.collapsed,
-      blockIds: [...group.blockIds],
-      scopeRowId: group.scopeRowId ?? null,
-    })),
-    functionalGroups: fGroups.map(group => ({
+    tags: fGroups.map(group => ({
       id: group.id,
       name: group.name,
       tone: group.tone,
-      modIds: [...group.modIds],
+      modIds: group.modIds,
     })),
-    versionRules: vRules,
-    customConfigs: cConfigs,
   });
+}
+
+/** Serialize aesthetic group structure for change-detection in save_rule_groups_command. */
+function serializeRuleGroups(aGroups: AestheticGroup[]): string {
+  return JSON.stringify(
+    aGroups.map(g => ({ id: g.id, name: g.name, collapsed: g.collapsed, rowIds: g.blockIds }))
+  );
 }
 
 function serializeIncompatibilities(rules: Array<{ winnerId: string; loserId: string }>) {
@@ -371,9 +368,18 @@ async function loadEditorSnapshot(modlistName: string, resetGroups = false) {
     // destroy and recreate every component on every reload.
     setModRowsState(cur => smartSetModRows(cur, snap.rows ?? []));
 
-    // Only wipe frontend-only groups when switching to a different list.
+    // Load aesthetic groups (structural containers) from rules.json via the snapshot.
+    const snapGroups = (snap.groups ?? []).map((g: any) => ({
+      id: g.id as string,
+      name: g.name as string,
+      collapsed: Boolean(g.collapsed),
+      blockIds: (g.blockIds ?? []) as string[],
+      scopeRowId: null as string | null,
+    }));
+    setAestheticGroups(snapGroups);
+
+    // Wipe functional groups when switching to a different list; they're loaded by loadModlistGroups.
     if (resetGroups) {
-      setAestheticGroups([]);
       setFunctionalGroups([]);
     }
     const incompat: Array<{ winner_id: string; loser_id: string }> = snap.incompatibilities ?? [];
@@ -432,18 +438,12 @@ async function loadModlistPresentation(modlistName: string) {
 
 async function loadModlistGroups(modlistName: string, rows: ModRow[]) {
   if (!modlistName) {
-    setAestheticGroups([]);
     setFunctionalGroups([]);
-    setVersionRules([]);
-    setCustomConfigs([]);
     return null;
   }
 
   if (!isTauri()) {
-    setAestheticGroups([]);
     setFunctionalGroups([]);
-    setVersionRules([]);
-    setCustomConfigs([]);
     return null;
   }
 
@@ -458,46 +458,19 @@ async function loadModlistGroups(modlistName: string, rows: ModRow[]) {
     };
     collect(rows);
 
-    const nextAestheticGroups = (layout.aestheticGroups ?? []).map((group: any) => ({
-      id: group.id,
-      name: group.name,
-      collapsed: Boolean(group.collapsed),
-      blockIds: (group.blockIds ?? []).filter((id: string) => availableIds.has(id)),
-      scopeRowId: group.scopeRowId ?? null,
-    })).filter((group: any) => group.blockIds.length > 0);
-    const nextFunctionalGroups = (layout.functionalGroups ?? []).map((group: any) => ({
+    // Read tag definitions with their mod_ids directly from the layout file.
+    const tagDefs = layout.tags ?? layout.functionalGroups ?? [];
+    const nextFunctionalGroups = tagDefs.map((group: any) => ({
       id: group.id,
       name: group.name,
       tone: group.tone,
-      modIds: (group.modIds ?? []).filter((id: string) => availableIds.has(id)),
+      modIds: (group.modIds ?? group.mod_ids ?? []).filter((id: string) => availableIds.has(id)),
     }));
-
-    setAestheticGroups(nextAestheticGroups);
     setFunctionalGroups(nextFunctionalGroups);
-
-    setVersionRules((layout.versionRules ?? []).map((r: any) => ({
-      id: r.id,
-      modId: r.modId,
-      kind: r.kind === 'only' ? 'only' as const : 'exclude' as const,
-      mcVersions: r.mcVersions ?? [],
-      loader: r.loader ?? 'any',
-    })).filter((r: any) => availableIds.has(r.modId)));
-
-    setCustomConfigs((layout.customConfigs ?? []).map((c: any) => ({
-      id: c.id,
-      modId: c.modId,
-      mcVersions: c.mcVersions ?? [],
-      loader: c.loader ?? 'any',
-      targetPath: c.targetPath ?? '',
-      files: c.files ?? [],
-    })).filter((c: any) => availableIds.has(c.modId)));
 
     return layout;
   } catch (err) {
-    setAestheticGroups([]);
     setFunctionalGroups([]);
-    setVersionRules([]);
-    setCustomConfigs([]);
     pushUiError({ title: "Could not load groups", message: `Saved groups for '${modlistName}' could not be loaded.`, detail: String(err), severity: "error", scope: "launch" });
     return null;
   }
@@ -548,13 +521,15 @@ async function fetchModIcons(rows: ModRow[]) {
 export default function App() {
   const [groupLayoutReady, setGroupLayoutReady] = createSignal(false);
   const [lastSavedGroupLayout, setLastSavedGroupLayout] = createSignal("");
+  const [lastSavedRuleMetaGroups, setLastSavedRuleMetaGroups] = createSignal("");
   const [incompatReady, setIncompatReady] = createSignal(false);
   const [lastSavedIncompat, setLastSavedIncompat] = createSignal("");
 
+  // Save functional group (tag) definitions + membership to modlist-editor-groups.json.
   createEffect(() => {
     const modlistName = selectedModListName();
     const ready = groupLayoutReady();
-    const serialized = serializeGroupsLayout(aestheticGroups(), functionalGroups(), versionRules(), customConfigs());
+    const serialized = serializeGroupsLayout(functionalGroups());
 
     if (!ready || !modlistName || !isTauri() || serialized === lastSavedGroupLayout()) return;
 
@@ -562,14 +537,31 @@ export default function App() {
     void invoke("save_modlist_groups_command", {
       input: {
         modlistName,
-        aestheticGroups: aestheticGroups(),
-        functionalGroups: functionalGroups(),
-        versionRules: versionRules(),
-        customConfigs: customConfigs(),
+        tags: functionalGroups().map(g => ({ id: g.id, name: g.name, tone: g.tone, modIds: g.modIds })),
       },
     }).catch(err => {
       setLastSavedGroupLayout("");
       pushUiError({ title: "Could not save groups", message: "The mod-list group layout could not be persisted.", detail: String(err), severity: "error", scope: "launch" });
+    });
+  });
+
+  // Save aesthetic group structure (structural containers) to rules.json.
+  createEffect(() => {
+    const modlistName = selectedModListName();
+    const ready = groupLayoutReady();
+    const serialized = serializeRuleGroups(aestheticGroups());
+
+    if (!ready || !modlistName || !isTauri() || serialized === lastSavedRuleMetaGroups()) return;
+
+    setLastSavedRuleMetaGroups(serialized);
+    void invoke("save_rule_groups_command", {
+      input: {
+        modlistName,
+        groups: aestheticGroups().map(g => ({ id: g.id, name: g.name, collapsed: g.collapsed, rowIds: g.blockIds })),
+      },
+    }).catch(err => {
+      setLastSavedRuleMetaGroups("");
+      pushUiError({ title: "Could not save rule groups", message: "The structural rule groups could not be persisted.", detail: String(err), severity: "error", scope: "launch" });
     });
   });
 
@@ -628,7 +620,8 @@ export default function App() {
         const editorSnapshot = await loadEditorSnapshot(firstList);
         await loadModlistPresentation(firstList);
         await loadModlistGroups(firstList, editorSnapshot?.rows ?? modRowsState());
-        setLastSavedGroupLayout(serializeGroupsLayout(aestheticGroups(), functionalGroups(), versionRules(), customConfigs()));
+        setLastSavedGroupLayout(serializeGroupsLayout(functionalGroups()));
+        setLastSavedRuleMetaGroups(serializeRuleGroups(aestheticGroups()));
         setGroupLayoutReady(true);
         setLastSavedIncompat(serializeIncompatibilities(savedIncompatibilities()));
         setIncompatReady(true);
@@ -709,7 +702,8 @@ export default function App() {
     const editorSnapshot = await loadEditorSnapshot(name, true);
     await loadModlistPresentation(name);
     await loadModlistGroups(name, editorSnapshot?.rows ?? modRowsState());
-    setLastSavedGroupLayout(serializeGroupsLayout(aestheticGroups(), functionalGroups(), versionRules(), customConfigs()));
+    setLastSavedGroupLayout(serializeGroupsLayout(functionalGroups()));
+    setLastSavedRuleMetaGroups(serializeRuleGroups(aestheticGroups()));
     setGroupLayoutReady(true);
     setLastSavedIncompat(serializeIncompatibilities(savedIncompatibilities()));
     setIncompatReady(true);
@@ -877,7 +871,8 @@ export default function App() {
       const editorSnapshot = await loadEditorSnapshot(name);
       await loadModlistPresentation(name);
       await loadModlistGroups(name, editorSnapshot?.rows ?? modRowsState());
-      setLastSavedGroupLayout(serializeGroupsLayout(aestheticGroups(), functionalGroups(), versionRules(), customConfigs()));
+      setLastSavedGroupLayout(serializeGroupsLayout(functionalGroups()));
+      setLastSavedRuleMetaGroups(serializeRuleGroups(aestheticGroups()));
       setGroupLayoutReady(true);
       setLastSavedIncompat(serializeIncompatibilities(savedIncompatibilities()));
       setIncompatReady(true);
@@ -1148,7 +1143,8 @@ export default function App() {
         const editorSnapshot = await loadEditorSnapshot(next, true);
         await loadModlistPresentation(next);
         await loadModlistGroups(next, editorSnapshot?.rows ?? modRowsState());
-        setLastSavedGroupLayout(serializeGroupsLayout(aestheticGroups(), functionalGroups(), versionRules(), customConfigs()));
+        setLastSavedGroupLayout(serializeGroupsLayout(functionalGroups()));
+        setLastSavedRuleMetaGroups(serializeRuleGroups(aestheticGroups()));
         setGroupLayoutReady(true);
         setLastSavedIncompat(serializeIncompatibilities(savedIncompatibilities()));
         setIncompatReady(true);

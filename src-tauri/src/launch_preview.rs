@@ -534,16 +534,21 @@ fn collect_modrinth_project_ids(modlist: &ModList) -> HashSet<String> {
     let mut ids = HashSet::new();
 
     for rule in &modlist.rules {
-        for option in &rule.options {
-            for mod_reference in &option.mods {
-                if mod_reference.source == ModSource::Modrinth {
-                    ids.insert(mod_reference.id.clone());
-                }
-            }
-        }
+        collect_modrinth_ids_from_rule(rule, &mut ids);
     }
 
     ids
+}
+
+fn collect_modrinth_ids_from_rule(rule: &crate::rules::Rule, ids: &mut HashSet<String>) {
+    for mod_reference in &rule.mods {
+        if mod_reference.source == ModSource::Modrinth {
+            ids.insert(mod_reference.id.clone());
+        }
+    }
+    for alt in &rule.alternatives {
+        collect_modrinth_ids_from_rule(alt, ids);
+    }
 }
 
 fn log_resolution(app_handle: &tauri::AppHandle, resolution: &ResolutionResult) -> Result<()> {

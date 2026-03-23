@@ -346,6 +346,7 @@ export function ModRuleItem(props: ModRuleItemProps) {
     const interleaved: string[] = [];
     const seenGroups = new Set<string>();
     const ungroupedSet = new Set(ungroupedIds);
+    let ungroupedPos = 0;
     for (const alt of (props.row.alternatives ?? [])) {
       if (alt.id === fromId && !membership.has(fromId) && !ungroupedSet.has(fromId)) continue;
       const gId = membership.get(alt.id);
@@ -356,7 +357,7 @@ export function ModRuleItem(props: ModRuleItemProps) {
           if (g) interleaved.push(...g.blockIds);
         }
       } else if (ungroupedSet.has(alt.id)) {
-        interleaved.push(alt.id);
+        interleaved.push(ungroupedIds[ungroupedPos++]);
       }
     }
     // Safety: add any groups not encountered in the walk

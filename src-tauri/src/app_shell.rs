@@ -504,8 +504,18 @@ mod tests {
             description: "Primary integrated test pack".into(),
             rules: vec![Rule {
                 rule_name: "Rendering".into(),
-                options: Vec::new(),
+                mods: vec![crate::rules::ModReference {
+                    id: "sodium".into(),
+                    source: crate::rules::ModSource::Modrinth,
+                    file_name: None,
+                }],
+                exclude_if_present: vec![],
+                alternatives: vec![],
+                links: vec![],
+                version_rules: vec![],
+                custom_configs: vec![],
             }],
+            groups_meta: vec![],
         }
         .write_to_file(&rules_path)
         .expect("rules should write");
@@ -596,6 +606,7 @@ mod tests {
             author: "AlphaAuthor".into(),
             description: "Alpha description".into(),
             rules: Vec::new(),
+            groups_meta: vec![],
         }
         .write_to_file(&alpha_modlist_root.join("rules.json"))
         .expect("alpha rules should write");
@@ -604,6 +615,7 @@ mod tests {
             author: "BetaAuthor".into(),
             description: "Beta description".into(),
             rules: Vec::new(),
+            groups_meta: vec![],
         }
         .write_to_file(&beta_modlist_root.join("rules.json"))
         .expect("beta rules should write");

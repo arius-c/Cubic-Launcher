@@ -67,6 +67,8 @@ pub fn run() {
             editor_data::add_alternative_command,
             editor_data::add_nested_alternative_command,
             editor_data::remove_alternative_command,
+            editor_data::save_rule_metadata_command,
+            editor_data::save_rule_groups_command,
             modlist_manager::create_modlist_command,
             modlist_manager::delete_modlist_command,
             modlist_manager::copy_local_jar_command,

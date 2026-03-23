@@ -25,56 +25,25 @@ pub struct ModlistPresentation {
     pub icon_image: Option<String>,
 }
 
+/// Tag (formerly "functionalGroup") definition stored in `modlist-editor-groups.json`.
+/// Membership is stored here as `mod_ids` — which row IDs this tag applies to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct PersistedAestheticGroup {
-    pub id: String,
-    pub name: String,
-    pub collapsed: bool,
-    pub block_ids: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scope_row_id: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PersistedFunctionalGroup {
+pub struct PersistedTag {
     pub id: String,
     pub name: String,
     pub tone: String,
+    /// Row IDs of rules/alts that have this tag assigned.
+    #[serde(default)]
     pub mod_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct PersistedVersionRule {
-    pub id: String,
-    pub mod_id: String,
-    pub kind: String,
-    pub mc_versions: Vec<String>,
-    pub loader: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PersistedCustomConfig {
-    pub id: String,
-    pub mod_id: String,
-    pub mc_versions: Vec<String>,
-    pub loader: String,
-    pub target_path: String,
-    pub files: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ModlistGroupLayout {
-    pub aesthetic_groups: Vec<PersistedAestheticGroup>,
-    pub functional_groups: Vec<PersistedFunctionalGroup>,
-    #[serde(default)]
-    pub version_rules: Vec<PersistedVersionRule>,
-    #[serde(default)]
-    pub custom_configs: Vec<PersistedCustomConfig>,
+    /// Tag definitions (formerly `functionalGroups`).
+    #[serde(default, alias = "functionalGroups")]
+    pub tags: Vec<PersistedTag>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -104,12 +73,9 @@ pub struct ExportModlistInput {
 #[serde(rename_all = "camelCase")]
 pub struct SaveModlistGroupsInput {
     pub modlist_name: String,
-    pub aesthetic_groups: Vec<PersistedAestheticGroup>,
-    pub functional_groups: Vec<PersistedFunctionalGroup>,
-    #[serde(default)]
-    pub version_rules: Vec<PersistedVersionRule>,
-    #[serde(default)]
-    pub custom_configs: Vec<PersistedCustomConfig>,
+    /// Tag definitions (formerly `functionalGroups`).
+    #[serde(default, alias = "functionalGroups")]
+    pub tags: Vec<PersistedTag>,
 }
 
 #[tauri::command]
@@ -262,10 +228,7 @@ pub fn save_modlist_groups_from_root(
     input: &SaveModlistGroupsInput,
 ) -> Result<()> {
     let layout = ModlistGroupLayout {
-        aesthetic_groups: input.aesthetic_groups.clone(),
-        functional_groups: input.functional_groups.clone(),
-        version_rules: input.version_rules.clone(),
-        custom_configs: input.custom_configs.clone(),
+        tags: input.tags.clone(),
     };
     let layout_path = modlist_group_layout_path(root_dir, &input.modlist_name);
 
@@ -439,10 +402,7 @@ fn default_presentation(modlist_name: &str) -> ModlistPresentation {
 
 fn default_group_layout() -> ModlistGroupLayout {
     ModlistGroupLayout {
-        aesthetic_groups: Vec::new(),
-        functional_groups: Vec::new(),
-        version_rules: Vec::new(),
-        custom_configs: Vec::new(),
+        tags: Vec::new(),
     }
 }
 
@@ -616,7 +576,7 @@ mod tests {
         export_modlist_from_root, load_modlist_groups_from_root,
         load_modlist_presentation_from_root, save_modlist_groups_from_root,
         save_modlist_presentation_from_root, ExportModlistInput, ModlistGroupLayout,
-        ModlistPresentation, PersistedAestheticGroup, PersistedFunctionalGroup,
+        ModlistPresentation, PersistedTag,
         SaveModlistGroupsInput, SaveModlistPresentationInput, MODLIST_GROUP_LAYOUT_FILENAME,
         MODLIST_PRESENTATION_FILENAME,
     };
@@ -685,10 +645,7 @@ mod tests {
         assert_eq!(
             layout,
             ModlistGroupLayout {
-                aesthetic_groups: Vec::new(),
-                functional_groups: Vec::new(),
-                version_rules: Vec::new(),
-                custom_configs: Vec::new(),
+                tags: Vec::new(),
             }
         );
 
@@ -700,21 +657,12 @@ mod tests {
         let root_dir = unique_test_root();
         let input = SaveModlistGroupsInput {
             modlist_name: "Sky Pack".into(),
-            aesthetic_groups: vec![PersistedAestheticGroup {
-                id: "ag-1".into(),
-                name: "Visuals".into(),
-                collapsed: true,
-                block_ids: vec!["rule-0-sodium".into()],
-                scope_row_id: None,
-            }],
-            functional_groups: vec![PersistedFunctionalGroup {
-                id: "fg-1".into(),
+            tags: vec![PersistedTag {
+                id: "tag-1".into(),
                 name: "Performance".into(),
                 tone: "violet".into(),
-                mod_ids: vec!["rule-0-sodium".into(), "rule-1-lithium".into()],
+                mod_ids: vec!["rule-0-sodium".into()],
             }],
-            version_rules: Vec::new(),
-            custom_configs: Vec::new(),
         };
 
         save_modlist_groups_from_root(&root_dir, &input).expect("groups should save");
@@ -723,10 +671,7 @@ mod tests {
         assert_eq!(
             reloaded,
             ModlistGroupLayout {
-                aesthetic_groups: input.aesthetic_groups,
-                functional_groups: input.functional_groups,
-                version_rules: Vec::new(),
-                custom_configs: Vec::new(),
+                tags: input.tags,
             }
         );
 
@@ -755,7 +700,7 @@ mod tests {
         fs::write(modlist_dir.join(RULES_FILENAME), b"{}\n").expect("rules file should exist");
         fs::write(&notes_path, b"{\n  \"iconLabel\": \"SP\",\n  \"iconAccent\": \"Sky\",\n  \"notes\": \"Bring elytra\"\n}\n")
             .expect("presentation file should exist");
-        fs::write(&groups_path, b"{\n  \"aestheticGroups\": [{\n    \"id\": \"ag-1\",\n    \"name\": \"Visuals\",\n    \"collapsed\": false,\n    \"blockIds\": [\"rule-0-sodium\"]\n  }],\n  \"functionalGroups\": []\n}\n")
+        fs::write(&groups_path, b"{\n  \"aestheticGroups\": [{\"id\": \"ag-1\", \"name\": \"Visuals\", \"collapsed\": false}],\n  \"tags\": []\n}\n")
             .expect("group layout file should exist");
         fs::write(cache_mods_dir.join("sodium.jar"), b"jar").expect("jar should exist");
         fs::write(

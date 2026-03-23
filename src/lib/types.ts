@@ -144,6 +144,7 @@ export type EditorSnapshot = {
   modlist_name: string;
   rows: ModRow[];
   incompatibilities: IncompatibilityRule[];
+  groups: Array<{ id: string; name: string; collapsed: boolean; blockIds: string[] }>;
 };
 
 export type LaunchProgressEvent = {

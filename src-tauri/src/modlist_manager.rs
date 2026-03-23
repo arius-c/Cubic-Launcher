@@ -68,6 +68,7 @@ pub fn create_modlist_from_root(
         author: author.clone(),
         description: description.clone(),
         rules: vec![],
+        groups_meta: vec![],
     };
 
     modlist.write_to_file(&rules_path).with_context(|| {
@@ -224,7 +225,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::editor_data::load_editor_snapshot_from_root;
-    use crate::rules::{FallbackStrategy, ModList, ModReference, ModSource, Rule, RuleOption};
+    use crate::rules::{ModList, ModReference, ModSource, Rule};
 
     use super::{
         copy_local_jar_from_root, create_modlist_from_root, CopyLocalJarInput, CreateModlistInput,
@@ -334,6 +335,7 @@ mod tests {
             author: "PlayerLine".into(),
             description: String::new(),
             rules: vec![],
+            groups_meta: vec![],
         }
         .write_to_file(&modlist_dir.join("rules.json"))
         .expect("rules should write");
@@ -382,6 +384,7 @@ mod tests {
             author: "PlayerLine".into(),
             description: String::new(),
             rules: vec![],
+            groups_meta: vec![],
         }
         .write_to_file(&modlist_dir.join("rules.json"))
         .expect("rules should write");
@@ -434,17 +437,16 @@ mod tests {
     fn _uses_rule_types() {
         let _ = Rule {
             rule_name: "x".into(),
-            options: vec![RuleOption {
-                mods: vec![ModReference {
-                    id: "x".into(),
-                    source: ModSource::Local,
-                    file_name: Some("x.jar".into()),
-                }],
-                exclude_if_present: vec![],
-                fallback_strategy: FallbackStrategy::Continue,
-                option_name: None,
-                alternatives: vec![],
+            mods: vec![ModReference {
+                id: "x".into(),
+                source: ModSource::Local,
+                file_name: Some("x.jar".into()),
             }],
+            exclude_if_present: vec![],
+            alternatives: vec![],
+            links: vec![],
+            version_rules: vec![],
+            custom_configs: vec![],
         };
     }
 }
