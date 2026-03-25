@@ -63,6 +63,8 @@ pub fn resolve_modlist(
     target: &ResolutionTarget,
     compatibility_checker: &impl CompatibilityChecker,
 ) -> Result<ResolutionResult> {
+    // Pass 1: resolve rules in order, building active_mods incrementally.
+    // Incompatibilities only apply to losers processed AFTER their winners here.
     let mut active_mods = HashSet::new();
     let mut resolved_rules = Vec::with_capacity(modlist.rules.len());
 
@@ -79,8 +81,27 @@ pub fn resolve_modlist(
         });
     }
 
+    // Pass 2: re-resolve every rule using the full post-pass-1 active_mods.
+    // This correctly excludes losers that were resolved before their winners in pass 1.
+    // Winners never have the loser's mods in their exclude_if_present, so this is safe.
+    let pass1_active = active_mods.clone();
+    let mut final_active = HashSet::new();
+
+    for (i, rule) in modlist.rules.iter().enumerate() {
+        let outcome = try_resolve_rule(rule, 0, &pass1_active, target, compatibility_checker)?;
+        if let RuleOutcome::Resolved { ref mods, .. } = outcome {
+            for m in mods {
+                final_active.insert(m.id.clone());
+            }
+        }
+        resolved_rules[i] = ResolvedRule {
+            rule_name: rule.rule_name.clone(),
+            outcome,
+        };
+    }
+
     Ok(ResolutionResult {
-        active_mods,
+        active_mods: final_active,
         resolved_rules,
     })
 }
@@ -227,6 +248,7 @@ mod tests {
             links: vec![],
             version_rules: vec![],
             custom_configs: vec![],
+            alt_groups: vec![],
         }
     }
 
@@ -245,7 +267,9 @@ mod tests {
                 links: vec![],
                 version_rules: vec![],
                 custom_configs: vec![],
+                alt_groups: vec![],
             }],
+            presentation: None,
         };
 
         let checker = FakeCompatibilityChecker::with([("sodium", false), ("rubidium", true)]);
@@ -281,8 +305,10 @@ mod tests {
                     links: vec![],
                     version_rules: vec![],
                     custom_configs: vec![],
+                    alt_groups: vec![],
                 },
             ],
+            presentation: None,
         };
 
         let checker =
@@ -317,8 +343,10 @@ mod tests {
                     links: vec![],
                     version_rules: vec![],
                     custom_configs: vec![],
+                    alt_groups: vec![],
                 },
             ],
+            presentation: None,
         };
 
         let checker = FakeCompatibilityChecker::with([
@@ -356,7 +384,9 @@ mod tests {
                 links: vec![],
                 version_rules: vec![],
                 custom_configs: vec![],
+                alt_groups: vec![],
             }],
+            presentation: None,
         };
 
         let checker = FakeCompatibilityChecker::with([
@@ -393,7 +423,9 @@ mod tests {
                 links: vec![],
                 version_rules: vec![],
                 custom_configs: vec![],
+                alt_groups: vec![],
             }],
+            presentation: None,
         };
 
         let checker = FakeCompatibilityChecker::with([
@@ -430,8 +462,10 @@ mod tests {
                     links: vec![],
                     version_rules: vec![],
                     custom_configs: vec![],
+                    alt_groups: vec![],
                 },
             ],
+            presentation: None,
         };
 
         let checker = FakeCompatibilityChecker::with([

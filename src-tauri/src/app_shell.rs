@@ -514,8 +514,10 @@ mod tests {
                 links: vec![],
                 version_rules: vec![],
                 custom_configs: vec![],
+                alt_groups: vec![],
             }],
             groups_meta: vec![],
+            presentation: None,
         }
         .write_to_file(&rules_path)
         .expect("rules should write");
@@ -607,6 +609,7 @@ mod tests {
             description: "Alpha description".into(),
             rules: Vec::new(),
             groups_meta: vec![],
+            presentation: None,
         }
         .write_to_file(&alpha_modlist_root.join("rules.json"))
         .expect("alpha rules should write");
@@ -616,6 +619,7 @@ mod tests {
             description: "Beta description".into(),
             rules: Vec::new(),
             groups_meta: vec![],
+            presentation: None,
         }
         .write_to_file(&beta_modlist_root.join("rules.json"))
         .expect("beta rules should write");

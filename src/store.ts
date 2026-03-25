@@ -498,28 +498,19 @@ export function commitGroupRename(id: string) {
 }
 
 export function createAestheticGroup() {
-  const level = selectedIdsLevel();
-  if (level === "empty") {
+  const ctx = selectionContext();
+  if (ctx === "empty") {
     pushUiError({ title: "No mods selected", message: "Select one or more mods before creating a visual group.", detail: "Visual groups are created from the currently selected mods.", severity: "warning", scope: "launch" });
     return;
   }
-  if (level === "mixed") {
+  if (ctx === "mixed") {
     pushUiError({ title: "Mixed selection", message: "A visual group can only contain mods from the same level.", detail: "Select top-level mods only, or alternatives that share the same direct parent.", severity: "warning", scope: "launch" });
     return;
   }
 
   const selected = selectedIds();
-  const scopeRowId = level === "alternatives"
-    ? findDirectParentId(modRowsState(), selected[0])
-    : null;
-
-  if (level === "alternatives") {
-    const parents = new Set(selected.map(id => findDirectParentId(modRowsState(), id)));
-    if (parents.size !== 1 || !scopeRowId) {
-      pushUiError({ title: "Alternatives mismatch", message: "Selected alternatives must share the same direct parent to create a visual group.", detail: "Open one alternatives list and select children from that list only.", severity: "warning", scope: "launch" });
-      return;
-    }
-  }
+  const pMap = parentIdByChildId();
+  const scopeRowId = ctx === "same-parent" ? (pMap.get(selected[0]) ?? null) : null;
 
   const id = `ag-${Date.now()}`;
   const name = nextAestheticGroupName(scopeRowId);
@@ -548,19 +539,16 @@ export function removeAestheticGroup(id: string) {
   if (editingGroupId() === id) setEditingGroupId(null);
 }
 
-function selectedIdsLevel(): "top-level" | "alternatives" | "mixed" | "empty" {
+/** Returns "top-level" | "same-parent" | "mixed" | "empty".
+ *  Uses parentIdByChildId — never parses ID strings. */
+export function selectionContext(): "top-level" | "same-parent" | "mixed" | "empty" {
   const ids = selectedIds();
   if (ids.length === 0) return "empty";
-
-  const topLevelIds = ids.filter(id => !id.includes("-alternative-"));
-  const altIds = ids.filter(id => id.includes("-alternative-"));
-
-  if (altIds.length > 0 && topLevelIds.length > 0) return "mixed";
-  if (altIds.length === 0) return "top-level";
-
-  // All alternatives — check they all belong to the same parent rule
-  const parents = new Set(altIds.map(id => id.match(/^(rule-\d+)-alternative-/)?.[1] ?? ""));
-  return parents.size === 1 ? "alternatives" : "mixed";
+  const pMap = parentIdByChildId();
+  const parents = new Set(ids.map(id => pMap.get(id) ?? null));
+  if (parents.size !== 1) return "mixed";
+  const parent = [...parents][0];
+  return parent === null ? "top-level" : "same-parent";
 }
 
 export function toggleTagFilter(groupId: string) {
@@ -593,8 +581,8 @@ export function createFunctionalGroup() {
     return;
   }
 
-  const level = selectedIdsLevel();
-  if (level === "mixed") {
+  const ctx = selectionContext();
+  if (ctx === "mixed") {
     pushUiError({ title: "Mixed selection", message: "A functional tag can only contain mods at the same level.", detail: "Select either top-level rules only, or alternatives of the same parent rule only.", severity: "warning", scope: "launch" });
     return;
   }

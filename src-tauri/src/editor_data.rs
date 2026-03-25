@@ -6,7 +6,7 @@ use tauri::State;
 
 use crate::debug_trace::append_debug_trace_to_root;
 use crate::launcher_paths::LauncherPaths;
-use crate::rules::{ModList, ModReference, ModSource, Rule, RuleConfigFile, RuleCustomConfig, RuleGroupMeta, RuleVersionFilter, RULES_FILENAME};
+use crate::rules::{AltGroupMeta, ModList, ModReference, ModSource, Rule, RuleConfigFile, RuleCustomConfig, RuleGroupMeta, RuleVersionFilter, RULES_FILENAME};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EditorSnapshot {
@@ -28,6 +28,17 @@ pub struct EditorGroupInfo {
     pub block_ids: Vec<String>,
 }
 
+/// Visual group inside a rule's alternatives panel (stored in `Rule.alt_groups`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditorAltGroupInfo {
+    pub id: String,
+    pub name: String,
+    pub collapsed: bool,
+    /// Row IDs of the alternative rows belonging to this visual group.
+    pub block_ids: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EditorRow {
     pub id: String,
@@ -35,6 +46,7 @@ pub struct EditorRow {
     /// Primary Modrinth project slug/id for icon fetching — None for local mods.
     pub modrinth_id: Option<String>,
     /// The first mod's ID regardless of source (used for link target lookup on the frontend).
+    #[serde(rename = "primaryModId")]
     pub primary_mod_id: Option<String>,
     pub kind: String,
     pub area: String,
@@ -47,6 +59,9 @@ pub struct EditorRow {
     pub custom_configs: Vec<EditorCustomConfig>,
     #[serde(rename = "versionRules")]
     pub version_rules: Vec<EditorVersionRule>,
+    /// Visual groups for this row's alternatives panel (stored in `Rule.alt_groups`).
+    #[serde(rename = "altGroups")]
+    pub alt_groups: Vec<EditorAltGroupInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -176,6 +191,9 @@ pub struct SaveRuleGroupItem {
     pub collapsed: bool,
     /// Row IDs of rules belonging to this group (e.g. "rule-0-sodium").
     pub row_ids: Vec<String>,
+    /// `None` for top-level structural groups; `Some(parent_row_id)` for
+    /// alternative-panel visual groups.
+    pub scope_row_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -253,6 +271,15 @@ pub fn save_rule_groups_command(
     input: SaveRuleGroupsInput,
 ) -> Result<(), String> {
     save_rule_groups_from_root(launcher_paths.root_dir(), &input)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn save_rule_links_command(
+    launcher_paths: State<'_, LauncherPaths>,
+    input: SaveRuleLinksInput,
+) -> Result<(), String> {
+    save_rule_links_from_root(launcher_paths.root_dir(), &input)
         .map_err(|error| error.to_string())
 }
 
@@ -518,6 +545,7 @@ pub fn add_mod_rule_from_root(root_dir: &Path, input: &AddModRuleInput) -> Resul
         links: vec![],
         version_rules: vec![],
         custom_configs: vec![],
+        alt_groups: vec![],
     };
 
     modlist.rules.push(new_rule);
@@ -767,7 +795,14 @@ pub fn save_rule_groups_from_root(root_dir: &Path, input: &SaveRuleGroupsInput) 
         )
     })?;
 
-    // Build row_id → rule_name map using current indices.
+    // Separate top-level groups (scope_row_id == None) from alt-scoped groups.
+    let top_level: Vec<&SaveRuleGroupItem> =
+        input.groups.iter().filter(|g| g.scope_row_id.is_none()).collect();
+    let alt_scoped: Vec<&SaveRuleGroupItem> =
+        input.groups.iter().filter(|g| g.scope_row_id.is_some()).collect();
+
+    // ── Top-level structural groups ───────────────────────────────────────────
+    // Build row_id → rule_name map for top-level rules.
     let id_to_name: std::collections::HashMap<String, String> = modlist
         .rules
         .iter()
@@ -775,8 +810,7 @@ pub fn save_rule_groups_from_root(root_dir: &Path, input: &SaveRuleGroupsInput) 
         .map(|(i, r)| (build_editor_row(i, r).id, r.rule_name.clone()))
         .collect();
 
-    modlist.groups_meta = input
-        .groups
+    modlist.groups_meta = top_level
         .iter()
         .map(|g| RuleGroupMeta {
             id: g.id.clone(),
@@ -790,6 +824,138 @@ pub fn save_rule_groups_from_root(root_dir: &Path, input: &SaveRuleGroupsInput) 
                 .collect(),
         })
         .collect();
+
+    // ── Alt-scoped visual groups ──────────────────────────────────────────────
+    // Clear all existing alt_groups on all rules before re-applying.
+    fn clear_alt_groups(rule: &mut Rule) {
+        rule.alt_groups.clear();
+        for alt in rule.alternatives.iter_mut() {
+            clear_alt_groups(alt);
+        }
+    }
+    for rule in modlist.rules.iter_mut() {
+        clear_alt_groups(rule);
+    }
+
+    // Group by scope_row_id, then update each parent rule's alt_groups.
+    let mut groups_by_scope: std::collections::HashMap<&str, Vec<&SaveRuleGroupItem>> =
+        std::collections::HashMap::new();
+    for g in &alt_scoped {
+        if let Some(ref sid) = g.scope_row_id {
+            groups_by_scope.entry(sid.as_str()).or_default().push(g);
+        }
+    }
+
+    for (scope_row_id, groups) in groups_by_scope {
+        let path = match parse_option_path_from_row_id(scope_row_id) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        // Build alt name → row_id map for the scoped rule's direct alternatives.
+        let alt_id_to_name: std::collections::HashMap<String, String> = {
+            let rule_idx = path[0];
+            let parent_path_str = if path.len() == 1 {
+                String::new()
+            } else {
+                option_path_suffix(&path[1..])
+            };
+            match get_rule_ref(&modlist.rules, &path) {
+                None => continue,
+                Some(scoped_rule) => scoped_rule
+                    .alternatives
+                    .iter()
+                    .enumerate()
+                    .map(|(i, alt)| {
+                        let alt_id =
+                            build_alternative_row(rule_idx, i + 1, alt, &parent_path_str).id;
+                        (alt_id, alt.rule_name.clone())
+                    })
+                    .collect(),
+            }
+        };
+
+        let new_alt_groups: Vec<AltGroupMeta> = groups
+            .iter()
+            .map(|g| AltGroupMeta {
+                id: g.id.clone(),
+                name: g.name.clone(),
+                collapsed: g.collapsed,
+                block_names: g
+                    .row_ids
+                    .iter()
+                    .filter_map(|rid| alt_id_to_name.get(rid))
+                    .cloned()
+                    .collect(),
+            })
+            .collect();
+
+        match navigate_to_rule_mut(&mut modlist.rules, &path) {
+            Ok(rule) => rule.alt_groups = new_alt_groups,
+            Err(_) => continue,
+        }
+    }
+
+    modlist.write_to_file(&rules_path)
+}
+
+// ── Save rule links ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveRuleLinksInput {
+    pub modlist_name: String,
+    pub links: Vec<RuleMetadataLinkInput>,
+}
+
+pub fn save_rule_links_from_root(root_dir: &Path, input: &SaveRuleLinksInput) -> Result<()> {
+    let launcher_paths = LauncherPaths::new(root_dir.to_path_buf());
+    let rules_path = launcher_paths
+        .modlists_dir()
+        .join(&input.modlist_name)
+        .join(RULES_FILENAME);
+
+    let mut modlist = ModList::read_from_file(&rules_path).with_context(|| {
+        format!(
+            "failed to load modlist '{}' for rule links save from {}",
+            input.modlist_name,
+            rules_path.display()
+        )
+    })?;
+
+    // Build row_id → first primary mod ID map (needed for link target resolution).
+    let row_to_primary_mod: std::collections::HashMap<String, String> =
+        collect_all_row_ids(&modlist.rules)
+            .into_iter()
+            .filter_map(|(row_id, mod_ids)| mod_ids.into_iter().next().map(|m| (row_id, m)))
+            .collect();
+
+    // Clear all links recursively.
+    fn clear_links(rule: &mut Rule) {
+        rule.links.clear();
+        for alt in rule.alternatives.iter_mut() {
+            clear_links(alt);
+        }
+    }
+    for rule in modlist.rules.iter_mut() {
+        clear_links(rule);
+    }
+
+    // Re-apply links from input.
+    for link in &input.links {
+        let from_path = match parse_option_path_from_row_id(&link.from_id) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let to_mod_id = match row_to_primary_mod.get(&link.to_id) {
+            Some(id) => id.clone(),
+            None => continue,
+        };
+        match navigate_to_rule_mut(&mut modlist.rules, &from_path) {
+            Ok(from_rule) => from_rule.links.push(to_mod_id),
+            Err(_) => continue,
+        }
+    }
 
     modlist.write_to_file(&rules_path)
 }
@@ -992,6 +1158,93 @@ pub fn add_nested_alternative_from_root(
     Ok(())
 }
 
+// ── Move alternative to another parent ───────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MoveAltToAlternativeInput {
+    pub modlist_name: String,
+    /// The alternative row being moved (must be non-top-level: contains "-alternative-").
+    pub source_row_id: String,
+    /// The row that will become the new parent of the source (any depth).
+    pub target_parent_row_id: String,
+}
+
+#[tauri::command]
+pub fn move_alt_to_alternative_command(
+    launcher_paths: State<'_, LauncherPaths>,
+    input: MoveAltToAlternativeInput,
+) -> Result<(), String> {
+    move_alt_to_alternative_from_root(launcher_paths.root_dir(), &input)
+        .map_err(|e| e.to_string())
+}
+
+pub fn move_alt_to_alternative_from_root(
+    root_dir: &Path,
+    input: &MoveAltToAlternativeInput,
+) -> Result<()> {
+    let source_path = parse_option_path_from_row_id(&input.source_row_id)
+        .with_context(|| format!("invalid source_row_id '{}'", input.source_row_id))?;
+    let target_path = parse_option_path_from_row_id(&input.target_parent_row_id)
+        .with_context(|| format!("invalid target_parent_row_id '{}'", input.target_parent_row_id))?;
+
+    anyhow::ensure!(
+        source_path.len() >= 2,
+        "source_row_id must refer to an alternative (non-top-level), got '{}'",
+        input.source_row_id
+    );
+    anyhow::ensure!(
+        source_path[0] != target_path[0],
+        "source and target parent must belong to different top-level rule chains"
+    );
+
+    let launcher_paths = LauncherPaths::new(root_dir.to_path_buf());
+    let rules_path = launcher_paths
+        .modlists_dir()
+        .join(&input.modlist_name)
+        .join(RULES_FILENAME);
+
+    let mut modlist = ModList::read_from_file(&rules_path).with_context(|| {
+        format!("failed to load modlist '{}' for move_alt_to_alternative", input.modlist_name)
+    })?;
+
+    // Clone the source rule before mutably modifying the modlist.
+    let source_rule = {
+        let src = navigate_to_rule_mut(&mut modlist.rules, &source_path)
+            .with_context(|| format!("failed to navigate to source {:?}", source_path))?;
+        src.clone()
+    };
+
+    // Remove source from its current parent's alternatives.
+    {
+        let parent_path = &source_path[..source_path.len() - 1];
+        // path indices after position 0 are 1-based; convert last index to 0-based.
+        let alt_idx_1based = source_path[source_path.len() - 1];
+        let alt_idx = alt_idx_1based
+            .checked_sub(1)
+            .context("alternative index must be >= 1")?;
+        let parent = navigate_to_rule_mut(&mut modlist.rules, parent_path)
+            .with_context(|| format!("failed to navigate to source parent {:?}", parent_path))?;
+        anyhow::ensure!(
+            alt_idx < parent.alternatives.len(),
+            "source alt index {} out of bounds (len={})",
+            alt_idx,
+            parent.alternatives.len()
+        );
+        parent.alternatives.remove(alt_idx);
+    }
+
+    // Append source to the target parent's alternatives.
+    // target_path is in a different top-level rule so indices are unaffected by the removal above.
+    {
+        let target = navigate_to_rule_mut(&mut modlist.rules, &target_path)
+            .with_context(|| format!("failed to navigate to target parent {:?}", target_path))?;
+        target.alternatives.push(source_rule);
+    }
+
+    modlist.write_to_file(&rules_path)
+}
+
 // ── Remove alternative ────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1150,6 +1403,15 @@ pub fn reorder_rules_from_root(root_dir: &Path, input: &ReorderRulesInput) -> Re
 // ── Row-building helpers ──────────────────────────────────────────────────────
 
 fn build_editor_row(rule_index: usize, rule: &Rule) -> EditorRow {
+    // Build alt rule_name → row_id map for converting alt_groups block_names.
+    let alt_name_to_id: std::collections::HashMap<&str, String> = rule
+        .alternatives
+        .iter()
+        .enumerate()
+        .map(|(i, alt)| (alt.rule_name.as_str(), build_alternative_row(rule_index, i + 1, alt, "").id))
+        .collect();
+    let alt_groups = build_editor_alt_groups(&rule.alt_groups, &alt_name_to_id);
+
     EditorRow {
         id: format!(
             "rule-{}-{}",
@@ -1176,6 +1438,7 @@ fn build_editor_row(rule_index: usize, rule: &Rule) -> EditorRow {
         links: rule.links.clone(),
         custom_configs: rule.custom_configs.iter().map(to_editor_custom_config).collect(),
         version_rules: rule.version_rules.iter().map(to_editor_version_rule).collect(),
+        alt_groups,
     }
 }
 
@@ -1193,6 +1456,15 @@ fn build_alternative_row(
         normalize_identifier(&alt.rule_name)
     );
     let child_path = format!("{parent_path}-alternative-{alt_index}");
+
+    // Build sub-alt name → row_id map for converting alt_groups block_names.
+    let sub_alt_name_to_id: std::collections::HashMap<&str, String> = alt
+        .alternatives
+        .iter()
+        .enumerate()
+        .map(|(i, sub)| (sub.rule_name.as_str(), build_alternative_row(rule_index, i + 1, sub, &child_path).id))
+        .collect();
+    let alt_groups = build_editor_alt_groups(&alt.alt_groups, &sub_alt_name_to_id);
 
     EditorRow {
         id,
@@ -1216,7 +1488,27 @@ fn build_alternative_row(
         links: alt.links.clone(),
         custom_configs: alt.custom_configs.iter().map(to_editor_custom_config).collect(),
         version_rules: alt.version_rules.iter().map(to_editor_version_rule).collect(),
+        alt_groups,
     }
+}
+
+fn build_editor_alt_groups(
+    alt_groups: &[AltGroupMeta],
+    name_to_id: &std::collections::HashMap<&str, String>,
+) -> Vec<EditorAltGroupInfo> {
+    alt_groups
+        .iter()
+        .map(|ag| EditorAltGroupInfo {
+            id: ag.id.clone(),
+            name: ag.name.clone(),
+            collapsed: ag.collapsed,
+            block_ids: ag
+                .block_names
+                .iter()
+                .filter_map(|name| name_to_id.get(name.as_str()).cloned())
+                .collect(),
+        })
+        .collect()
 }
 
 fn to_editor_version_rule(vr: &RuleVersionFilter) -> EditorVersionRule {
@@ -1614,6 +1906,7 @@ mod tests {
             links: vec![],
             version_rules: vec![],
             custom_configs: vec![],
+            alt_groups: vec![],
         }
     }
 
@@ -1640,8 +1933,10 @@ mod tests {
                 links: vec![],
                 version_rules: vec![],
                 custom_configs: vec![],
+                alt_groups: vec![],
             }],
             groups_meta: vec![],
+            presentation: None,
         };
         write_modlist(&modlist, &root_dir);
 
@@ -1667,6 +1962,7 @@ mod tests {
             description: "".into(),
             rules: vec![simple_rule("Sodium", "sodium")],
             groups_meta: vec![],
+            presentation: None,
         };
         write_modlist(&modlist, &root_dir);
 
@@ -1699,6 +1995,7 @@ mod tests {
             description: "".into(),
             rules: vec![simple_rule("Old Name", "sodium")],
             groups_meta: vec![],
+            presentation: None,
         };
         write_modlist(&modlist, &root_dir);
 
@@ -1732,6 +2029,7 @@ mod tests {
             description: "".into(),
             rules: vec![simple_rule("Sodium", "sodium"), simple_rule("Iris", "iris")],
             groups_meta: vec![],
+            presentation: None,
         };
         write_modlist(&modlist, &root_dir);
 
@@ -1771,8 +2069,10 @@ mod tests {
                 links: vec![],
                 version_rules: vec![],
                 custom_configs: vec![],
+                alt_groups: vec![],
             }],
             groups_meta: vec![],
+            presentation: None,
         };
         write_modlist(&modlist, &root_dir);
 
@@ -1806,6 +2106,7 @@ mod tests {
             description: "".into(),
             rules: vec![simple_rule("Sodium", "sodium"), simple_rule("Embeddium", "embeddium")],
             groups_meta: vec![],
+            presentation: None,
         };
         write_modlist(&modlist, &root_dir);
 
@@ -1842,6 +2143,7 @@ mod tests {
             description: "".into(),
             rules: vec![simple_rule("Sodium", "sodium"), simple_rule("Rubidium", "rubidium")],
             groups_meta: vec![],
+            presentation: None,
         };
         write_modlist(&modlist, &root_dir);
 
@@ -1887,8 +2189,10 @@ mod tests {
                 links: vec![],
                 version_rules: vec![],
                 custom_configs: vec![],
+                alt_groups: vec![],
             }],
             groups_meta: vec![],
+            presentation: None,
         };
         write_modlist(&modlist, &root_dir);
 
@@ -1960,10 +2264,12 @@ mod tests {
                 links: vec![],
                 version_rules: vec![],
                 custom_configs: vec![],
+                alt_groups: vec![],
             }],
             links: vec![],
             version_rules: vec![],
             custom_configs: vec![],
+            alt_groups: vec![],
         }];
 
         // Navigate to rules[0].alternatives[0]: path = [0 (rule idx), 1 (1-based alt idx)]

@@ -69,6 +69,7 @@ pub fn create_modlist_from_root(
         description: description.clone(),
         rules: vec![],
         groups_meta: vec![],
+        presentation: None,
     };
 
     modlist.write_to_file(&rules_path).with_context(|| {
@@ -336,6 +337,7 @@ mod tests {
             description: String::new(),
             rules: vec![],
             groups_meta: vec![],
+            presentation: None,
         }
         .write_to_file(&modlist_dir.join("rules.json"))
         .expect("rules should write");
@@ -385,6 +387,7 @@ mod tests {
             description: String::new(),
             rules: vec![],
             groups_meta: vec![],
+            presentation: None,
         }
         .write_to_file(&modlist_dir.join("rules.json"))
         .expect("rules should write");
@@ -447,6 +450,7 @@ mod tests {
             links: vec![],
             version_rules: vec![],
             custom_configs: vec![],
+            alt_groups: vec![],
         };
     }
 }

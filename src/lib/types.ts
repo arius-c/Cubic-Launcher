@@ -5,11 +5,17 @@ export type ModRow = {
   name: string;
   /** Modrinth project slug — present for Modrinth mods, absent for local mods. Used for icon fetching. */
   modrinth_id?: string;
+  /** First mod ID in the rule (used as stable link target identifier). */
+  primaryModId?: string;
   kind: "modrinth" | "local";
   area: string;
   note: string;
   tags: string[];
   alternatives?: ModRow[];
+  /** Primary mod IDs of linked rules (as stored in rules.json). */
+  links?: string[];
+  /** Visual groups inside this row's alternatives panel. */
+  altGroups?: Array<{ id: string; name: string; collapsed: boolean; blockIds: string[] }>;
 };
 
 export type ModListCard = {

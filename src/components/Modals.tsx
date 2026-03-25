@@ -1,11 +1,7 @@
 import { For, Show, createSignal, createEffect } from "solid-js";
 import type { ModRow } from "../lib/types";
 import { appendDebugTrace } from "../lib/debugTrace";
-import {
-  DragDropProvider, DragDropSensors, DragOverlay, SortableProvider,
-  createSortable, closestCenter, maybeTransformStyle,
-  type DragEvent,
-} from "@thisbeyond/solid-dnd";
+import { useDragEngine, type DragItem } from "../lib/dragEngine";
 import { GripVerticalIcon } from "./icons";
 import {
   /* Settings */
@@ -31,7 +27,7 @@ import {
   /* Incompatibilities */
   incompatibilityModalOpen, setIncompatibilityModalOpen,
   focusedIncompatibilityMod, draftIncompatibilities,
-  modRowsState, rowMap, priorityParadoxDetected,
+  rowMap, priorityParadoxDetected,
   setPairConflictEnabled, setPairWinner,
   incompatibilityFocusId,
   /* Links */
@@ -52,26 +48,36 @@ import {
 import { XIcon, AlertTriangleIcon } from "./icons";
 
 // ── Sortable alternative row (for drag-and-drop in the alternatives panel) ────
-function SortableAltRow(props: {
+function DraggableAltRow(props: {
   alt: ModRow;
   priority: number;
   removing: boolean;
   selected: boolean;
+  isDragging: boolean;
+  isDropTarget: boolean;
+  translateY: number;
+  anyDragging: boolean;
   onToggleSelected: () => void;
   onRemove: () => void;
   onOpenAlts: () => void;
+  onStartDrag: (e: PointerEvent) => void;
 }) {
-  const sortable = createSortable(props.alt.id);
   return (
     <div
-      ref={sortable.ref}
-      style={maybeTransformStyle(sortable.transform)}
-      class={`flex items-center gap-3 rounded-md border px-3 py-2.5 ${props.selected ? "border-primary/40 bg-primary/5" : "border-border bg-background"} ${sortable.isActiveDraggable ? "opacity-0 pointer-events-none" : ""}`}
+      data-draggable-id={props.alt.id}
+      data-draggable-mid-id={props.alt.id}
+      style={{
+        transform:  props.anyDragging ? `translateY(${props.isDragging ? 0 : props.translateY}px)` : "none",
+        transition: props.anyDragging ? "transform 150ms ease" : "none",
+        position:   "relative",
+        "z-index":  props.isDragging ? "0" : "1",
+      }}
+      class={`flex items-center gap-3 rounded-md border px-3 py-2.5 ${props.selected ? "border-primary/40 bg-primary/5" : "border-border bg-background"} ${props.isDragging ? "opacity-0 pointer-events-none" : ""} ${props.isDropTarget ? "ring-1 ring-primary/40" : ""}`}
     >
       {/* Drag handle */}
       <div
         class="shrink-0 cursor-grab touch-none text-muted-foreground/50 hover:text-muted-foreground"
-        {...(sortable.dragActivators as any)}
+        onPointerDown={props.onStartDrag}
         title="Drag to reorder"
       >
         <GripVerticalIcon class="h-4 w-4" />
@@ -977,36 +983,53 @@ export function AlternativesPanel(props: AlternativesPanelProps) {
     setSelectedAlternativeIds([]);
   };
 
-  const handleAltDragEnd = ({ draggable, droppable }: DragEvent) => {
-    if (!draggable || !droppable) return;
-    const fromId = draggable.id as string;
-    const toId   = droppable.id as string;
-    if (fromId === toId) return;
+  let altPanelContainerRef: HTMLDivElement | undefined;
 
-    appendDebugTrace("alts.drag.frontend", {
-      phase: "start",
-      parentId: alternativesPanelParent()?.id ?? null,
-      fromId,
-      toId,
-      orderedIds: ordered().map(alt => alt.id),
-    });
+  const altPanelEngine = useDragEngine({
+    containerRef: () => altPanelContainerRef,
+    getItems: () => ordered().map((r): DragItem => ({ kind: "row", id: r.id })),
+    onCommit: (fromId, dropId) => {
+      // Resolve the target index from the drop ID
+      let toId: string;
+      if (dropId.startsWith("before:")) {
+        toId = dropId.slice("before:".length);
+      } else if (dropId.startsWith("after:")) {
+        toId = dropId.slice("after:".length);
+      } else {
+        return;
+      }
+      if (fromId === toId) return;
 
-    setOrdered(cur => {
-      const arr = [...cur];
-      const fromIdx = arr.findIndex(r => r.id === fromId);
-      const toIdx   = arr.findIndex(r => r.id === toId);
-      if (fromIdx === -1 || toIdx === -1) return cur;
-      arr.splice(toIdx, 0, arr.splice(fromIdx, 1)[0]);
       appendDebugTrace("alts.drag.frontend", {
-        phase: "end",
+        phase: "start",
         parentId: alternativesPanelParent()?.id ?? null,
         fromId,
         toId,
-        orderedIds: arr.map(alt => alt.id),
+        orderedIds: ordered().map(alt => alt.id),
       });
-      return arr;
-    });
-  };
+
+      setOrdered(cur => {
+        const arr = [...cur];
+        const fromIdx = arr.findIndex(r => r.id === fromId);
+        const toIdx   = arr.findIndex(r => r.id === toId);
+        if (fromIdx === -1 || toIdx === -1) return cur;
+        // For "after:" we insert after toIdx, for "before:" we insert at toIdx
+        const [item] = arr.splice(fromIdx, 1);
+        const adjustedToIdx = dropId.startsWith("after:")
+          ? (toIdx > fromIdx ? toIdx : toIdx + 1)
+          : (toIdx > fromIdx ? toIdx - 1 : toIdx);
+        arr.splice(Math.max(0, Math.min(adjustedToIdx, arr.length)), 0, item);
+        appendDebugTrace("alts.drag.frontend", {
+          phase: "end",
+          parentId: alternativesPanelParent()?.id ?? null,
+          fromId,
+          toId,
+          orderedIds: arr.map(alt => alt.id),
+        });
+        return arr;
+      });
+    },
+  });
 
   const handleSave = async () => {
     const parent = alternativesPanelParent();
@@ -1049,21 +1072,36 @@ export function AlternativesPanel(props: AlternativesPanelProps) {
     const parent = alternativesPanelParent();
     if (!parent) return [];
     const existingAltIds = new Set(ordered().map(r => r.id));
-    // Exclude the row that owns this panel parent as an alternative,
-    // to prevent the most direct circular reference (if X is an alt of Y, don't add Y to X).
-    let ownerRowId: string | null = null;
+
+    // Build exclusion set: self + all ancestors + all descendants.
+    const excluded = new Set<string>();
+    excluded.add(parent.id);
+
+    // Ancestors: walk up via parent map.
+    const parentMap = new Map<string, string>();
     for (const row of rowMap().values()) {
-      if ((row.alternatives ?? []).some(a => a.id === parent.id)) {
-        ownerRowId = row.id;
-        break;
+      for (const alt of (row.alternatives ?? [])) {
+        parentMap.set(alt.id, row.id);
       }
     }
-    // Only top-level mods can be added (backend only accepts top-level row IDs).
-    return modRowsState().filter(r =>
-      r.id !== parent.id &&
-      !existingAltIds.has(r.id) &&
-      r.id !== ownerRowId
-    );
+    let cur = parent.id;
+    while (parentMap.has(cur)) {
+      const pid = parentMap.get(cur)!;
+      excluded.add(pid);
+      cur = pid;
+    }
+
+    // Descendants: all alternatives of parent, recursively.
+    const collectDesc = (row: ModRow) => {
+      for (const alt of (row.alternatives ?? [])) {
+        excluded.add(alt.id);
+        collectDesc(alt);
+      }
+    };
+    collectDesc(parent);
+
+    // Return all rows at any depth except excluded and already-added.
+    return [...rowMap().values()].filter(r => !existingAltIds.has(r.id) && !excluded.has(r.id));
   };
 
   return (
@@ -1110,72 +1148,77 @@ export function AlternativesPanel(props: AlternativesPanelProps) {
                 </div>
               }
             >
-              <DragDropProvider onDragEnd={handleAltDragEnd} collisionDetector={closestCenter}>
-                <DragDropSensors>
-                  <SortableProvider ids={ordered().map(r => r.id)}>
-                    <div class="space-y-3">
-                      <For each={scopedGroups()}>
-                        {group => (
-                          <div class="rounded-md border border-border bg-muted/20 p-2">
-                            <div class="mb-2 flex items-center justify-between px-1">
-                              <span class="text-xs font-medium uppercase tracking-wider text-muted-foreground">{group.name}</span>
-                              <span class="text-[10px] text-muted-foreground">{group.blocks.length} mods</span>
-                            </div>
-                            <div class="space-y-1.5">
-                              <For each={group.blocks}>
-                                {(alt) => (
-                                  <SortableAltRow
-                                    alt={alt}
-                                    priority={ordered().findIndex(candidate => candidate.id === alt.id) + 2}
-                                    removing={removing() === alt.id}
-                                    selected={selectedAlternativeIds().includes(alt.id)}
-                                    onToggleSelected={() => toggleAlternativeSelection(alt.id)}
-                                    onRemove={() => void handleRemoveAlt(alt)}
-                                    onOpenAlts={() => {
-                                      setAlternativesPanelParentId(alt.id);
-                                    }}
-                                  />
-                                )}
-                              </For>
-                            </div>
-                          </div>
-                        )}
-                      </For>
-
-                      <For each={ungroupedAlternatives()}>
-                        {(alt) => (
-                          <SortableAltRow
-                            alt={alt}
-                            priority={ordered().findIndex(candidate => candidate.id === alt.id) + 2}
-                            removing={removing() === alt.id}
-                            selected={selectedAlternativeIds().includes(alt.id)}
-                            onToggleSelected={() => toggleAlternativeSelection(alt.id)}
-                            onRemove={() => void handleRemoveAlt(alt)}
-                            onOpenAlts={() => {
-                              setAlternativesPanelParentId(alt.id);
-                            }}
-                          />
-                        )}
-                      </For>
+              {/* Drag ghost */}
+              <Show when={altPanelEngine.draggingId() && altPanelEngine.dragPointer()}>
+                {(() => {
+                  const alt = () => ordered().find(r => r.id === altPanelEngine.draggingId());
+                  return (
+                    <div
+                      class="pointer-events-none fixed z-50 flex cursor-grabbing items-center gap-3 rounded-md border border-primary/40 bg-card px-3 py-2.5 shadow-2xl ring-1 ring-primary/20"
+                      style={{ left: `${altPanelEngine.dragPointer()!.x + 12}px`, top: `${altPanelEngine.dragPointer()!.y - 16}px`, "min-width": "220px" }}
+                    >
+                      <GripVerticalIcon class="h-4 w-4 shrink-0 text-primary" />
+                      <span class="truncate text-sm font-medium text-foreground">{alt()?.name ?? "..."}</span>
                     </div>
-                  </SortableProvider>
+                  );
+                })()}
+              </Show>
 
-                  {/* Floating ghost while dragging */}
-                  <DragOverlay>
-                    {(draggable) => {
-                      const alt = draggable
-                        ? ordered().find(r => r.id === (draggable.id as string))
-                        : null;
-                      return (
-                        <div class="pointer-events-none flex cursor-grabbing items-center gap-3 rounded-md border border-primary/40 bg-card px-3 py-2.5 shadow-2xl ring-1 ring-primary/20" style={{ "min-width": "220px" }}>
-                          <GripVerticalIcon class="h-4 w-4 shrink-0 text-primary" />
-                          <span class="truncate text-sm font-medium text-foreground">{alt?.name ?? "…"}</span>
-                        </div>
-                      );
-                    }}
-                  </DragOverlay>
-                </DragDropSensors>
-              </DragDropProvider>
+              <div class="space-y-3" ref={altPanelContainerRef}>
+                <For each={scopedGroups()}>
+                  {group => (
+                    <div class="rounded-md border border-border bg-muted/20 p-2">
+                      <div class="mb-2 flex items-center justify-between px-1">
+                        <span class="text-xs font-medium uppercase tracking-wider text-muted-foreground">{group.name}</span>
+                        <span class="text-[10px] text-muted-foreground">{group.blocks.length} mods</span>
+                      </div>
+                      <div class="space-y-1.5">
+                        <For each={group.blocks}>
+                          {(alt) => (
+                            <DraggableAltRow
+                              alt={alt}
+                              priority={ordered().findIndex(candidate => candidate.id === alt.id) + 2}
+                              removing={removing() === alt.id}
+                              selected={selectedAlternativeIds().includes(alt.id)}
+                              isDragging={altPanelEngine.draggingId() === alt.id}
+                              isDropTarget={!!(altPanelEngine.hoveredDropId()?.endsWith(alt.id))}
+                              translateY={altPanelEngine.previewTranslates().get(alt.id) ?? 0}
+                              anyDragging={altPanelEngine.anyDragging()}
+                              onToggleSelected={() => toggleAlternativeSelection(alt.id)}
+                              onRemove={() => void handleRemoveAlt(alt)}
+                              onOpenAlts={() => {
+                                setAlternativesPanelParentId(alt.id);
+                              }}
+                              onStartDrag={(e) => altPanelEngine.startDrag(alt.id, "row", e)}
+                            />
+                          )}
+                        </For>
+                      </div>
+                    </div>
+                  )}
+                </For>
+
+                <For each={ungroupedAlternatives()}>
+                  {(alt) => (
+                    <DraggableAltRow
+                      alt={alt}
+                      priority={ordered().findIndex(candidate => candidate.id === alt.id) + 2}
+                      removing={removing() === alt.id}
+                      selected={selectedAlternativeIds().includes(alt.id)}
+                      isDragging={altPanelEngine.draggingId() === alt.id}
+                      isDropTarget={!!(altPanelEngine.hoveredDropId()?.endsWith(alt.id))}
+                      translateY={altPanelEngine.previewTranslates().get(alt.id) ?? 0}
+                      anyDragging={altPanelEngine.anyDragging()}
+                      onToggleSelected={() => toggleAlternativeSelection(alt.id)}
+                      onRemove={() => void handleRemoveAlt(alt)}
+                      onOpenAlts={() => {
+                        setAlternativesPanelParentId(alt.id);
+                      }}
+                      onStartDrag={(e) => altPanelEngine.startDrag(alt.id, "row", e)}
+                    />
+                  )}
+                </For>
+              </div>
             </Show>
 
             {/* Add from list */}

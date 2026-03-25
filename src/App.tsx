@@ -1,12 +1,14 @@
 import { createEffect, createSignal, onMount, onCleanup, batch } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
-import { appendDebugTrace, clearDebugTrace } from "./lib/debugTrace";
+import { appendDebugTrace } from "./lib/debugTrace";
+import { logger } from "./lib/logger";
+import { updateAltsDeep } from "./lib/dragUtils";
 
 import {
   modListCards, setModListCards, selectedModListName, setSelectedModListName,
   modRowsState, setModRowsState, setAccounts, setActiveAccountId,
   setLaunchState, setLaunchProgress, setLaunchStageLabel, setLaunchStageDetail,
-  setLaunchLogs, setLauncherErrors,
+  setLaunchLogs,
   globalSettings, modlistOverrides, selectedMcVersion, setSelectedMcVersion, selectedModLoader, setSelectedModLoader,
   createModlistName, createModlistDescription, setCreateModlistModalOpen,
   setCreateModlistBusy, createModlistBusy,
@@ -14,19 +16,20 @@ import {
   selectedIds, setSelectedIds, setExpandedRows, activeAccount, setAddModModalOpen,
   setSettingsModalOpen, localJarRuleName, setLocalJarRuleName,
   setGlobalSettings, setModlistOverrides,
-  upsertDownloadProgress, pushUiError, resetLaunchUiState,
+  pushUiError, resetLaunchUiState,
   aestheticGroups, functionalGroups, setAestheticGroups, setFunctionalGroups,
   savedIncompatibilities, setSavedIncompatibilities,
+  savedLinks, setSavedLinks,
   draftIncompatibilities, setIncompatibilityModalOpen,
   instancePresentation, setInstancePresentation,
   exportOptions, setExportModalOpen, setInstancePresentationOpen,
   alternativesPanelParent, setAlternativesPanelParentId,
+  setAdvancedPanelModId, rowMap,
   launchState, selectedModList, setAppLoading, setModIcons, modIcons,
   minecraftVersions, setMinecraftVersions,
   LAUNCH_STAGES, wait,
-  DEMO_MOD_LISTS, DEMO_ACCOUNTS,
 } from "./store";
-import type { AestheticGroup, FunctionalGroup, ModRow } from "./lib/types";
+import type { AestheticGroup, FunctionalGroup, LinkRule, ModRow } from "./lib/types";
 
 // ── Row state helpers ─────────────────────────────────────────────────────────
 
@@ -236,8 +239,12 @@ function serializeGroupsLayout(fGroups: FunctionalGroup[]) {
 /** Serialize aesthetic group structure for change-detection in save_rule_groups_command. */
 function serializeRuleGroups(aGroups: AestheticGroup[]): string {
   return JSON.stringify(
-    aGroups.map(g => ({ id: g.id, name: g.name, collapsed: g.collapsed, rowIds: g.blockIds }))
+    aGroups.map(g => ({ id: g.id, name: g.name, collapsed: g.collapsed, rowIds: g.blockIds, scopeRowId: g.scopeRowId ?? null }))
   );
+}
+
+function serializeLinks(links: Array<{ fromId: string; toId: string }>): string {
+  return JSON.stringify([...links].sort((a, b) => `${a.fromId}|${a.toId}`.localeCompare(`${b.fromId}|${b.toId}`)));
 }
 
 function serializeIncompatibilities(rules: Array<{ winnerId: string; loserId: string }>) {
@@ -255,10 +262,11 @@ import {
   AlternativesPanel, ErrorCenter, ExportModal,
 } from "./components/Modals";
 import { AdvancedModPanel } from "./components/AdvancedModPanel";
+import { DebugPanel } from "./components/DebugPanel";
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-const isTauri = () => "__TAURI_INTERNALS__" in window;
+const isTauri = () => false;
 
 // ── Per-modlist version/loader cache (prevents bleed when switching modlists) ──
 const modlistVersionLoaderCache = new Map<string, { version: string; loader: string }>();
@@ -267,9 +275,14 @@ const modlistVersionLoaderCache = new Map<string, { version: string; loader: str
 
 async function loadShellSnapshot(preferredName?: string | null) {
   try {
-    const snap: any = await invoke("load_shell_snapshot_command", {
-      selectedModlistName: preferredName ?? null,
-    });
+    logger.debug("App", "invoke stubbed: load_shell_snapshot_command"); // [STUB]
+    const snap: any = {
+      modlists: [], active_account: null,
+      global_settings: { min_ram_mb: 2048, max_ram_mb: 4096,
+        custom_jvm_args: "", profiler_enabled: false,
+        wrapper_command: "", java_path_override: "" },
+      selected_modlist_overrides: {},
+    };
 
     // Always update mod list cards — preserve any cached icon data already loaded
     const existing = modListCards();
@@ -352,6 +365,7 @@ async function loadShellSnapshot(preferredName?: string | null) {
 
     return snap;
   } catch (err) {
+    logger.error("App", "loadShellSnapshot failed", err);
     pushUiError({ title: "Could not load launcher state", message: "The backend returned an error on startup.", detail: String(err), severity: "error", scope: "launch" });
     return null;
   }
@@ -360,23 +374,67 @@ async function loadShellSnapshot(preferredName?: string | null) {
 async function loadEditorSnapshot(modlistName: string, resetGroups = false) {
   if (!modlistName) return null;
   try {
-    const snap: any = await invoke("load_modlist_editor_command", {
-      selectedModlistName: modlistName,
-    });
+    logger.debug("App", "invoke stubbed: load_modlist_editor_command"); // [STUB]
+    const snap: any = { modlist_name: "", rows: [], incompatibilities: [], groups: [] };
 
     // Smart merge: preserve unchanged row references so SolidJS <For> doesn't
     // destroy and recreate every component on every reload.
     setModRowsState(cur => smartSetModRows(cur, snap.rows ?? []));
 
-    // Load aesthetic groups (structural containers) from rules.json via the snapshot.
-    const snapGroups = (snap.groups ?? []).map((g: any) => ({
+    // Load top-level aesthetic groups (structural containers) from rules.json.
+    const snapGroups: AestheticGroup[] = (snap.groups ?? []).map((g: any) => ({
       id: g.id as string,
       name: g.name as string,
       collapsed: Boolean(g.collapsed),
       blockIds: (g.blockIds ?? []) as string[],
       scopeRowId: null as string | null,
     }));
-    setAestheticGroups(snapGroups);
+
+    // Reconstruct alt-scoped aesthetic groups from each row's altGroups field.
+    const altScopedGroups: AestheticGroup[] = [];
+    const extractAltGroups = (rows: any[]) => {
+      for (const row of rows) {
+        if (row.altGroups?.length) {
+          for (const ag of row.altGroups) {
+            altScopedGroups.push({
+              id: ag.id as string,
+              name: ag.name as string,
+              collapsed: Boolean(ag.collapsed),
+              blockIds: (ag.blockIds ?? []) as string[],
+              scopeRowId: row.id as string,
+            });
+          }
+        }
+        if (row.alternatives?.length) extractAltGroups(row.alternatives);
+      }
+    };
+    extractAltGroups(snap.rows ?? []);
+
+    setAestheticGroups([...snapGroups, ...altScopedGroups]);
+
+    // Reconstruct savedLinks from each row's links field (primary mod IDs → row IDs).
+    // Build a primaryModId → rowId map covering all rows at every depth.
+    const primaryModToRowId = new Map<string, string>();
+    const collectPrimaryMods = (rows: any[]) => {
+      for (const row of rows) {
+        if (row.primaryModId) primaryModToRowId.set(row.primaryModId as string, row.id as string);
+        if (row.alternatives?.length) collectPrimaryMods(row.alternatives);
+      }
+    };
+    collectPrimaryMods(snap.rows ?? []);
+
+    const restoredLinks: LinkRule[] = [];
+    const collectLinks = (rows: any[]) => {
+      for (const row of rows) {
+        for (const primaryModId of (row.links ?? []) as string[]) {
+          const toId = primaryModToRowId.get(primaryModId);
+          if (toId) restoredLinks.push({ fromId: row.id as string, toId });
+        }
+        if (row.alternatives?.length) collectLinks(row.alternatives);
+      }
+    };
+    collectLinks(snap.rows ?? []);
+    setSavedLinks(restoredLinks);
 
     // Wipe functional groups when switching to a different list; they're loaded by loadModlistGroups.
     if (resetGroups) {
@@ -386,6 +444,7 @@ async function loadEditorSnapshot(modlistName: string, resetGroups = false) {
     setSavedIncompatibilities(incompat.map(r => ({ winnerId: r.winner_id, loserId: r.loser_id })));
     return snap;
   } catch (err) {
+    logger.error("App", "loadEditorSnapshot failed", err);
     pushUiError({ title: "Could not load mod list", message: `Failed to read rules for '${modlistName}'.`, detail: String(err), severity: "error", scope: "launch" });
     setModRowsState([]);
     return null;
@@ -393,7 +452,7 @@ async function loadEditorSnapshot(modlistName: string, resetGroups = false) {
 }
 
 async function loadAllCardIcons(names: string[]) {
-  if (!isTauri() || names.length === 0) return;
+  if (!isTauri() || names.length === 0) { logger.warn("App", "loadAllCardIcons skipped — no backend"); return; }
   await Promise.all(names.map(async name => {
     try {
       const p: any = await invoke("load_modlist_presentation_command", { modlistName: name });
@@ -412,6 +471,7 @@ async function loadModlistPresentation(modlistName: string) {
   }
 
   if (!isTauri()) {
+    logger.warn("App", "loadModlistPresentation skipped — no backend");
     setInstancePresentation({ iconLabel: buildDefaultIconLabel(modlistName), iconAccent: "", notes: "", iconImage: "" });
     return null;
   }
@@ -443,6 +503,7 @@ async function loadModlistGroups(modlistName: string, rows: ModRow[]) {
   }
 
   if (!isTauri()) {
+    logger.warn("App", "loadModlistGroups skipped — no backend");
     setFunctionalGroups([]);
     return null;
   }
@@ -466,7 +527,7 @@ async function loadModlistGroups(modlistName: string, rows: ModRow[]) {
       tone: group.tone,
       modIds: (group.modIds ?? group.mod_ids ?? []).filter((id: string) => availableIds.has(id)),
     }));
-    setFunctionalGroups(nextFunctionalGroups);
+    setFunctionalGroups(nextFunctionalGroups.filter((g: FunctionalGroup) => g.modIds.length > 0));
 
     return layout;
   } catch (err) {
@@ -524,6 +585,8 @@ export default function App() {
   const [lastSavedRuleMetaGroups, setLastSavedRuleMetaGroups] = createSignal("");
   const [incompatReady, setIncompatReady] = createSignal(false);
   const [lastSavedIncompat, setLastSavedIncompat] = createSignal("");
+  const [linksReady, setLinksReady] = createSignal(false);
+  const [lastSavedLinks, setLastSavedLinks] = createSignal("");
 
   // Save functional group (tag) definitions + membership to modlist-editor-groups.json.
   createEffect(() => {
@@ -557,7 +620,7 @@ export default function App() {
     void invoke("save_rule_groups_command", {
       input: {
         modlistName,
-        groups: aestheticGroups().map(g => ({ id: g.id, name: g.name, collapsed: g.collapsed, rowIds: g.blockIds })),
+        groups: aestheticGroups().map(g => ({ id: g.id, name: g.name, collapsed: g.collapsed, rowIds: g.blockIds, scopeRowId: g.scopeRowId ?? null })),
       },
     }).catch(err => {
       setLastSavedRuleMetaGroups("");
@@ -582,38 +645,45 @@ export default function App() {
     });
   });
 
+  // Save mod links to rules.json whenever savedLinks changes.
+  createEffect(() => {
+    const modlistName = selectedModListName();
+    const ready = linksReady();
+    const serialized = serializeLinks(savedLinks());
+
+    if (!ready || !modlistName || !isTauri() || serialized === lastSavedLinks()) return;
+
+    setLastSavedLinks(serialized);
+    void invoke("save_rule_links_command", {
+      input: {
+        modlistName,
+        links: savedLinks().map(l => ({ fromId: l.fromId, toId: l.toId })),
+      },
+    }).catch(err => {
+      setLastSavedLinks("");
+      pushUiError({ title: "Could not save links", message: "The mod links could not be persisted.", detail: String(err), severity: "error", scope: "launch" });
+    });
+  });
+
   // ── Startup ────────────────────────────────────────────────────────────────
   onMount(() => {
     let disposed = false;
     const unlisteners: Array<() => void> = [];
 
     const boot = async () => {
-      if (!isTauri()) {
-        // Browser-only mode: use demo data so the UI is explorable
-        setModListCards(DEMO_MOD_LISTS);
-        setSelectedModListName(DEMO_MOD_LISTS[0]?.name ?? "");
-        setAccounts(DEMO_ACCOUNTS);
-        setActiveAccountId(DEMO_ACCOUNTS[0]?.id ?? "");
-        setAppLoading(false);
-        return;
+      logger.info("App", "boot started");
+
+      // Load shell + editor from backend (stubs return empty defaults in browser mode)
+      const snap = await loadShellSnapshot(null);
+      setAppLoading(false);
+      logger.debug("App", "shell snapshot loaded", { modlists: (snap?.modlists ?? []).map((m: any) => m.name) });
+
+      { // [STUB] fetch_minecraft_versions_command
+        logger.debug("App", "invoke stubbed: fetch_minecraft_versions_command");
+        const versions = ["1.21.1", "1.20.6", "1.20.4", "1.19.4"];
+        if (versions.length > 0) setMinecraftVersions(versions);
       }
 
-      const tracePath = await clearDebugTrace();
-      appendDebugTrace("app.boot", { tracePath, phase: "start" });
-
-      // Real Tauri app: load everything from the backend
-      const snap = await loadShellSnapshot(null);
-      appendDebugTrace("app.boot", {
-        phase: "shell-loaded",
-        modlists: (snap?.modlists ?? []).map((modlist: any) => modlist.name),
-      });
-      setAppLoading(false);
-
-      // Fetch Minecraft version list and start background pre-download
-      try {
-        const versions = await invoke<string[]>("fetch_minecraft_versions_command");
-        if (versions.length > 0) setMinecraftVersions(versions);
-      } catch (_) { /* keep the hardcoded fallback list */ }
       // Load editor data + icons for the selected mod list
       const firstList = snap?.modlists?.[0]?.name ?? "";
       if (firstList) {
@@ -625,49 +695,13 @@ export default function App() {
         setGroupLayoutReady(true);
         setLastSavedIncompat(serializeIncompatibilities(savedIncompatibilities()));
         setIncompatReady(true);
-        appendDebugTrace("app.boot", {
-          phase: "editor-loaded",
-          firstList,
-          rowCount: editorSnapshot?.rows?.length ?? modRowsState().length,
-        });
+        setLastSavedLinks(serializeLinks(savedLinks()));
+        setLinksReady(true);
+        logger.debug("App", "boot completed", { firstList, rowCount: editorSnapshot?.rows?.length ?? modRowsState().length });
         void fetchModIcons(modRowsState());
+      } else {
+        logger.debug("App", "boot completed — no mod lists found");
       }
-
-      // Wire up Tauri event listeners
-      const { listen } = await import("@tauri-apps/api/event");
-
-      unlisteners.push(await listen<{ filename: string; percentage: number }>("download-progress", ev => {
-        if (ev.payload) upsertDownloadProgress({ filename: ev.payload.filename, progress: ev.payload.percentage });
-      }));
-
-      unlisteners.push(await listen<any>("launcher-error", ev => {
-        if (!ev.payload) return;
-        const p = ev.payload;
-        setLauncherErrors(cur => {
-          const e = { id: p.id ?? `le-${Date.now()}`, title: p.title, message: p.message, detail: p.detail ?? p.message, severity: p.severity ?? "error", scope: p.scope ?? "launch" };
-          return [e, ...cur.filter((x: any) => x.id !== e.id)];
-        });
-      }));
-
-      unlisteners.push(await listen<any>("launch-progress", ev => {
-        if (!ev.payload) return;
-        setLaunchState(ev.payload.state);
-        setLaunchProgress(ev.payload.progress);
-        setLaunchStageLabel(ev.payload.stage);
-        setLaunchStageDetail(ev.payload.detail);
-      }));
-
-      unlisteners.push(await listen<any>("minecraft-log", ev => {
-        if (ev.payload) {
-          setLaunchLogs(c => [...c, `[${ev.payload.stream}] ${ev.payload.line}`]);
-        }
-      }));
-
-      unlisteners.push(await listen<any>("minecraft-exit", ev => {
-        if (!ev.payload) return;
-        setLaunchState("idle");
-        setLaunchLogs(c => [...c, `[exit] Process finished with code ${ev.payload.exitCode ?? ev.payload.exit_code ?? "unknown"}`]);
-      }));
 
       if (disposed) unlisteners.forEach(u => u());
     };
@@ -679,11 +713,13 @@ export default function App() {
   // ── Handlers ──────────────────────────────────────────────────────────────
 
   const handleSelectModList = async (name: string) => {
+    logger.info("App", "handleSelectModList started", { name });
     appendDebugTrace("modlist.select", { name });
     setSelectedModListName(name);
     setSelectedIds([]);
     setGroupLayoutReady(false);
     setIncompatReady(false);
+    setLinksReady(false);
     // Immediately show cached presentation data so there's no flicker
     const cached = modListCards().find(c => c.name === name);
     if (cached?.iconLabel !== undefined) {
@@ -697,7 +733,7 @@ export default function App() {
     // Restore cached version/loader immediately — prevents bleed from previous modlist
     const cachedVL = modlistVersionLoaderCache.get(name);
     if (cachedVL) { setSelectedMcVersion(cachedVL.version); setSelectedModLoader(cachedVL.loader); }
-    if (!isTauri()) return;
+    if (!isTauri()) { logger.warn("App", "handleSelectModList skipped — no backend"); return; }
     await loadShellSnapshot(name);
     const editorSnapshot = await loadEditorSnapshot(name, true);
     await loadModlistPresentation(name);
@@ -707,11 +743,14 @@ export default function App() {
     setGroupLayoutReady(true);
     setLastSavedIncompat(serializeIncompatibilities(savedIncompatibilities()));
     setIncompatReady(true);
+    setLastSavedLinks(serializeLinks(savedLinks()));
+    setLinksReady(true);
     void fetchModIcons(modRowsState());
   };
 
   const handleReorderRules = async (orderedIds: string[]) => {
-    if (!isTauri() || !selectedModListName()) return;
+    logger.info("App", "handleReorderRules started", { count: orderedIds.length });
+    if (!isTauri() || !selectedModListName()) { logger.warn("App", "handleReorderRules skipped — no backend"); return; }
     try {
       await invoke("reorder_rules_command", {
         input: { modlistName: selectedModListName(), orderedRowIds: orderedIds },
@@ -728,11 +767,17 @@ export default function App() {
           winnerId: idRemap.get(r.winnerId) ?? r.winnerId,
           loserId:  idRemap.get(r.loserId)  ?? r.loserId,
         })));
+        setSavedLinks(links => links.map(l => ({
+          fromId: idRemap.get(l.fromId) ?? l.fromId,
+          toId:   idRemap.get(l.toId)   ?? l.toId,
+        })).filter(l => validIds.has(l.fromId) && validIds.has(l.toId)));
         setSelectedIds(ids => remapIds(ids, idRemap, validIds));
         setExpandedRows(ids => remapIds(ids, idRemap, validIds));
         setAlternativesPanelParentId(id => (id && idRemap.has(id) ? idRemap.get(id)! : id));
+        setAdvancedPanelModId(id => (id && idRemap.has(id) ? idRemap.get(id)! : id));
       });
     } catch (err) {
+      logger.error("App", "handleReorderRules failed", err);
       pushUiError({ title: "Reorder failed", message: "The new rule order could not be saved.", detail: String(err), severity: "error", scope: "launch" });
       await loadEditorSnapshot(selectedModListName()); // restore original order on failure
     }
@@ -745,7 +790,7 @@ export default function App() {
     // Optimistic: reorder alternatives in local state immediately, at any depth.
     setModRowsState(cur => reorderAlternativesInRows(cur, parentId, orderedAltIds));
 
-    if (!isTauri()) return;
+    if (!isTauri()) { logger.warn("App", "handleSaveAlternativeOrder skipped — no backend"); return; }
     try {
       await invoke("save_alternative_order_command", {
         input: { modlistName: selectedModListName(), parentRowId: parentId, orderedAlternativeIds: orderedAltIds },
@@ -759,7 +804,29 @@ export default function App() {
   };
 
   const handleAddAlternative = async (parentId: string, altRowId: string) => {
-    if (!isTauri() || !selectedModListName()) return;
+    if (!isTauri()) {
+      const parentRow = rowMap().get(parentId);
+      const altRow = rowMap().get(altRowId);
+      if (!parentRow || !altRow) return;
+
+      // Remove altRow from wherever it currently lives (top-level or nested)
+      const withoutAlt = modRowsState()
+        .filter(r => r.id !== altRowId)
+        .map(r => ({
+          ...r,
+          alternatives: (r.alternatives ?? []).filter(a => a.id !== altRowId),
+        }));
+
+      // Add a shallow copy as alternative of parent (breaks the shared reference)
+      setModRowsState(
+        updateAltsDeep(withoutAlt, parentId, [
+          ...(parentRow.alternatives ?? []),
+          { ...altRow, alternatives: [] },
+        ])
+      );
+      return;
+    }
+    if (!selectedModListName()) { logger.warn("App", "handleAddAlternative skipped — no modlist"); return; }
     // If the parent is itself an alternative (contains "-alternative-"),
     // use the nested alternative command; otherwise use the flat command.
     const isNested = parentId.includes("-alternative-");
@@ -771,8 +838,14 @@ export default function App() {
       isNested,
       parentNamePath,
     });
+    const altIsNested = altRowId.includes("-alternative-");
     try {
-      if (isNested) {
+      if (altIsNested) {
+        // Source is an alternative of another rule — move it to the target parent.
+        await invoke("move_alt_to_alternative_command", {
+          input: { modlistName: selectedModListName(), sourceRowId: altRowId, targetParentRowId: parentId },
+        });
+      } else if (isNested) {
         await invoke("add_nested_alternative_command", {
           input: { modlistName: selectedModListName(), parentAltRowId: parentId, alternativeRowId: altRowId },
         });
@@ -800,7 +873,21 @@ export default function App() {
   };
 
   const handleRemoveAlternative = async (altRowId: string) => {
-    if (!isTauri() || !selectedModListName()) return;
+    if (!isTauri()) {
+      setModRowsState(rows =>
+        rows
+          .filter(r => r.id !== altRowId)
+          .map(function removeDeep(r: ModRow): ModRow {
+            if (!r.alternatives?.length) return r;
+            const filtered = r.alternatives
+              .filter(a => a.id !== altRowId)
+              .map(removeDeep);
+            return { ...r, alternatives: filtered };
+          })
+      );
+      return;
+    }
+    if (!selectedModListName()) { logger.warn("App", "handleRemoveAlternative skipped — no modlist"); return; }
     const activePanelPath = alternativesPanelParent()
       ? findRowNamePath(modRowsState(), alternativesPanelParent()!.id)
       : null;
@@ -834,7 +921,7 @@ export default function App() {
 
   const handleSwitchAccount = async (id: string) => {
     setActiveAccountId(id);
-    if (!isTauri()) return;
+    if (!isTauri()) { logger.warn("App", "handleSwitchAccount skipped — no backend"); return; }
     try {
       await invoke("switch_active_account_command", { microsoftId: id });
       await loadShellSnapshot(selectedModListName() || null);
@@ -846,10 +933,12 @@ export default function App() {
   const handleCreateModlist = async () => {
     const name = createModlistName().trim();
     if (!name || createModlistBusy()) return;
+    logger.info("App", "handleCreateModlist started", { name });
     setCreateModlistBusy(true);
 
     if (!isTauri()) {
-      // Browser demo: just add to the list locally
+      logger.warn("App", "handleCreateModlist skipped — no backend");
+      // Browser mode: add to the list locally so the UI is usable
       setModListCards(cur => [...cur, { name, status: "Ready", accent: "from-primary/30 via-primary/10 to-transparent", description: createModlistDescription().trim() || "New mod list." }]);
       setSelectedModListName(name);
       setModRowsState([]);
@@ -876,7 +965,11 @@ export default function App() {
       setGroupLayoutReady(true);
       setLastSavedIncompat(serializeIncompatibilities(savedIncompatibilities()));
       setIncompatReady(true);
+      setLastSavedLinks(serializeLinks(savedLinks()));
+      setLinksReady(true);
+      logger.debug("App", "handleCreateModlist completed", { name });
     } catch (err) {
+      logger.error("App", "handleCreateModlist failed", err);
       pushUiError({ title: "Failed to create mod list", message: `'${name}' could not be created.`, detail: String(err), severity: "error", scope: "launch" });
     } finally {
       setCreateModlistBusy(false);
@@ -884,6 +977,12 @@ export default function App() {
   };
 
   const handleAddModrinth = async (modId: string, displayName: string) => {
+    // Must have a mod list selected before we can add anything
+    if (!selectedModListName()) {
+      pushUiError({ title: "No mod list selected", message: "Create or select a mod list in the sidebar before adding mods.", detail: "", severity: "warning", scope: "launch" });
+      return;
+    }
+    logger.info("App", "handleAddModrinth started", { modId, displayName });
     // Optimistic insert: append a placeholder row immediately so the list
     // never fully re-renders.  The backend normalises the rule name the same
     // way we compute the ID here, so the reference is stable after the reload.
@@ -901,15 +1000,16 @@ export default function App() {
     setModRowsState(c => [...c, tempRow]);
     void fetchModIcons([tempRow]);
 
-    if (!isTauri()) return;
-    if (!selectedModListName()) return;
+    if (!isTauri()) { logger.warn("App", "handleAddModrinth skipped — no backend"); return; }
     try {
       await invoke("add_mod_rule_command", {
         input: { modlistName: selectedModListName(), ruleName: displayName, modId, modSource: "modrinth", fileName: null },
       });
       // Smart-merge: only the new row changes (or its ID gets corrected); existing rows keep references.
       await loadEditorSnapshot(selectedModListName());
+      logger.debug("App", "handleAddModrinth completed", { modId, displayName });
     } catch (err) {
+      logger.error("App", "handleAddModrinth failed", err);
       // Remove the optimistic row on failure.
       setModRowsState(c => c.filter(r => r.id !== tempId));
       pushUiError({ title: "Failed to add mod", message: `'${displayName}' could not be added.`, detail: String(err), severity: "error", scope: "launch" });
@@ -943,6 +1043,7 @@ export default function App() {
   const handleDeleteSelected = async () => {
     const ids = selectedIds();
     if (ids.length === 0) return;
+    logger.info("App", "handleDeleteSelected started", { ids });
     const idSet = new Set(ids);
 
     // Optimistic update: remove top-level rules AND nested alternatives.
@@ -959,17 +1060,22 @@ export default function App() {
         })
     );
     setSelectedIds([]);
-    if (!isTauri() || !selectedModListName()) return;
+    if (!isTauri() || !selectedModListName()) { logger.warn("App", "handleDeleteSelected skipped — no backend"); return; }
     try {
       await invoke("delete_rules_command", { input: { modlistName: selectedModListName(), rowIds: ids } });
       const currentRows = modRowsState();
       const rebuiltRows = rebuildRowIds(currentRows);
       const idRemap = buildIdRemap(currentRows, rebuiltRows);
       const validIds = collectRowIds(rebuiltRows);
-      setModRowsState(rebuiltRows);
-      setAestheticGroups(groups => remapAestheticGroups(groups, idRemap, validIds));
-      setFunctionalGroups(groups => remapFunctionalGroups(groups, idRemap, validIds));
+      batch(() => {
+        setModRowsState(rebuiltRows);
+        setAestheticGroups(groups => remapAestheticGroups(groups, idRemap, validIds));
+        setFunctionalGroups(groups => remapFunctionalGroups(groups, idRemap, validIds));
+        setAdvancedPanelModId(id => (id && idRemap.has(id) ? idRemap.get(id)! : (id && validIds.has(id) ? id : null)));
+      });
+      logger.debug("App", "handleDeleteSelected completed");
     } catch (err) {
+      logger.error("App", "handleDeleteSelected failed", err);
       pushUiError({ title: "Failed to delete rules", message: "The selected rules could not be removed.", detail: String(err), severity: "error", scope: "launch" });
       await loadEditorSnapshot(selectedModListName()); // restore on failure
     }
@@ -979,27 +1085,34 @@ export default function App() {
     const id = renameRuleTargetId();
     const name = renameRuleDraft().trim();
     if (!id || !name) return;
+    logger.info("App", "handleRenameRule started", { id, name });
     const nextId = renameRowId(id, name);
     const idRemap = new Map([[id, nextId]]);
     const currentRows = modRowsState().map(r => r.id === id ? { ...r, id: nextId, name } : r);
     const validIds = collectRowIds(currentRows);
-    setModRowsState(currentRows);
-    setAestheticGroups(groups => remapAestheticGroups(groups, idRemap, validIds));
-    setFunctionalGroups(groups => remapFunctionalGroups(groups, idRemap, validIds));
-    setSelectedIds(ids => remapIds(ids, idRemap, validIds));
+    batch(() => {
+      setModRowsState(currentRows);
+      setAestheticGroups(groups => remapAestheticGroups(groups, idRemap, validIds));
+      setFunctionalGroups(groups => remapFunctionalGroups(groups, idRemap, validIds));
+      setSelectedIds(ids => remapIds(ids, idRemap, validIds));
+      setAdvancedPanelModId(aid => (aid && idRemap.has(aid) ? idRemap.get(aid)! : aid));
+    });
     setRenameRuleModalOpen(false);
-    if (!isTauri() || !selectedModListName()) return;
+    if (!isTauri() || !selectedModListName()) { logger.warn("App", "handleRenameRule skipped — no backend"); return; }
     try {
       await invoke("rename_rule_command", { input: { modlistName: selectedModListName(), rowId: id, newName: name } });
       // Optimistic update already applied — no reload needed.
+      logger.debug("App", "handleRenameRule completed");
     } catch (err) {
+      logger.error("App", "handleRenameRule failed", err);
       pushUiError({ title: "Rename failed", message: "The rule name could not be saved.", detail: String(err), severity: "error", scope: "launch" });
       await loadEditorSnapshot(selectedModListName()); // restore on failure
     }
   };
 
   const handleSaveSettings = async () => {
-    if (!isTauri()) { setSettingsModalOpen(false); return; }
+    logger.info("App", "handleSaveSettings started");
+    if (!isTauri()) { logger.warn("App", "handleSaveSettings skipped — no backend"); setSettingsModalOpen(false); return; }
     try {
       const g = globalSettings();
       await invoke("save_global_settings_command", {
@@ -1022,13 +1135,15 @@ export default function App() {
       }
       setSettingsModalOpen(false);
       await loadShellSnapshot(selectedModListName() || null);
+      logger.debug("App", "handleSaveSettings completed");
     } catch (err) {
+      logger.error("App", "handleSaveSettings failed", err);
       pushUiError({ title: "Settings not saved", message: "The settings could not be written to disk.", detail: String(err), severity: "error", scope: "launch" });
     }
   };
 
   const saveVersionLoader = async (modlistName: string, version: string, loader: string) => {
-    if (!isTauri() || !modlistName) return;
+    if (!isTauri() || !modlistName) { logger.warn("App", "saveVersionLoader skipped — no backend"); return; }
     const ov = modlistOverrides();
     await invoke("save_modlist_overrides_command", {
       overrides: {
@@ -1148,6 +1263,8 @@ export default function App() {
         setGroupLayoutReady(true);
         setLastSavedIncompat(serializeIncompatibilities(savedIncompatibilities()));
         setIncompatReady(true);
+        setLastSavedLinks(serializeLinks(savedLinks()));
+        setLinksReady(true);
       } else {
         setSelectedModListName("");
         setInstancePresentation({ iconLabel: "ML", iconAccent: "", notes: "", iconImage: "" });
@@ -1248,6 +1365,7 @@ export default function App() {
             onAddMod={() => setAddModModalOpen(true)}
             onDeleteSelected={handleDeleteSelected}
             onReorder={orderedIds => void handleReorderRules(orderedIds)}
+            onReorderAlts={(parentId, orderedIds) => void handleSaveAlternativeOrder(parentId, orderedIds)}
           />
           <LaunchPanel onLaunch={handleLaunch} onSwitchAccount={handleSwitchAccount} onVersionChange={handleVersionChange} onLoaderChange={handleLoaderChange} />
         </div>
@@ -1268,6 +1386,7 @@ export default function App() {
       <AlternativesPanel onSave={handleSaveAlternativeOrder} onAddAlternative={handleAddAlternative} onRemoveAlternative={handleRemoveAlternative} />
       <ErrorCenter />
       <ExportModal onExport={handleExport} />
+      <DebugPanel />
     </div>
   );
 }
