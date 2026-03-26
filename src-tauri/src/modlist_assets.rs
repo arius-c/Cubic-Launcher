@@ -10,7 +10,7 @@ use tauri::State;
 use zip::write::FileOptions;
 
 use crate::launcher_paths::LauncherPaths;
-use crate::rules::{ModList, ModlistPresentation, RULES_FILENAME};
+use crate::rules::{ModlistPresentation, RULES_FILENAME};
 
 const MODLIST_PRESENTATION_FILENAME: &str = "modlist-presentation.json";
 const MODLIST_GROUP_LAYOUT_FILENAME: &str = "modlist-editor-groups.json";
@@ -140,22 +140,7 @@ pub fn load_modlist_presentation_from_root(
     root_dir: &Path,
     modlist_name: &str,
 ) -> Result<ModlistPresentation> {
-    let launcher_paths = LauncherPaths::new(root_dir.to_path_buf());
-    let rules_path = launcher_paths
-        .modlists_dir()
-        .join(modlist_name)
-        .join(RULES_FILENAME);
-
-    // Primary source: presentation embedded in rules.json (schema v3+).
-    if rules_path.exists() {
-        if let Ok(modlist) = ModList::read_from_file(&rules_path) {
-            if let Some(presentation) = modlist.presentation {
-                return Ok(presentation);
-            }
-        }
-    }
-
-    // Legacy fallback: separate modlist-presentation.json file.
+    // Presentation is stored in the separate modlist-presentation.json file.
     let presentation_path = modlist_presentation_path(root_dir, modlist_name);
     if !presentation_path.exists() {
         return Ok(default_presentation(modlist_name));
@@ -187,22 +172,7 @@ pub fn save_modlist_presentation_from_root(
         icon_image: input.icon_image.clone().filter(|s| !s.is_empty()),
     };
 
-    let launcher_paths = LauncherPaths::new(root_dir.to_path_buf());
-    let rules_path = launcher_paths
-        .modlists_dir()
-        .join(&input.modlist_name)
-        .join(RULES_FILENAME);
-
-    // Preferred path: embed presentation in rules.json (schema v3+).
-    if rules_path.exists() {
-        let mut modlist = ModList::read_from_file(&rules_path).with_context(|| {
-            format!("failed to load rules.json for modlist '{}'", input.modlist_name)
-        })?;
-        modlist.presentation = Some(presentation);
-        return modlist.write_to_file(&rules_path);
-    }
-
-    // Legacy fallback: write to the separate modlist-presentation.json file.
+    // Write to the separate modlist-presentation.json file.
     let presentation_path = modlist_presentation_path(root_dir, &input.modlist_name);
     if let Some(parent) = presentation_path.parent() {
         fs::create_dir_all(parent)

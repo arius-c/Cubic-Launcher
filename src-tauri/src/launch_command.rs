@@ -157,7 +157,7 @@ mod tests {
 
     use super::{
         build_launch_command, join_classpath_entries, split_argument_string, JavaLaunchRequest,
-        JavaLaunchSettings, ProfilerConfig,
+        JavaLaunchSettings, PreparedLaunchCommand, ProfilerConfig,
     };
 
     fn sample_loader_metadata() -> LoaderMetadata {

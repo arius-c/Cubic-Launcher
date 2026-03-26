@@ -33,7 +33,7 @@ pub fn create_modlist_command(
     launcher_paths: State<'_, LauncherPaths>,
     input: CreateModlistInput,
 ) -> Result<CreateModlistResult, String> {
-    create_modlist_from_root(launcher_paths.root_dir(), &input).map_err(|error| error.to_string())
+    create_modlist_from_root(launcher_paths.root_dir(), &input).map_err(|e| e.to_string())
 }
 
 pub fn create_modlist_from_root(
@@ -54,22 +54,29 @@ pub fn create_modlist_from_root(
     let description = input.description.trim().to_string();
 
     let launcher_paths = LauncherPaths::new(root_dir.to_path_buf());
-    let rules_path = launcher_paths
-        .modlists_dir()
-        .join(&name)
-        .join(RULES_FILENAME);
+    let modlist_dir = launcher_paths.modlists_dir().join(&name);
+    let rules_path = modlist_dir.join(RULES_FILENAME);
 
     if rules_path.exists() {
         bail!("a mod-list named '{}' already exists", name);
     }
+
+    // Create subdirectories
+    std::fs::create_dir_all(modlist_dir.join("local-jars")).with_context(|| {
+        format!("failed to create local-jars directory for modlist '{}'", name)
+    })?;
+    std::fs::create_dir_all(modlist_dir.join("custom_configs")).with_context(|| {
+        format!(
+            "failed to create custom_configs directory for modlist '{}'",
+            name
+        )
+    })?;
 
     let modlist = ModList {
         modlist_name: name.clone(),
         author: author.clone(),
         description: description.clone(),
         rules: vec![],
-        groups_meta: vec![],
-        presentation: None,
     };
 
     modlist.write_to_file(&rules_path).with_context(|| {
@@ -97,7 +104,7 @@ pub fn delete_modlist_command(
     modlist_name: String,
 ) -> Result<(), String> {
     delete_modlist_from_root(launcher_paths.root_dir(), &modlist_name)
-        .map_err(|error| error.to_string())
+        .map_err(|e| e.to_string())
 }
 
 pub fn delete_modlist_from_root(root_dir: &Path, modlist_name: &str) -> Result<()> {
@@ -131,11 +138,7 @@ pub fn delete_modlist_from_root(root_dir: &Path, modlist_name: &str) -> Result<(
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CopyLocalJarInput {
-    /// Absolute path of the source JAR on the user's filesystem.
     pub source_path: String,
-    /// Human-readable rule name to assign (falls back to filename stem if empty).
-    pub rule_name: String,
-    /// Name of the mod-list to which the rule will be appended.
     pub modlist_name: String,
 }
 
@@ -144,7 +147,7 @@ pub fn copy_local_jar_command(
     launcher_paths: State<'_, LauncherPaths>,
     input: CopyLocalJarInput,
 ) -> Result<(), String> {
-    copy_local_jar_from_root(launcher_paths.root_dir(), &input).map_err(|error| error.to_string())
+    copy_local_jar_from_root(launcher_paths.root_dir(), &input).map_err(|e| e.to_string())
 }
 
 pub fn copy_local_jar_from_root(root_dir: &Path, input: &CopyLocalJarInput) -> Result<()> {
@@ -162,19 +165,50 @@ pub fn copy_local_jar_from_root(root_dir: &Path, input: &CopyLocalJarInput) -> R
         );
     }
 
-    let launcher_paths = LauncherPaths::new(root_dir.to_path_buf());
-    let dest_path = launcher_paths.mods_cache_dir().join(file_name);
+    // Derive mod_id from the filename stem (without .jar)
+    let mod_id = file_name
+        .trim_end_matches(".jar")
+        .trim_end_matches(".JAR")
+        .to_string();
 
-    // Ensure cache/mods/ directory exists before copying.
-    if let Some(parent) = dest_path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "failed to create cache/mods/ directory at {}",
-                parent.display()
-            )
-        })?;
+    if mod_id.is_empty() {
+        bail!("JAR filename has no stem: '{}'", file_name);
     }
 
+    // Check if a rule with this mod_id already exists
+    let launcher_paths = LauncherPaths::new(root_dir.to_path_buf());
+    let rules_path = launcher_paths
+        .modlists_dir()
+        .join(&input.modlist_name)
+        .join(RULES_FILENAME);
+    let modlist = ModList::read_from_file(&rules_path).with_context(|| {
+        format!(
+            "failed to load modlist '{}' for local JAR copy",
+            input.modlist_name
+        )
+    })?;
+
+    if modlist.contains_mod_id(&mod_id) {
+        bail!(
+            "a rule with mod_id '{}' already exists in modlist '{}'",
+            mod_id,
+            input.modlist_name
+        );
+    }
+
+    // Copy the JAR to local-jars/
+    let local_jars_dir = launcher_paths
+        .modlists_dir()
+        .join(&input.modlist_name)
+        .join("local-jars");
+    std::fs::create_dir_all(&local_jars_dir).with_context(|| {
+        format!(
+            "failed to create local-jars directory at {}",
+            local_jars_dir.display()
+        )
+    })?;
+
+    let dest_path = local_jars_dir.join(format!("{}.jar", mod_id));
     std::fs::copy(source_path, &dest_path).with_context(|| {
         format!(
             "failed to copy '{}' to '{}'",
@@ -183,33 +217,14 @@ pub fn copy_local_jar_from_root(root_dir: &Path, input: &CopyLocalJarInput) -> R
         )
     })?;
 
-    // Derive the rule name: prefer the user-provided name, fall back to filename stem.
-    let rule_name = {
-        let candidate = input.rule_name.trim().to_string();
-        if candidate.is_empty() {
-            file_name
-                .trim_end_matches(".jar")
-                .trim_end_matches(".JAR")
-                .to_string()
-        } else {
-            candidate
-        }
-    };
-
-    // Derive the mod_id from the filename stem (without extension).
-    let mod_id = file_name
-        .trim_end_matches(".jar")
-        .trim_end_matches(".JAR")
-        .to_string();
-
+    // Append a new top-level rule
     add_mod_rule_from_root(
         root_dir,
         &AddModRuleInput {
             modlist_name: input.modlist_name.clone(),
-            rule_name,
             mod_id,
-            mod_source: "local".into(),
-            file_name: Some(file_name.to_string()),
+            source: "local".into(),
+            file_name: None,
         },
     )
 }
@@ -226,231 +241,195 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::editor_data::load_editor_snapshot_from_root;
-    use crate::rules::{ModList, ModReference, ModSource, Rule};
+    use crate::rules::ModList;
 
     use super::{
         copy_local_jar_from_root, create_modlist_from_root, CopyLocalJarInput, CreateModlistInput,
     };
 
     fn unique_test_root() -> PathBuf {
-        let timestamp = SystemTime::now()
+        let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("system time before unix epoch")
+            .unwrap()
             .as_nanos();
-
-        env::temp_dir().join(format!("cubic-launcher-modlist-manager-test-{timestamp}"))
+        env::temp_dir().join(format!("cubic-modlist-mgr-test-{ts}"))
     }
 
     #[test]
     fn create_modlist_writes_skeleton_rules_json() {
-        let root_dir = unique_test_root();
-        fs::create_dir_all(root_dir.join("mod-lists")).expect("mod-lists directory should exist");
+        let root = unique_test_root();
+        fs::create_dir_all(root.join("mod-lists")).unwrap();
 
         create_modlist_from_root(
-            &root_dir,
+            &root,
             &CreateModlistInput {
                 name: "My New Pack".into(),
                 author: "PlayerLine".into(),
                 description: "A fresh mod-list".into(),
             },
         )
-        .expect("create modlist should succeed");
+        .unwrap();
 
-        let rules_path = root_dir
+        let rules_path = root.join("mod-lists").join("My New Pack").join("rules.json");
+        assert!(rules_path.exists());
+
+        // local-jars and custom_configs directories should exist
+        assert!(root.join("mod-lists").join("My New Pack").join("local-jars").exists());
+        assert!(root
             .join("mod-lists")
             .join("My New Pack")
-            .join("rules.json");
-        assert!(rules_path.exists(), "rules.json should have been created");
+            .join("custom_configs")
+            .exists());
 
-        let snapshot = load_editor_snapshot_from_root(&root_dir, "My New Pack")
-            .expect("editor snapshot should load");
-
+        let snapshot = load_editor_snapshot_from_root(&root, "My New Pack").unwrap();
         assert_eq!(snapshot.modlist_name, "My New Pack");
-        assert!(
-            snapshot.rows.is_empty(),
-            "new mod-list should have no rules"
-        );
+        assert!(snapshot.rows.is_empty());
 
-        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
     fn create_modlist_uses_default_author_when_blank() {
-        let root_dir = unique_test_root();
-        fs::create_dir_all(root_dir.join("mod-lists")).expect("mod-lists directory should exist");
+        let root = unique_test_root();
+        fs::create_dir_all(root.join("mod-lists")).unwrap();
 
         let result = create_modlist_from_root(
-            &root_dir,
+            &root,
             &CreateModlistInput {
                 name: "Blank Author Pack".into(),
                 author: "   ".into(),
                 description: String::new(),
             },
         )
-        .expect("create modlist should succeed");
+        .unwrap();
 
         assert_eq!(result.author, "Author");
-
-        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
     fn create_modlist_rejects_duplicate_name() {
-        let root_dir = unique_test_root();
-        fs::create_dir_all(root_dir.join("mod-lists")).expect("mod-lists directory should exist");
+        let root = unique_test_root();
+        fs::create_dir_all(root.join("mod-lists")).unwrap();
 
         create_modlist_from_root(
-            &root_dir,
+            &root,
             &CreateModlistInput {
-                name: "Duplicate Pack".into(),
-                author: "PlayerLine".into(),
+                name: "Dup Pack".into(),
+                author: "Author".into(),
                 description: String::new(),
             },
         )
-        .expect("first create should succeed");
+        .unwrap();
 
-        let second = create_modlist_from_root(
-            &root_dir,
+        let result = create_modlist_from_root(
+            &root,
             &CreateModlistInput {
-                name: "Duplicate Pack".into(),
-                author: "PlayerLine".into(),
+                name: "Dup Pack".into(),
+                author: "Author".into(),
                 description: String::new(),
             },
         );
+        assert!(result.is_err());
 
-        assert!(second.is_err(), "second create with same name should fail");
-
-        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
-    fn copy_local_jar_places_file_in_cache_and_adds_rule() {
-        let root_dir = unique_test_root();
-        let modlist_dir = root_dir.join("mod-lists").join("Test Pack");
-        let mods_cache_dir = root_dir.join("cache").join("mods");
-        fs::create_dir_all(&modlist_dir).expect("modlist directory should exist");
-        fs::create_dir_all(&mods_cache_dir).expect("cache mods directory should exist");
+    fn copy_local_jar_places_file_and_adds_rule() {
+        let root = unique_test_root();
+        let modlist_dir = root.join("mod-lists").join("Test Pack");
+        fs::create_dir_all(modlist_dir.join("local-jars")).unwrap();
 
         ModList {
             modlist_name: "Test Pack".into(),
-            author: "PlayerLine".into(),
+            author: "Author".into(),
             description: String::new(),
             rules: vec![],
-            groups_meta: vec![],
-            presentation: None,
         }
         .write_to_file(&modlist_dir.join("rules.json"))
-        .expect("rules should write");
+        .unwrap();
 
-        // Create a fake JAR source file.
-        let source_dir = root_dir.join("source");
-        fs::create_dir_all(&source_dir).expect("source dir should exist");
+        // Create a fake JAR source file
+        let source_dir = root.join("source");
+        fs::create_dir_all(&source_dir).unwrap();
         let source_jar = source_dir.join("custom-patch-1.0.jar");
-        fs::write(&source_jar, b"fake jar content").expect("fake jar should write");
+        fs::write(&source_jar, b"fake jar content").unwrap();
 
         copy_local_jar_from_root(
-            &root_dir,
+            &root,
             &CopyLocalJarInput {
                 source_path: source_jar.to_string_lossy().into_owned(),
-                rule_name: "Custom Patch".into(),
                 modlist_name: "Test Pack".into(),
             },
         )
-        .expect("copy local jar should succeed");
+        .unwrap();
 
-        assert!(
-            mods_cache_dir.join("custom-patch-1.0.jar").exists(),
-            "JAR should have been copied to cache/mods/"
-        );
+        assert!(modlist_dir.join("local-jars").join("custom-patch-1.0.jar").exists());
 
-        let snapshot = load_editor_snapshot_from_root(&root_dir, "Test Pack")
-            .expect("editor snapshot should load");
-
+        let snapshot = load_editor_snapshot_from_root(&root, "Test Pack").unwrap();
         assert_eq!(snapshot.rows.len(), 1);
-        assert_eq!(snapshot.rows[0].name, "Custom Patch");
-        assert_eq!(snapshot.rows[0].kind, "local");
+        assert_eq!(snapshot.rows[0].mod_id, "custom-patch-1.0");
+        assert_eq!(snapshot.rows[0].source, "local");
 
-        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
-    }
-
-    #[test]
-    fn copy_local_jar_uses_filename_stem_as_rule_name_when_rule_name_is_blank() {
-        let root_dir = unique_test_root();
-        let modlist_dir = root_dir.join("mod-lists").join("Stem Pack");
-        let mods_cache_dir = root_dir.join("cache").join("mods");
-        fs::create_dir_all(&modlist_dir).expect("modlist directory should exist");
-        fs::create_dir_all(&mods_cache_dir).expect("cache mods directory should exist");
-
-        ModList {
-            modlist_name: "Stem Pack".into(),
-            author: "PlayerLine".into(),
-            description: String::new(),
-            rules: vec![],
-            groups_meta: vec![],
-            presentation: None,
-        }
-        .write_to_file(&modlist_dir.join("rules.json"))
-        .expect("rules should write");
-
-        let source_dir = root_dir.join("source");
-        fs::create_dir_all(&source_dir).expect("source dir should exist");
-        let source_jar = source_dir.join("sodium-fabric-0.6.0.jar");
-        fs::write(&source_jar, b"fake jar content").expect("fake jar should write");
-
-        copy_local_jar_from_root(
-            &root_dir,
-            &CopyLocalJarInput {
-                source_path: source_jar.to_string_lossy().into_owned(),
-                rule_name: "".into(),
-                modlist_name: "Stem Pack".into(),
-            },
-        )
-        .expect("copy should succeed with blank rule name");
-
-        let snapshot = load_editor_snapshot_from_root(&root_dir, "Stem Pack")
-            .expect("editor snapshot should load");
-
-        assert_eq!(snapshot.rows.len(), 1);
-        assert_eq!(snapshot.rows[0].name, "sodium-fabric-0.6.0");
-
-        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
     fn copy_local_jar_rejects_non_jar_files() {
-        let root_dir = unique_test_root();
-        fs::create_dir_all(root_dir.join("mod-lists").join("Any Pack"))
-            .expect("modlist dir should exist");
+        let root = unique_test_root();
+        fs::create_dir_all(root.join("mod-lists").join("Any Pack")).unwrap();
 
         let result = copy_local_jar_from_root(
-            &root_dir,
+            &root,
             &CopyLocalJarInput {
                 source_path: "/tmp/not-a-jar.zip".into(),
-                rule_name: "Bad File".into(),
                 modlist_name: "Any Pack".into(),
             },
         );
 
-        assert!(result.is_err(), "non-JAR files should be rejected");
-
-        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+        assert!(result.is_err());
+        fs::remove_dir_all(&root).unwrap();
     }
 
-    #[allow(dead_code)]
-    fn _uses_rule_types() {
-        let _ = Rule {
-            rule_name: "x".into(),
-            mods: vec![ModReference {
-                id: "x".into(),
+    #[test]
+    fn copy_local_jar_rejects_duplicate_mod_id() {
+        let root = unique_test_root();
+        let modlist_dir = root.join("mod-lists").join("Test Pack");
+        fs::create_dir_all(modlist_dir.join("local-jars")).unwrap();
+
+        use crate::rules::{ModSource, Rule};
+        ModList {
+            modlist_name: "Test Pack".into(),
+            author: "Author".into(),
+            description: String::new(),
+            rules: vec![Rule {
+                mod_id: "existing-mod".into(),
                 source: ModSource::Local,
-                file_name: Some("x.jar".into()),
+                exclude_if: vec![],
+                requires: vec![],
+                version_rules: vec![],
+                custom_configs: vec![],
+                alternatives: vec![],
             }],
-            exclude_if_present: vec![],
-            alternatives: vec![],
-            links: vec![],
-            version_rules: vec![],
-            custom_configs: vec![],
-            alt_groups: vec![],
-        };
+        }
+        .write_to_file(&modlist_dir.join("rules.json"))
+        .unwrap();
+
+        let source_dir = root.join("source");
+        fs::create_dir_all(&source_dir).unwrap();
+        let source_jar = source_dir.join("existing-mod.jar");
+        fs::write(&source_jar, b"fake").unwrap();
+
+        let result = copy_local_jar_from_root(
+            &root,
+            &CopyLocalJarInput {
+                source_path: source_jar.to_string_lossy().into_owned(),
+                modlist_name: "Test Pack".into(),
+            },
+        );
+        assert!(result.is_err());
+
+        fs::remove_dir_all(&root).unwrap();
     }
 }

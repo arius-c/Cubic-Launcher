@@ -30,10 +30,10 @@ use crate::process_streaming::{
     TauriProcessEventSink, MINECRAFT_LOG_EVENT,
 };
 use crate::resolver::{
-    resolve_modlist, CompatibilityChecker, ModLoader, ResolutionResult, ResolutionTarget,
-    RuleFailureReason, RuleOutcome,
+    resolve_modlist, find_resolved_rule, ModLoader, ResolutionResult, ResolutionTarget,
+    FailureReason, RuleOutcome,
 };
-use crate::rules::{ModList, ModReference, ModSource, RULES_FILENAME};
+use crate::rules::{ModList, ModSource, RULES_FILENAME};
 use crate::token_storage::KeyringSecretStore;
 
 pub const LAUNCH_PROGRESS_EVENT: &str = "launch-progress";
@@ -111,28 +111,11 @@ struct LaunchPlaceholders {
     classpath_separator: String,
 }
 
-struct PrefetchedCompatibilityChecker<'a> {
-    compatible_modrinth_projects: &'a HashSet<String>,
-    mods_cache_dir: &'a Path,
-}
-
-impl CompatibilityChecker for PrefetchedCompatibilityChecker<'_> {
-    fn is_compatible(
-        &self,
-        mod_reference: &ModReference,
-        _target: &ResolutionTarget,
-    ) -> Result<bool> {
-        Ok(match mod_reference.source {
-            ModSource::Modrinth => self
-                .compatible_modrinth_projects
-                .contains(&mod_reference.id),
-            ModSource::Local => mod_reference
-                .file_name
-                .as_deref()
-                .map(|file_name| self.mods_cache_dir.join(file_name).exists())
-                .unwrap_or(false),
-        })
-    }
+/// A selected mod from resolution — carries mod_id + source for downstream processing.
+#[derive(Debug, Clone)]
+struct SelectedMod {
+    mod_id: String,
+    source: ModSource,
 }
 
 #[tauri::command]
@@ -211,17 +194,13 @@ async fn run_launch_pipeline(
 
     let modrinth_client = ModrinthClient::new();
     let http_client = reqwest::Client::new();
-    let compatible_versions =
-        prefetch_compatible_versions(&modlist, &target, &modrinth_client).await?;
-    let compatible_projects = compatible_versions.keys().cloned().collect::<HashSet<_>>();
-    let checker = PrefetchedCompatibilityChecker {
-        compatible_modrinth_projects: &compatible_projects,
-        mods_cache_dir: launcher_paths.mods_cache_dir(),
-    };
-    let resolution = resolve_modlist(&modlist, &target, &checker)?;
+
+    let resolution = resolve_modlist(&modlist, &target)?;
     log_resolution(&app_handle, &resolution)?;
 
-    let selected_mods = collect_selected_mod_references(&resolution);
+    let selected_mods = collect_selected_mods(&modlist, &resolution);
+    let compatible_versions =
+        prefetch_compatible_versions_for_selected(&selected_mods, &modrinth_client, &target).await?;
     let parent_versions = collect_resolved_parent_versions(&selected_mods, &compatible_versions)?;
     let dependency_resolution =
         resolve_required_dependencies_with_client(&parent_versions, &target, &modrinth_client)
@@ -511,60 +490,43 @@ fn load_modlist(launcher_paths: &LauncherPaths, modlist_name: &str) -> Result<Mo
     })
 }
 
-async fn prefetch_compatible_versions(
-    modlist: &ModList,
-    target: &ResolutionTarget,
+
+/// Fetch compatible versions only for the mods that were actually selected by resolution.
+async fn prefetch_compatible_versions_for_selected(
+    selected_mods: &[SelectedMod],
     client: &ModrinthClient,
+    target: &ResolutionTarget,
 ) -> Result<HashMap<String, ModrinthVersion>> {
     let mut versions = HashMap::new();
 
-    for project_id in collect_modrinth_project_ids(modlist) {
+    for selected in selected_mods {
+        if !matches!(selected.source, ModSource::Modrinth) {
+            continue;
+        }
+        if versions.contains_key(&selected.mod_id) {
+            continue;
+        }
         if let Some(version) = client
-            .fetch_latest_compatible_version(&project_id, target)
+            .fetch_latest_compatible_version(&selected.mod_id, target)
             .await?
         {
-            versions.insert(project_id, version);
+            versions.insert(selected.mod_id.clone(), version);
         }
     }
 
     Ok(versions)
 }
 
-fn collect_modrinth_project_ids(modlist: &ModList) -> HashSet<String> {
-    let mut ids = HashSet::new();
-
-    for rule in &modlist.rules {
-        collect_modrinth_ids_from_rule(rule, &mut ids);
-    }
-
-    ids
-}
-
-fn collect_modrinth_ids_from_rule(rule: &crate::rules::Rule, ids: &mut HashSet<String>) {
-    for mod_reference in &rule.mods {
-        if mod_reference.source == ModSource::Modrinth {
-            ids.insert(mod_reference.id.clone());
-        }
-    }
-    for alt in &rule.alternatives {
-        collect_modrinth_ids_from_rule(alt, ids);
-    }
-}
-
 fn log_resolution(app_handle: &tauri::AppHandle, resolution: &ResolutionResult) -> Result<()> {
     for rule in &resolution.resolved_rules {
         match &rule.outcome {
-            RuleOutcome::Resolved { option_index, mods } => emit_log(
+            RuleOutcome::Resolved { option_index } => emit_log(
                 app_handle,
                 ProcessLogStream::Stdout,
                 format!(
-                    "[Resolver] {} -> option {} [{}]",
-                    rule.rule_name,
+                    "[Resolver] {} -> option {}",
+                    rule.mod_id,
                     option_index + 1,
-                    mods.iter()
-                        .map(|mod_reference| mod_reference.id.clone())
-                        .collect::<Vec<_>>()
-                        .join(", ")
                 ),
             )?,
             RuleOutcome::Unresolved { reason } => emit_log(
@@ -572,8 +534,8 @@ fn log_resolution(app_handle: &tauri::AppHandle, resolution: &ResolutionResult) 
                 ProcessLogStream::Stdout,
                 format!(
                     "[Resolver] {} unresolved ({})",
-                    rule.rule_name,
-                    describe_rule_failure(*reason)
+                    rule.mod_id,
+                    describe_failure_reason(*reason)
                 ),
             )?,
         }
@@ -582,46 +544,53 @@ fn log_resolution(app_handle: &tauri::AppHandle, resolution: &ResolutionResult) 
     Ok(())
 }
 
-fn describe_rule_failure(reason: RuleFailureReason) -> &'static str {
+fn describe_failure_reason(reason: FailureReason) -> &'static str {
     match reason {
-        RuleFailureReason::NoOptionsAvailable => "no compatible option remained",
-        RuleFailureReason::ExcludedByActiveMods => "excluded by already-selected mods",
-        RuleFailureReason::IncompatibleGroup => "group compatibility check failed",
+        FailureReason::ExcludedByActiveMod => "excluded by already-selected mods",
+        FailureReason::RequiredModMissing => "required mod not active",
+        FailureReason::IncompatibleVersion => "incompatible version/loader",
+        FailureReason::NoOptionAvailable => "no compatible option remained",
     }
 }
 
-fn collect_selected_mod_references(resolution: &ResolutionResult) -> Vec<ModReference> {
-    resolution
-        .resolved_rules
-        .iter()
-        .filter_map(|rule| match &rule.outcome {
-            RuleOutcome::Resolved { mods, .. } => Some(mods.clone()),
-            RuleOutcome::Unresolved { .. } => None,
-        })
-        .flatten()
-        .collect()
+/// Collect the actually-resolved mods from the resolution, looking up Rule data in the modlist.
+fn collect_selected_mods(modlist: &ModList, resolution: &ResolutionResult) -> Vec<SelectedMod> {
+    let mut selected = Vec::new();
+
+    for (i, resolved) in resolution.resolved_rules.iter().enumerate() {
+        if let Some(top_rule) = modlist.rules.get(i) {
+            if let Some(actual_rule) = find_resolved_rule(top_rule, &resolved.outcome) {
+                selected.push(SelectedMod {
+                    mod_id: actual_rule.mod_id.clone(),
+                    source: actual_rule.source.clone(),
+                });
+            }
+        }
+    }
+
+    selected
 }
 
 fn collect_resolved_parent_versions(
-    selected_mods: &[ModReference],
+    selected_mods: &[SelectedMod],
     compatible_versions: &HashMap<String, ModrinthVersion>,
 ) -> Result<Vec<ModrinthVersion>> {
     let mut versions = Vec::new();
     let mut seen_projects = HashSet::new();
 
-    for mod_reference in selected_mods {
-        if mod_reference.source != ModSource::Modrinth
-            || !seen_projects.insert(mod_reference.id.clone())
+    for selected in selected_mods {
+        if !matches!(selected.source, ModSource::Modrinth)
+            || !seen_projects.insert(selected.mod_id.clone())
         {
             continue;
         }
 
         let version = compatible_versions
-            .get(&mod_reference.id)
+            .get(&selected.mod_id)
             .with_context(|| {
                 format!(
                     "resolved Modrinth project '{}' did not have a prefetched compatible version",
-                    mod_reference.id
+                    selected.mod_id
                 )
             })?;
         versions.push(version.clone());
@@ -820,22 +789,20 @@ fn build_instance_root(
 }
 
 fn build_cached_mod_jars(
-    selected_mods: &[ModReference],
+    selected_mods: &[SelectedMod],
     versions: &[ModrinthVersion],
     target: &ResolutionTarget,
 ) -> Result<Vec<CachedModJar>> {
     let mut jars = Vec::new();
     let mut seen = HashSet::new();
 
-    for mod_reference in selected_mods {
-        if mod_reference.source != ModSource::Local {
+    // Local mods: JAR lives at local-jars/{mod_id}.jar
+    for selected in selected_mods {
+        if !matches!(selected.source, ModSource::Local) {
             continue;
         }
 
-        let file_name = mod_reference
-            .file_name
-            .clone()
-            .with_context(|| format!("local mod '{}' is missing file_name", mod_reference.id))?;
+        let file_name = format!("{}.jar", selected.mod_id);
         if seen.insert(file_name.clone()) {
             jars.push(CachedModJar {
                 jar_filename: file_name,

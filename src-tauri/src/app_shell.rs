@@ -452,7 +452,7 @@ mod tests {
 
     use crate::database::initialize_database;
     use crate::microsoft_auth::{AccountRecord, AccountsRepository};
-    use crate::rules::{ModList, Rule};
+    use crate::rules::{ModList, ModSource, Rule};
 
     use super::{
         load_shell_snapshot_from_root, save_global_settings, save_modlist_overrides,
@@ -503,21 +503,14 @@ mod tests {
             author: "PlayerLine".into(),
             description: "Primary integrated test pack".into(),
             rules: vec![Rule {
-                rule_name: "Rendering".into(),
-                mods: vec![crate::rules::ModReference {
-                    id: "sodium".into(),
-                    source: crate::rules::ModSource::Modrinth,
-                    file_name: None,
-                }],
-                exclude_if_present: vec![],
-                alternatives: vec![],
-                links: vec![],
+                mod_id: "sodium".into(),
+                source: ModSource::Modrinth,
+                exclude_if: vec![],
+                requires: vec![],
                 version_rules: vec![],
                 custom_configs: vec![],
-                alt_groups: vec![],
+                alternatives: vec![],
             }],
-            groups_meta: vec![],
-            presentation: None,
         }
         .write_to_file(&rules_path)
         .expect("rules should write");
@@ -608,8 +601,6 @@ mod tests {
             author: "AlphaAuthor".into(),
             description: "Alpha description".into(),
             rules: Vec::new(),
-            groups_meta: vec![],
-            presentation: None,
         }
         .write_to_file(&alpha_modlist_root.join("rules.json"))
         .expect("alpha rules should write");
@@ -618,8 +609,6 @@ mod tests {
             author: "BetaAuthor".into(),
             description: "Beta description".into(),
             rules: Vec::new(),
-            groups_meta: vec![],
-            presentation: None,
         }
         .write_to_file(&beta_modlist_root.join("rules.json"))
         .expect("beta rules should write");
