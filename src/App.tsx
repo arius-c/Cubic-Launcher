@@ -28,8 +28,9 @@ import {
   launchState, selectedModList, setAppLoading, setModIcons, modIcons,
   minecraftVersions, setMinecraftVersions,
   LAUNCH_STAGES, wait,
+  versionRules, setVersionRules, customConfigs, setCustomConfigs,
 } from "./store";
-import type { AestheticGroup, FunctionalGroup, LinkRule, ModRow } from "./lib/types";
+import type { AestheticGroup, FunctionalGroup, LinkRule, ModRow, VersionRule, CustomConfig } from "./lib/types";
 
 // ── Row state helpers ─────────────────────────────────────────────────────────
 
@@ -266,7 +267,7 @@ import { DebugPanel } from "./components/DebugPanel";
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-const isTauri = () => false;
+const isTauri = () => typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 
 // ── Per-modlist version/loader cache (prevents bleed when switching modlists) ──
 const modlistVersionLoaderCache = new Map<string, { version: string; loader: string }>();
@@ -275,14 +276,9 @@ const modlistVersionLoaderCache = new Map<string, { version: string; loader: str
 
 async function loadShellSnapshot(preferredName?: string | null) {
   try {
-    logger.debug("App", "invoke stubbed: load_shell_snapshot_command"); // [STUB]
-    const snap: any = {
-      modlists: [], active_account: null,
-      global_settings: { min_ram_mb: 2048, max_ram_mb: 4096,
-        custom_jvm_args: "", profiler_enabled: false,
-        wrapper_command: "", java_path_override: "" },
-      selected_modlist_overrides: {},
-    };
+    const snap: any = await invoke("load_shell_snapshot_command", {
+      selectedModlistName: preferredName ?? null,
+    });
 
     // Always update mod list cards — preserve any cached icon data already loaded
     const existing = modListCards();
@@ -371,15 +367,40 @@ async function loadShellSnapshot(preferredName?: string | null) {
   }
 }
 
+function mapEditorRow(row: any, ruleIndex: number, path: string): ModRow {
+  const nameId = normalizeIdentifier(row.name);
+  const id = `rule-${ruleIndex}${path}-${nameId}`;
+  const alternatives = (row.alternatives ?? []).map((alt: any, altIdx: number) =>
+    mapEditorRow(alt, ruleIndex, `${path}-alternative-${altIdx + 1}`)
+  );
+  return {
+    id,
+    name: row.name as string,
+    modrinth_id: row.source === "modrinth" ? (row.modId as string) : undefined,
+    primaryModId: row.modId as string,
+    kind: row.source as "modrinth" | "local",
+    area: "Rule",
+    note: alternatives.length > 0 ? `Primary option with ${alternatives.length + 1} mods.` : "Primary option with 1 mod.",
+    tags: [],
+    alternatives,
+    links: (row.requires ?? []) as string[],
+    altGroups: [],
+  };
+}
+
+function mapEditorRowsToModRows(rows: any[]): ModRow[] {
+  return rows.map((row: any, index: number) => mapEditorRow(row, index, ""));
+}
+
 async function loadEditorSnapshot(modlistName: string, resetGroups = false) {
   if (!modlistName) return null;
   try {
-    logger.debug("App", "invoke stubbed: load_modlist_editor_command"); // [STUB]
-    const snap: any = { modlist_name: "", rows: [], incompatibilities: [], groups: [] };
+    const snap: any = await invoke("load_modlist_editor_command", { selectedModlistName: modlistName });
+    const mappedRows: ModRow[] = mapEditorRowsToModRows(snap.rows ?? []);
 
     // Smart merge: preserve unchanged row references so SolidJS <For> doesn't
     // destroy and recreate every component on every reload.
-    setModRowsState(cur => smartSetModRows(cur, snap.rows ?? []));
+    setModRowsState(cur => smartSetModRows(cur, mappedRows));
 
     // Load top-level aesthetic groups (structural containers) from rules.json.
     const snapGroups: AestheticGroup[] = (snap.groups ?? []).map((g: any) => ({
@@ -408,7 +429,7 @@ async function loadEditorSnapshot(modlistName: string, resetGroups = false) {
         if (row.alternatives?.length) extractAltGroups(row.alternatives);
       }
     };
-    extractAltGroups(snap.rows ?? []);
+    extractAltGroups(mappedRows);
 
     setAestheticGroups([...snapGroups, ...altScopedGroups]);
 
@@ -421,7 +442,7 @@ async function loadEditorSnapshot(modlistName: string, resetGroups = false) {
         if (row.alternatives?.length) collectPrimaryMods(row.alternatives);
       }
     };
-    collectPrimaryMods(snap.rows ?? []);
+    collectPrimaryMods(mappedRows);
 
     const restoredLinks: LinkRule[] = [];
     const collectLinks = (rows: any[]) => {
@@ -433,15 +454,35 @@ async function loadEditorSnapshot(modlistName: string, resetGroups = false) {
         if (row.alternatives?.length) collectLinks(row.alternatives);
       }
     };
-    collectLinks(snap.rows ?? []);
+    collectLinks(mappedRows);
     setSavedLinks(restoredLinks);
 
     // Wipe functional groups when switching to a different list; they're loaded by loadModlistGroups.
     if (resetGroups) {
       setFunctionalGroups([]);
     }
-    const incompat: Array<{ winner_id: string; loser_id: string }> = snap.incompatibilities ?? [];
-    setSavedIncompatibilities(incompat.map(r => ({ winnerId: r.winner_id, loserId: r.loser_id })));
+    const incompat: Array<{ winnerId: string; loserId: string }> = snap.incompatibilities ?? [];
+    setSavedIncompatibilities(incompat.map(r => ({ winnerId: r.winnerId, loserId: r.loserId })));
+
+    // Extract versionRules and customConfigs from the flat backend rows.
+    const extractedVR: VersionRule[] = [];
+    const extractedCC: CustomConfig[] = [];
+    const collectAdvanced = (rows: any[]) => {
+      for (const row of rows) {
+        const modId = row.modId as string;
+        for (const [i, vr] of (row.versionRules ?? []).entries()) {
+          extractedVR.push({ id: `vr-${modId}-${i}`, modId, kind: vr.kind as 'exclude' | 'only', mcVersions: vr.mcVersions ?? [], loader: vr.loader ?? 'any' });
+        }
+        for (const [i, cc] of (row.customConfigs ?? []).entries()) {
+          extractedCC.push({ id: `cc-${modId}-${i}`, modId, mcVersions: cc.mcVersions ?? [], loader: cc.loader ?? 'any', targetPath: cc.targetPath ?? '', files: cc.files ?? [] });
+        }
+        if (row.alternatives?.length) collectAdvanced(row.alternatives);
+      }
+    };
+    collectAdvanced(snap.rows ?? []);
+    setVersionRules(extractedVR);
+    setCustomConfigs(extractedCC);
+
     return snap;
   } catch (err) {
     logger.error("App", "loadEditorSnapshot failed", err);
@@ -665,6 +706,45 @@ export default function App() {
     });
   });
 
+  // Save versionRules and customConfigs to the backend when they change.
+  const [advancedReady, setAdvancedReady] = createSignal(false);
+  const [lastSavedAdvanced, setLastSavedAdvanced] = createSignal("");
+
+  createEffect(() => {
+    const modlistName = selectedModListName();
+    const ready = advancedReady();
+    const vr = versionRules();
+    const cc = customConfigs();
+    const serialized = JSON.stringify({ vr, cc });
+
+    if (!ready || !modlistName || !isTauri() || serialized === lastSavedAdvanced()) return;
+
+    setLastSavedAdvanced(serialized);
+
+    // Collect unique modIds across both signals.
+    const modIds = new Set<string>();
+    for (const r of vr) modIds.add(r.modId);
+    for (const c of cc) modIds.add(c.modId);
+
+    for (const modId of modIds) {
+      const modVR = vr.filter(r => r.modId === modId);
+      const modCC = cc.filter(c => c.modId === modId);
+      void invoke("save_rule_advanced_command", {
+        input: {
+          modlistName,
+          modId,
+          excludeIf: [],
+          requires: [],
+          versionRules: modVR.map(r => ({ kind: r.kind, mcVersions: r.mcVersions, loader: r.loader })),
+          customConfigs: modCC.map(c => ({ mcVersions: c.mcVersions, loader: c.loader, targetPath: c.targetPath, files: c.files })),
+        },
+      }).catch(err => {
+        setLastSavedAdvanced("");
+        pushUiError({ title: "Could not save advanced rule config", message: `Failed to persist config for '${modId}'.`, detail: String(err), severity: "error", scope: "launch" });
+      });
+    }
+  });
+
   // ── Startup ────────────────────────────────────────────────────────────────
   onMount(() => {
     let disposed = false;
@@ -697,6 +777,8 @@ export default function App() {
         setIncompatReady(true);
         setLastSavedLinks(serializeLinks(savedLinks()));
         setLinksReady(true);
+        setLastSavedAdvanced(JSON.stringify({ vr: versionRules(), cc: customConfigs() }));
+        setAdvancedReady(true);
         logger.debug("App", "boot completed", { firstList, rowCount: editorSnapshot?.rows?.length ?? modRowsState().length });
         void fetchModIcons(modRowsState());
       } else {
@@ -720,6 +802,7 @@ export default function App() {
     setGroupLayoutReady(false);
     setIncompatReady(false);
     setLinksReady(false);
+    setAdvancedReady(false);
     // Immediately show cached presentation data so there's no flicker
     const cached = modListCards().find(c => c.name === name);
     if (cached?.iconLabel !== undefined) {
@@ -745,6 +828,8 @@ export default function App() {
     setIncompatReady(true);
     setLastSavedLinks(serializeLinks(savedLinks()));
     setLinksReady(true);
+    setLastSavedAdvanced(JSON.stringify({ vr: versionRules(), cc: customConfigs() }));
+    setAdvancedReady(true);
     void fetchModIcons(modRowsState());
   };
 
@@ -753,7 +838,7 @@ export default function App() {
     if (!isTauri() || !selectedModListName()) { logger.warn("App", "handleReorderRules skipped — no backend"); return; }
     try {
       await invoke("reorder_rules_command", {
-        input: { modlistName: selectedModListName(), orderedRowIds: orderedIds },
+        input: { modlistName: selectedModListName(), orderedModIds: orderedIds.map(id => rowMap().get(id)?.primaryModId ?? id) },
       });
       const currentRows = modRowsState();
       const rebuiltRows = rebuildRowIds(currentRows);
@@ -967,6 +1052,8 @@ export default function App() {
       setIncompatReady(true);
       setLastSavedLinks(serializeLinks(savedLinks()));
       setLinksReady(true);
+      setLastSavedAdvanced(JSON.stringify({ vr: versionRules(), cc: customConfigs() }));
+      setAdvancedReady(true);
       logger.debug("App", "handleCreateModlist completed", { name });
     } catch (err) {
       logger.error("App", "handleCreateModlist failed", err);
@@ -1003,7 +1090,7 @@ export default function App() {
     if (!isTauri()) { logger.warn("App", "handleAddModrinth skipped — no backend"); return; }
     try {
       await invoke("add_mod_rule_command", {
-        input: { modlistName: selectedModListName(), ruleName: displayName, modId, modSource: "modrinth", fileName: null },
+        input: { modlistName: selectedModListName(), modId, source: "modrinth", fileName: null },
       });
       // Smart-merge: only the new row changes (or its ID gets corrected); existing rows keep references.
       await loadEditorSnapshot(selectedModListName());
@@ -1062,7 +1149,7 @@ export default function App() {
     setSelectedIds([]);
     if (!isTauri() || !selectedModListName()) { logger.warn("App", "handleDeleteSelected skipped — no backend"); return; }
     try {
-      await invoke("delete_rules_command", { input: { modlistName: selectedModListName(), rowIds: ids } });
+      await invoke("delete_rules_command", { input: { modlistName: selectedModListName(), modIds: ids.map(id => rowMap().get(id)?.primaryModId ?? id) } });
       const currentRows = modRowsState();
       const rebuiltRows = rebuildRowIds(currentRows);
       const idRemap = buildIdRemap(currentRows, rebuiltRows);
@@ -1265,6 +1352,8 @@ export default function App() {
         setIncompatReady(true);
         setLastSavedLinks(serializeLinks(savedLinks()));
         setLinksReady(true);
+        setLastSavedAdvanced(JSON.stringify({ vr: versionRules(), cc: customConfigs() }));
+        setAdvancedReady(true);
       } else {
         setSelectedModListName("");
         setInstancePresentation({ iconLabel: "ML", iconAccent: "", notes: "", iconImage: "" });
