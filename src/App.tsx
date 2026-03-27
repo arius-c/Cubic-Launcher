@@ -649,26 +649,6 @@ export default function App() {
     });
   });
 
-  // Save aesthetic group structure (structural containers) to rules.json.
-  createEffect(() => {
-    const modlistName = selectedModListName();
-    const ready = groupLayoutReady();
-    const serialized = serializeRuleGroups(aestheticGroups());
-
-    if (!ready || !modlistName || !isTauri() || serialized === lastSavedRuleMetaGroups()) return;
-
-    setLastSavedRuleMetaGroups(serialized);
-    void invoke("save_rule_groups_command", {
-      input: {
-        modlistName,
-        groups: aestheticGroups().map(g => ({ id: g.id, name: g.name, collapsed: g.collapsed, rowIds: g.blockIds, scopeRowId: g.scopeRowId ?? null })),
-      },
-    }).catch(err => {
-      setLastSavedRuleMetaGroups("");
-      pushUiError({ title: "Could not save rule groups", message: "The structural rule groups could not be persisted.", detail: String(err), severity: "error", scope: "launch" });
-    });
-  });
-
   createEffect(() => {
     const modlistName = selectedModListName();
     const ready = incompatReady();
@@ -677,7 +657,10 @@ export default function App() {
     if (!ready || !modlistName || !isTauri() || serialized === lastSavedIncompat()) return;
 
     setLastSavedIncompat(serialized);
-    const rules = savedIncompatibilities().map(r => ({ winnerId: r.winnerId, loserId: r.loserId }));
+    const rules = savedIncompatibilities().map(r => ({
+      winnerId: rowMap().get(r.winnerId)?.primaryModId ?? r.winnerId,
+      loserId: rowMap().get(r.loserId)?.primaryModId ?? r.loserId,
+    }));
     void invoke("save_incompatibilities_command", {
       input: { modlistName, rules },
     }).catch(err => {
@@ -686,47 +669,44 @@ export default function App() {
     });
   });
 
-  // Save mod links to rules.json whenever savedLinks changes.
-  createEffect(() => {
-    const modlistName = selectedModListName();
-    const ready = linksReady();
-    const serialized = serializeLinks(savedLinks());
-
-    if (!ready || !modlistName || !isTauri() || serialized === lastSavedLinks()) return;
-
-    setLastSavedLinks(serialized);
-    void invoke("save_rule_links_command", {
-      input: {
-        modlistName,
-        links: savedLinks().map(l => ({ fromId: l.fromId, toId: l.toId })),
-      },
-    }).catch(err => {
-      setLastSavedLinks("");
-      pushUiError({ title: "Could not save links", message: "The mod links could not be persisted.", detail: String(err), severity: "error", scope: "launch" });
-    });
-  });
-
-  // Save versionRules and customConfigs to the backend when they change.
+  // Combined effect: save links + versionRules + customConfigs via save_rule_advanced_command.
+  // Merged into one effect so they don't overwrite each other's data.
   const [advancedReady, setAdvancedReady] = createSignal(false);
   const [lastSavedAdvanced, setLastSavedAdvanced] = createSignal("");
 
   createEffect(() => {
     const modlistName = selectedModListName();
-    const ready = advancedReady();
+    const readyLinks = linksReady();
+    const readyAdv = advancedReady();
+    const links = savedLinks();
     const vr = versionRules();
     const cc = customConfigs();
-    const serialized = JSON.stringify({ vr, cc });
+    const serialized = JSON.stringify({ links: serializeLinks(links), vr, cc });
 
-    if (!ready || !modlistName || !isTauri() || serialized === lastSavedAdvanced()) return;
+    if (!readyLinks || !readyAdv || !modlistName || !isTauri() || serialized === lastSavedAdvanced()) return;
 
     setLastSavedAdvanced(serialized);
+    // Also keep lastSavedLinks in sync so the linksReady gate works correctly on modlist switch.
+    setLastSavedLinks(serializeLinks(links));
 
-    // Collect unique modIds across both signals.
+    // Build requires map from links (fromId → [toId, ...]).
+    const requiresByModId = new Map<string, string[]>();
+    for (const l of links) {
+      const fromModId = rowMap().get(l.fromId)?.primaryModId ?? l.fromId;
+      const toModId = rowMap().get(l.toId)?.primaryModId ?? l.toId;
+      const arr = requiresByModId.get(fromModId) ?? [];
+      arr.push(toModId);
+      requiresByModId.set(fromModId, arr);
+    }
+
+    // Collect all modIds that have any data to save.
     const modIds = new Set<string>();
+    for (const [id] of requiresByModId) modIds.add(id);
     for (const r of vr) modIds.add(r.modId);
     for (const c of cc) modIds.add(c.modId);
 
     for (const modId of modIds) {
+      const requires = requiresByModId.get(modId) ?? [];
       const modVR = vr.filter(r => r.modId === modId);
       const modCC = cc.filter(c => c.modId === modId);
       void invoke("save_rule_advanced_command", {
@@ -734,13 +714,13 @@ export default function App() {
           modlistName,
           modId,
           excludeIf: [],
-          requires: [],
+          requires,
           versionRules: modVR.map(r => ({ kind: r.kind, mcVersions: r.mcVersions, loader: r.loader })),
           customConfigs: modCC.map(c => ({ mcVersions: c.mcVersions, loader: c.loader, targetPath: c.targetPath, files: c.files })),
         },
       }).catch(err => {
         setLastSavedAdvanced("");
-        pushUiError({ title: "Could not save advanced rule config", message: `Failed to persist config for '${modId}'.`, detail: String(err), severity: "error", scope: "launch" });
+        pushUiError({ title: "Could not save rule config", message: `Failed to persist config for '${modId}'.`, detail: String(err), severity: "error", scope: "launch" });
       });
     }
   });
@@ -769,7 +749,7 @@ export default function App() {
       if (firstList) {
         const editorSnapshot = await loadEditorSnapshot(firstList);
         await loadModlistPresentation(firstList);
-        await loadModlistGroups(firstList, editorSnapshot?.rows ?? modRowsState());
+        await loadModlistGroups(firstList, modRowsState());
         setLastSavedGroupLayout(serializeGroupsLayout(functionalGroups()));
         setLastSavedRuleMetaGroups(serializeRuleGroups(aestheticGroups()));
         setGroupLayoutReady(true);
@@ -820,7 +800,7 @@ export default function App() {
     await loadShellSnapshot(name);
     const editorSnapshot = await loadEditorSnapshot(name, true);
     await loadModlistPresentation(name);
-    await loadModlistGroups(name, editorSnapshot?.rows ?? modRowsState());
+    await loadModlistGroups(name, modRowsState());
     setLastSavedGroupLayout(serializeGroupsLayout(functionalGroups()));
     setLastSavedRuleMetaGroups(serializeRuleGroups(aestheticGroups()));
     setGroupLayoutReady(true);
@@ -878,7 +858,7 @@ export default function App() {
     if (!isTauri()) { logger.warn("App", "handleSaveAlternativeOrder skipped — no backend"); return; }
     try {
       await invoke("save_alternative_order_command", {
-        input: { modlistName: selectedModListName(), parentRowId: parentId, orderedAlternativeIds: orderedAltIds },
+        input: { modlistName: selectedModListName(), parentModId: rowMap().get(parentId)?.primaryModId ?? parentId, orderedAltIds: orderedAltIds.map(id => rowMap().get(id)?.primaryModId ?? id) },
       });
       appendDebugTrace("alts.reorder.frontend", { parentId, status: "saved" });
     } catch (err) {
@@ -923,20 +903,22 @@ export default function App() {
       isNested,
       parentNamePath,
     });
-    const altIsNested = altRowId.includes("-alternative-");
+    const altModId = rowMap().get(altRowId)?.primaryModId ?? altRowId;
+    const parentModId = rowMap().get(parentId)?.primaryModId ?? parentId;
+    const altSource = rowMap().get(altRowId)?.kind ?? "modrinth";
     try {
-      if (altIsNested) {
-        // Source is an alternative of another rule — move it to the target parent.
-        await invoke("move_alt_to_alternative_command", {
-          input: { modlistName: selectedModListName(), sourceRowId: altRowId, targetParentRowId: parentId },
-        });
-      } else if (isNested) {
+      // Remove the mod from its current position first (top-level or nested),
+      // then add it as an alternative. The backend rejects duplicates.
+      await invoke("delete_rules_command", {
+        input: { modlistName: selectedModListName(), modIds: [altModId] },
+      });
+      if (isNested) {
         await invoke("add_nested_alternative_command", {
-          input: { modlistName: selectedModListName(), parentAltRowId: parentId, alternativeRowId: altRowId },
+          input: { modlistName: selectedModListName(), parentModId, modId: altModId, source: altSource },
         });
       } else {
         await invoke("add_alternative_command", {
-          input: { modlistName: selectedModListName(), parentRowId: parentId, alternativeRowId: altRowId },
+          input: { modlistName: selectedModListName(), parentModId, modId: altModId, source: altSource },
         });
       }
       await loadEditorSnapshot(selectedModListName());
@@ -983,8 +965,18 @@ export default function App() {
       activePanelPath,
     });
     try {
+      const altModId = rowMap().get(altRowId)?.primaryModId ?? altRowId;
+      const findParent = (rows: ModRow[]): ModRow | undefined => {
+        for (const r of rows) {
+          if (r.alternatives?.some(a => a.id === altRowId)) return r;
+          if (r.alternatives?.length) { const found = findParent(r.alternatives); if (found) return found; }
+        }
+        return undefined;
+      };
+      const parentRow = findParent(modRowsState());
+      const parentModId = parentRow?.primaryModId ?? "";
       await invoke("remove_alternative_command", {
-        input: { modlistName: selectedModListName(), alternativeRowId: altRowId },
+        input: { modlistName: selectedModListName(), parentModId, altModId },
       });
       await loadEditorSnapshot(selectedModListName());
       if (activePanelPath) {
@@ -1044,7 +1036,7 @@ export default function App() {
       await loadShellSnapshot(name);
       const editorSnapshot = await loadEditorSnapshot(name);
       await loadModlistPresentation(name);
-      await loadModlistGroups(name, editorSnapshot?.rows ?? modRowsState());
+      await loadModlistGroups(name, modRowsState());
       setLastSavedGroupLayout(serializeGroupsLayout(functionalGroups()));
       setLastSavedRuleMetaGroups(serializeRuleGroups(aestheticGroups()));
       setGroupLayoutReady(true);
@@ -1187,7 +1179,7 @@ export default function App() {
     setRenameRuleModalOpen(false);
     if (!isTauri() || !selectedModListName()) { logger.warn("App", "handleRenameRule skipped — no backend"); return; }
     try {
-      await invoke("rename_rule_command", { input: { modlistName: selectedModListName(), rowId: id, newName: name } });
+      await invoke("rename_rule_command", { input: { modlistName: selectedModListName(), modId: rowMap().get(id)?.primaryModId ?? id, newModId: name } });
       // Optimistic update already applied — no reload needed.
       logger.debug("App", "handleRenameRule completed");
     } catch (err) {
@@ -1263,9 +1255,15 @@ export default function App() {
   };
 
   const handleSaveIncompatibilities = async () => {
+    // Keep synthetic IDs for the frontend signals (UI uses them)
     const rules = draftIncompatibilities().map(rule => ({
       winnerId: rule.winnerId,
       loserId: rule.loserId,
+    }));
+    // Map to real mod IDs for the backend
+    const backendRules = rules.map(rule => ({
+      winnerId: rowMap().get(rule.winnerId)?.primaryModId ?? rule.winnerId,
+      loserId: rowMap().get(rule.loserId)?.primaryModId ?? rule.loserId,
     }));
 
     if (!isTauri() || !selectedModListName()) {
@@ -1279,7 +1277,7 @@ export default function App() {
       await invoke("save_incompatibilities_command", {
         input: {
           modlistName: selectedModListName(),
-          rules,
+          rules: backendRules,
         },
       });
       setSavedIncompatibilities(rules.map(rule => ({ ...rule })));
@@ -1344,7 +1342,7 @@ export default function App() {
         setSelectedModListName(next);
         const editorSnapshot = await loadEditorSnapshot(next, true);
         await loadModlistPresentation(next);
-        await loadModlistGroups(next, editorSnapshot?.rows ?? modRowsState());
+        await loadModlistGroups(next, modRowsState());
         setLastSavedGroupLayout(serializeGroupsLayout(functionalGroups()));
         setLastSavedRuleMetaGroups(serializeRuleGroups(aestheticGroups()));
         setGroupLayoutReady(true);
