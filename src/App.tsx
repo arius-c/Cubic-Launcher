@@ -576,6 +576,16 @@ async function loadModlistGroups(modlistName: string, rows: ModRow[]) {
     }));
     setFunctionalGroups(nextFunctionalGroups.filter((g: FunctionalGroup) => g.modIds.length > 0));
 
+    // Read aesthetic groups from the layout file.
+    const persistedAesthetic: any[] = layout.aestheticGroups ?? [];
+    setAestheticGroups(persistedAesthetic.map((g: any) => ({
+      id: g.id as string,
+      name: g.name as string,
+      collapsed: g.collapsed as boolean,
+      blockIds: (g.blockIds ?? []).filter((id: string) => availableIds.has(id)),
+      scopeRowId: (g.scopeRowId as string | null) ?? null,
+    })));
+
     return layout;
   } catch (err) {
     setFunctionalGroups([]);
@@ -644,19 +654,38 @@ export default function App() {
 
     if (!ready || !modlistName || !isTauri() || serialized === lastSavedGroupLayout()) return;
 
-    logger.debug("App", "group save effect firing", { modlistName, groupCount: groups.length, serialized });
     setLastSavedGroupLayout(serialized);
     void invoke("save_modlist_groups_command", {
       input: {
         modlistName,
         tags: groups.map(g => ({ id: g.id, name: g.name, tone: g.tone, modIds: g.modIds })),
+        aestheticGroups: aestheticGroups().map(g => ({ id: g.id, name: g.name, collapsed: g.collapsed, blockIds: g.blockIds, scopeRowId: g.scopeRowId ?? null })),
       },
-    }).then(() => {
-      logger.debug("App", "group save succeeded");
     }).catch(err => {
-      logger.error("App", "group save failed", err);
       setLastSavedGroupLayout("");
       pushUiError({ title: "Could not save groups", message: "The mod-list group layout could not be persisted.", detail: String(err), severity: "error", scope: "launch" });
+    });
+  });
+
+  // Save aesthetic group changes to the same modlist-editor-groups.json file.
+  createEffect(() => {
+    const modlistName = selectedModListName();
+    const ready = groupLayoutReady();
+    const aGroups = aestheticGroups();
+    const serialized = serializeRuleGroups(aGroups);
+
+    if (!ready || !modlistName || !isTauri() || serialized === lastSavedRuleMetaGroups()) return;
+
+    setLastSavedRuleMetaGroups(serialized);
+    void invoke("save_modlist_groups_command", {
+      input: {
+        modlistName,
+        tags: functionalGroups().map(g => ({ id: g.id, name: g.name, tone: g.tone, modIds: g.modIds })),
+        aestheticGroups: aGroups.map(g => ({ id: g.id, name: g.name, collapsed: g.collapsed, blockIds: g.blockIds, scopeRowId: g.scopeRowId ?? null })),
+      },
+    }).catch(err => {
+      setLastSavedRuleMetaGroups("");
+      pushUiError({ title: "Could not save groups", message: "The aesthetic group layout could not be persisted.", detail: String(err), severity: "error", scope: "launch" });
     });
   });
 

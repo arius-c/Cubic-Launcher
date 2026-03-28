@@ -28,12 +28,28 @@ pub struct PersistedTag {
     pub mod_ids: Vec<String>,
 }
 
+/// Aesthetic group (visual section container) stored in `modlist-editor-groups.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistedAestheticGroup {
+    pub id: String,
+    pub name: String,
+    pub collapsed: bool,
+    #[serde(default)]
+    pub block_ids: Vec<String>,
+    #[serde(default)]
+    pub scope_row_id: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModlistGroupLayout {
     /// Tag definitions (formerly `functionalGroups`).
     #[serde(default, alias = "functionalGroups")]
     pub tags: Vec<PersistedTag>,
+    /// Aesthetic groups (visual section containers).
+    #[serde(default)]
+    pub aesthetic_groups: Vec<PersistedAestheticGroup>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -66,6 +82,9 @@ pub struct SaveModlistGroupsInput {
     /// Tag definitions (formerly `functionalGroups`).
     #[serde(default, alias = "functionalGroups")]
     pub tags: Vec<PersistedTag>,
+    /// Aesthetic groups (visual section containers).
+    #[serde(default)]
+    pub aesthetic_groups: Vec<PersistedAestheticGroup>,
 }
 
 #[tauri::command]
@@ -218,6 +237,7 @@ pub fn save_modlist_groups_from_root(
 ) -> Result<()> {
     let layout = ModlistGroupLayout {
         tags: input.tags.clone(),
+        aesthetic_groups: input.aesthetic_groups.clone(),
     };
     let layout_path = modlist_group_layout_path(root_dir, &input.modlist_name);
 
@@ -392,6 +412,7 @@ fn default_presentation(modlist_name: &str) -> ModlistPresentation {
 fn default_group_layout() -> ModlistGroupLayout {
     ModlistGroupLayout {
         tags: Vec::new(),
+        aesthetic_groups: Vec::new(),
     }
 }
 
