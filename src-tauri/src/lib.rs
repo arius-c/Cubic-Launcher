@@ -68,6 +68,7 @@ pub fn run() {
             editor_data::remove_alternative_command,
             editor_data::save_incompatibilities_command,
             editor_data::save_rule_advanced_command,
+            editor_data::save_advanced_batch_command,
             modlist_manager::create_modlist_command,
             modlist_manager::delete_modlist_command,
             modlist_manager::copy_local_jar_command,

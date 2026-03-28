@@ -148,6 +148,36 @@ pub struct SaveRuleAdvancedInput {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SaveAdvancedBatchInput {
+    pub modlist_name: String,
+    pub requires_entries: Vec<RequiresEntry>,
+    pub version_rules_entries: Vec<VersionRulesEntry>,
+    pub custom_configs_entries: Vec<CustomConfigsEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequiresEntry {
+    pub mod_id: String,
+    pub requires: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VersionRulesEntry {
+    pub mod_id: String,
+    pub version_rules: Vec<SaveVersionRuleInput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomConfigsEntry {
+    pub mod_id: String,
+    pub custom_configs: Vec<SaveCustomConfigInput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SaveVersionRuleInput {
     pub kind: String,
     pub mc_versions: Vec<String>,
@@ -255,6 +285,14 @@ pub fn save_rule_advanced_command(
     input: SaveRuleAdvancedInput,
 ) -> Result<(), String> {
     save_rule_advanced_from_root(launcher_paths.root_dir(), &input).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn save_advanced_batch_command(
+    launcher_paths: State<'_, LauncherPaths>,
+    input: SaveAdvancedBatchInput,
+) -> Result<(), String> {
+    save_advanced_batch_from_root(launcher_paths.root_dir(), &input).map_err(|e| e.to_string())
 }
 
 // ── Worker functions ─────────────────────────────────────────────────────────
@@ -591,7 +629,7 @@ pub fn save_rule_advanced_from_root(root_dir: &Path, input: &SaveRuleAdvancedInp
         .find_rule_mut(&input.mod_id)
         .with_context(|| format!("rule '{}' not found", input.mod_id))?;
 
-    rule.exclude_if = input.exclude_if.clone();
+    // Note: exclude_if is NOT set here — it is managed exclusively by save_incompatibilities_command.
     rule.requires = input.requires.clone();
     rule.version_rules = input
         .version_rules
@@ -615,6 +653,69 @@ pub fn save_rule_advanced_from_root(root_dir: &Path, input: &SaveRuleAdvancedInp
             files: cc.files.clone(),
         })
         .collect();
+
+    save_modlist(root_dir, &input.modlist_name, &modlist)
+}
+
+pub fn save_advanced_batch_from_root(
+    root_dir: &Path,
+    input: &SaveAdvancedBatchInput,
+) -> Result<()> {
+    let mut modlist = load_modlist(root_dir, &input.modlist_name)?;
+
+    // Clear all requires, version_rules, and custom_configs across the entire tree.
+    fn clear_advanced(rule: &mut Rule) {
+        rule.requires.clear();
+        rule.version_rules.clear();
+        rule.custom_configs.clear();
+        for alt in &mut rule.alternatives {
+            clear_advanced(alt);
+        }
+    }
+    for rule in &mut modlist.rules {
+        clear_advanced(rule);
+    }
+
+    // Set new requires
+    for entry in &input.requires_entries {
+        if let Some(rule) = modlist.find_rule_mut(&entry.mod_id) {
+            rule.requires = entry.requires.clone();
+        }
+    }
+
+    // Set new version rules
+    for entry in &input.version_rules_entries {
+        if let Some(rule) = modlist.find_rule_mut(&entry.mod_id) {
+            rule.version_rules = entry
+                .version_rules
+                .iter()
+                .map(|vr| VersionRule {
+                    kind: match vr.kind.as_str() {
+                        "only" => VersionRuleKind::Only,
+                        _ => VersionRuleKind::Exclude,
+                    },
+                    mc_versions: vr.mc_versions.clone(),
+                    loader: vr.loader.clone(),
+                })
+                .collect();
+        }
+    }
+
+    // Set new custom configs
+    for entry in &input.custom_configs_entries {
+        if let Some(rule) = modlist.find_rule_mut(&entry.mod_id) {
+            rule.custom_configs = entry
+                .custom_configs
+                .iter()
+                .map(|cc| CustomConfig {
+                    mc_versions: cc.mc_versions.clone(),
+                    loader: cc.loader.clone(),
+                    target_path: cc.target_path.clone(),
+                    files: cc.files.clone(),
+                })
+                .collect();
+        }
+    }
 
     save_modlist(root_dir, &input.modlist_name, &modlist)
 }

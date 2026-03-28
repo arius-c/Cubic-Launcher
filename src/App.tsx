@@ -461,20 +461,26 @@ async function loadEditorSnapshot(modlistName: string, resetGroups = false) {
     if (resetGroups) {
       setFunctionalGroups([]);
     }
+    // Convert mod IDs → row IDs so the UI can match them against rowMap entries.
     const incompat: Array<{ winnerId: string; loserId: string }> = snap.incompatibilities ?? [];
-    setSavedIncompatibilities(incompat.map(r => ({ winnerId: r.winnerId, loserId: r.loserId })));
+    setSavedIncompatibilities(incompat.map(r => ({
+      winnerId: primaryModToRowId.get(r.winnerId) ?? r.winnerId,
+      loserId: primaryModToRowId.get(r.loserId) ?? r.loserId,
+    })));
 
     // Extract versionRules and customConfigs from the flat backend rows.
+    // Use row IDs (not mod IDs) so they match the IDs used by the AdvancedModPanel.
     const extractedVR: VersionRule[] = [];
     const extractedCC: CustomConfig[] = [];
     const collectAdvanced = (rows: any[]) => {
       for (const row of rows) {
-        const modId = row.modId as string;
+        const backendModId = row.modId as string;
+        const rowId = primaryModToRowId.get(backendModId) ?? backendModId;
         for (const [i, vr] of (row.versionRules ?? []).entries()) {
-          extractedVR.push({ id: `vr-${modId}-${i}`, modId, kind: vr.kind as 'exclude' | 'only', mcVersions: vr.mcVersions ?? [], loader: vr.loader ?? 'any' });
+          extractedVR.push({ id: `vr-${backendModId}-${i}`, modId: rowId, kind: vr.kind as 'exclude' | 'only', mcVersions: vr.mcVersions ?? [], loader: vr.loader ?? 'any' });
         }
         for (const [i, cc] of (row.customConfigs ?? []).entries()) {
-          extractedCC.push({ id: `cc-${modId}-${i}`, modId, mcVersions: cc.mcVersions ?? [], loader: cc.loader ?? 'any', targetPath: cc.targetPath ?? '', files: cc.files ?? [] });
+          extractedCC.push({ id: `cc-${backendModId}-${i}`, modId: rowId, mcVersions: cc.mcVersions ?? [], loader: cc.loader ?? 'any', targetPath: cc.targetPath ?? '', files: cc.files ?? [] });
         }
         if (row.alternatives?.length) collectAdvanced(row.alternatives);
       }
@@ -633,17 +639,22 @@ export default function App() {
   createEffect(() => {
     const modlistName = selectedModListName();
     const ready = groupLayoutReady();
-    const serialized = serializeGroupsLayout(functionalGroups());
+    const groups = functionalGroups();
+    const serialized = serializeGroupsLayout(groups);
 
     if (!ready || !modlistName || !isTauri() || serialized === lastSavedGroupLayout()) return;
 
+    logger.debug("App", "group save effect firing", { modlistName, groupCount: groups.length, serialized });
     setLastSavedGroupLayout(serialized);
     void invoke("save_modlist_groups_command", {
       input: {
         modlistName,
-        tags: functionalGroups().map(g => ({ id: g.id, name: g.name, tone: g.tone, modIds: g.modIds })),
+        tags: groups.map(g => ({ id: g.id, name: g.name, tone: g.tone, modIds: g.modIds })),
       },
+    }).then(() => {
+      logger.debug("App", "group save succeeded");
     }).catch(err => {
+      logger.error("App", "group save failed", err);
       setLastSavedGroupLayout("");
       pushUiError({ title: "Could not save groups", message: "The mod-list group layout could not be persisted.", detail: String(err), severity: "error", scope: "launch" });
     });
@@ -669,8 +680,8 @@ export default function App() {
     });
   });
 
-  // Combined effect: save links + versionRules + customConfigs via save_rule_advanced_command.
-  // Merged into one effect so they don't overwrite each other's data.
+  // Combined effect: save links + versionRules + customConfigs via save_advanced_batch_command.
+  // Uses a single batch command that clears all requires/vr/cc then sets new values atomically.
   const [advancedReady, setAdvancedReady] = createSignal(false);
   const [lastSavedAdvanced, setLastSavedAdvanced] = createSignal("");
 
@@ -689,7 +700,7 @@ export default function App() {
     // Also keep lastSavedLinks in sync so the linksReady gate works correctly on modlist switch.
     setLastSavedLinks(serializeLinks(links));
 
-    // Build requires map from links (fromId → [toId, ...]).
+    // Build requires entries from links (fromModId → [toModId, ...]).
     const requiresByModId = new Map<string, string[]>();
     for (const l of links) {
       const fromModId = rowMap().get(l.fromId)?.primaryModId ?? l.fromId;
@@ -699,30 +710,40 @@ export default function App() {
       requiresByModId.set(fromModId, arr);
     }
 
-    // Collect all modIds that have any data to save.
-    const modIds = new Set<string>();
-    for (const [id] of requiresByModId) modIds.add(id);
-    for (const r of vr) modIds.add(r.modId);
-    for (const c of cc) modIds.add(c.modId);
+    const requiresEntries = [...requiresByModId.entries()].map(([modId, requires]) => ({ modId, requires }));
 
-    for (const modId of modIds) {
-      const requires = requiresByModId.get(modId) ?? [];
-      const modVR = vr.filter(r => r.modId === modId);
-      const modCC = cc.filter(c => c.modId === modId);
-      void invoke("save_rule_advanced_command", {
-        input: {
-          modlistName,
-          modId,
-          excludeIf: [],
-          requires,
-          versionRules: modVR.map(r => ({ kind: r.kind, mcVersions: r.mcVersions, loader: r.loader })),
-          customConfigs: modCC.map(c => ({ mcVersions: c.mcVersions, loader: c.loader, targetPath: c.targetPath, files: c.files })),
-        },
-      }).catch(err => {
-        setLastSavedAdvanced("");
-        pushUiError({ title: "Could not save rule config", message: `Failed to persist config for '${modId}'.`, detail: String(err), severity: "error", scope: "launch" });
-      });
+    // Group version rules by mod ID (convert row IDs → mod IDs for the backend).
+    const vrByMod = new Map<string, typeof vr>();
+    for (const r of vr) {
+      const realModId = rowMap().get(r.modId)?.primaryModId ?? r.modId;
+      const arr = vrByMod.get(realModId) ?? [];
+      arr.push(r);
+      vrByMod.set(realModId, arr);
     }
+    const versionRulesEntries = [...vrByMod.entries()].map(([modId, rules]) => ({
+      modId,
+      versionRules: rules.map(r => ({ kind: r.kind, mcVersions: r.mcVersions, loader: r.loader })),
+    }));
+
+    // Group custom configs by mod ID (convert row IDs → mod IDs for the backend).
+    const ccByMod = new Map<string, typeof cc>();
+    for (const c of cc) {
+      const realModId = rowMap().get(c.modId)?.primaryModId ?? c.modId;
+      const arr = ccByMod.get(realModId) ?? [];
+      arr.push(c);
+      ccByMod.set(realModId, arr);
+    }
+    const customConfigsEntries = [...ccByMod.entries()].map(([modId, configs]) => ({
+      modId,
+      customConfigs: configs.map(c => ({ mcVersions: c.mcVersions, loader: c.loader, targetPath: c.targetPath, files: c.files })),
+    }));
+
+    void invoke("save_advanced_batch_command", {
+      input: { modlistName, requiresEntries, versionRulesEntries, customConfigsEntries },
+    }).catch(err => {
+      setLastSavedAdvanced("");
+      pushUiError({ title: "Could not save rule config", message: "Failed to persist advanced config.", detail: String(err), severity: "error", scope: "launch" });
+    });
   });
 
   // ── Startup ────────────────────────────────────────────────────────────────
@@ -757,7 +778,7 @@ export default function App() {
         setIncompatReady(true);
         setLastSavedLinks(serializeLinks(savedLinks()));
         setLinksReady(true);
-        setLastSavedAdvanced(JSON.stringify({ vr: versionRules(), cc: customConfigs() }));
+        setLastSavedAdvanced(JSON.stringify({ links: serializeLinks(savedLinks()), vr: versionRules(), cc: customConfigs() }));
         setAdvancedReady(true);
         logger.debug("App", "boot completed", { firstList, rowCount: editorSnapshot?.rows?.length ?? modRowsState().length });
         void fetchModIcons(modRowsState());
@@ -808,7 +829,7 @@ export default function App() {
     setIncompatReady(true);
     setLastSavedLinks(serializeLinks(savedLinks()));
     setLinksReady(true);
-    setLastSavedAdvanced(JSON.stringify({ vr: versionRules(), cc: customConfigs() }));
+    setLastSavedAdvanced(JSON.stringify({ links: serializeLinks(savedLinks()), vr: versionRules(), cc: customConfigs() }));
     setAdvancedReady(true);
     void fetchModIcons(modRowsState());
   };
@@ -1044,7 +1065,7 @@ export default function App() {
       setIncompatReady(true);
       setLastSavedLinks(serializeLinks(savedLinks()));
       setLinksReady(true);
-      setLastSavedAdvanced(JSON.stringify({ vr: versionRules(), cc: customConfigs() }));
+      setLastSavedAdvanced(JSON.stringify({ links: serializeLinks(savedLinks()), vr: versionRules(), cc: customConfigs() }));
       setAdvancedReady(true);
       logger.debug("App", "handleCreateModlist completed", { name });
     } catch (err) {
@@ -1350,7 +1371,7 @@ export default function App() {
         setIncompatReady(true);
         setLastSavedLinks(serializeLinks(savedLinks()));
         setLinksReady(true);
-        setLastSavedAdvanced(JSON.stringify({ vr: versionRules(), cc: customConfigs() }));
+        setLastSavedAdvanced(JSON.stringify({ links: serializeLinks(savedLinks()), vr: versionRules(), cc: customConfigs() }));
         setAdvancedReady(true);
       } else {
         setSelectedModListName("");
