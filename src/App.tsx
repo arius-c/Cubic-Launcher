@@ -13,7 +13,7 @@ import {
   createModlistName, createModlistDescription, setCreateModlistModalOpen,
   setCreateModlistBusy, createModlistBusy,
   renameRuleDraft, renameRuleTargetId, setRenameRuleModalOpen,
-  selectedIds, setSelectedIds, setExpandedRows, activeAccount, setAddModModalOpen,
+  selectedIds, setSelectedIds, expandedRows, setExpandedRows, activeAccount, setAddModModalOpen,
   setSettingsModalOpen, localJarRuleName, setLocalJarRuleName,
   setGlobalSettings, setModlistOverrides,
   pushUiError, resetLaunchUiState,
@@ -242,6 +242,10 @@ function serializeRuleGroups(aGroups: AestheticGroup[]): string {
   return JSON.stringify(
     aGroups.map(g => ({ id: g.id, name: g.name, collapsed: g.collapsed, rowIds: g.blockIds, scopeRowId: g.scopeRowId ?? null }))
   );
+}
+
+function serializeExpandedRows(ids: string[]): string {
+  return JSON.stringify([...ids].sort());
 }
 
 function serializeLinks(links: Array<{ fromId: string; toId: string }>): string {
@@ -586,6 +590,10 @@ async function loadModlistGroups(modlistName: string, rows: ModRow[]) {
       scopeRowId: (g.scopeRowId as string | null) ?? null,
     })));
 
+    // Restore expanded alt panels from persisted state.
+    const persistedExpanded: string[] = (layout.collapsedAlts ?? []).filter((id: string) => availableIds.has(id));
+    setExpandedRows(persistedExpanded);
+
     return layout;
   } catch (err) {
     setFunctionalGroups([]);
@@ -640,28 +648,30 @@ export default function App() {
   const [groupLayoutReady, setGroupLayoutReady] = createSignal(false);
   const [lastSavedGroupLayout, setLastSavedGroupLayout] = createSignal("");
   const [lastSavedRuleMetaGroups, setLastSavedRuleMetaGroups] = createSignal("");
+  const [lastSavedCollapsedAlts, setLastSavedCollapsedAlts] = createSignal("");
   const [incompatReady, setIncompatReady] = createSignal(false);
   const [lastSavedIncompat, setLastSavedIncompat] = createSignal("");
   const [linksReady, setLinksReady] = createSignal(false);
   const [lastSavedLinks, setLastSavedLinks] = createSignal("");
 
+  // Helper: build the full groups command payload (reused by all three group save effects).
+  const buildGroupsPayload = (modlistName: string) => ({
+    modlistName,
+    tags: functionalGroups().map(g => ({ id: g.id, name: g.name, tone: g.tone, modIds: g.modIds })),
+    aestheticGroups: aestheticGroups().map(g => ({ id: g.id, name: g.name, collapsed: g.collapsed, blockIds: g.blockIds, scopeRowId: g.scopeRowId ?? null })),
+    collapsedAlts: [...expandedRows()],
+  });
+
   // Save functional group (tag) definitions + membership to modlist-editor-groups.json.
   createEffect(() => {
     const modlistName = selectedModListName();
     const ready = groupLayoutReady();
-    const groups = functionalGroups();
-    const serialized = serializeGroupsLayout(groups);
+    const serialized = serializeGroupsLayout(functionalGroups());
 
     if (!ready || !modlistName || !isTauri() || serialized === lastSavedGroupLayout()) return;
 
     setLastSavedGroupLayout(serialized);
-    void invoke("save_modlist_groups_command", {
-      input: {
-        modlistName,
-        tags: groups.map(g => ({ id: g.id, name: g.name, tone: g.tone, modIds: g.modIds })),
-        aestheticGroups: aestheticGroups().map(g => ({ id: g.id, name: g.name, collapsed: g.collapsed, blockIds: g.blockIds, scopeRowId: g.scopeRowId ?? null })),
-      },
-    }).catch(err => {
+    void invoke("save_modlist_groups_command", { input: buildGroupsPayload(modlistName) }).catch(err => {
       setLastSavedGroupLayout("");
       pushUiError({ title: "Could not save groups", message: "The mod-list group layout could not be persisted.", detail: String(err), severity: "error", scope: "launch" });
     });
@@ -671,21 +681,29 @@ export default function App() {
   createEffect(() => {
     const modlistName = selectedModListName();
     const ready = groupLayoutReady();
-    const aGroups = aestheticGroups();
-    const serialized = serializeRuleGroups(aGroups);
+    const serialized = serializeRuleGroups(aestheticGroups());
 
     if (!ready || !modlistName || !isTauri() || serialized === lastSavedRuleMetaGroups()) return;
 
     setLastSavedRuleMetaGroups(serialized);
-    void invoke("save_modlist_groups_command", {
-      input: {
-        modlistName,
-        tags: functionalGroups().map(g => ({ id: g.id, name: g.name, tone: g.tone, modIds: g.modIds })),
-        aestheticGroups: aGroups.map(g => ({ id: g.id, name: g.name, collapsed: g.collapsed, blockIds: g.blockIds, scopeRowId: g.scopeRowId ?? null })),
-      },
-    }).catch(err => {
+    void invoke("save_modlist_groups_command", { input: buildGroupsPayload(modlistName) }).catch(err => {
       setLastSavedRuleMetaGroups("");
       pushUiError({ title: "Could not save groups", message: "The aesthetic group layout could not be persisted.", detail: String(err), severity: "error", scope: "launch" });
+    });
+  });
+
+  // Save expanded alt panel state to the same modlist-editor-groups.json file.
+  createEffect(() => {
+    const modlistName = selectedModListName();
+    const ready = groupLayoutReady();
+    const serialized = serializeExpandedRows(expandedRows());
+
+    if (!ready || !modlistName || !isTauri() || serialized === lastSavedCollapsedAlts()) return;
+
+    setLastSavedCollapsedAlts(serialized);
+    void invoke("save_modlist_groups_command", { input: buildGroupsPayload(modlistName) }).catch(err => {
+      setLastSavedCollapsedAlts("");
+      pushUiError({ title: "Could not save groups", message: "The alt panel state could not be persisted.", detail: String(err), severity: "error", scope: "launch" });
     });
   });
 
@@ -802,6 +820,7 @@ export default function App() {
         await loadModlistGroups(firstList, modRowsState());
         setLastSavedGroupLayout(serializeGroupsLayout(functionalGroups()));
         setLastSavedRuleMetaGroups(serializeRuleGroups(aestheticGroups()));
+        setLastSavedCollapsedAlts(serializeExpandedRows(expandedRows()));
         setGroupLayoutReady(true);
         setLastSavedIncompat(serializeIncompatibilities(savedIncompatibilities()));
         setIncompatReady(true);
@@ -853,6 +872,7 @@ export default function App() {
     await loadModlistGroups(name, modRowsState());
     setLastSavedGroupLayout(serializeGroupsLayout(functionalGroups()));
     setLastSavedRuleMetaGroups(serializeRuleGroups(aestheticGroups()));
+    setLastSavedCollapsedAlts(serializeExpandedRows(expandedRows()));
     setGroupLayoutReady(true);
     setLastSavedIncompat(serializeIncompatibilities(savedIncompatibilities()));
     setIncompatReady(true);
@@ -1089,6 +1109,7 @@ export default function App() {
       await loadModlistGroups(name, modRowsState());
       setLastSavedGroupLayout(serializeGroupsLayout(functionalGroups()));
       setLastSavedRuleMetaGroups(serializeRuleGroups(aestheticGroups()));
+      setLastSavedCollapsedAlts(serializeExpandedRows(expandedRows()));
       setGroupLayoutReady(true);
       setLastSavedIncompat(serializeIncompatibilities(savedIncompatibilities()));
       setIncompatReady(true);
@@ -1395,6 +1416,7 @@ export default function App() {
         await loadModlistGroups(next, modRowsState());
         setLastSavedGroupLayout(serializeGroupsLayout(functionalGroups()));
         setLastSavedRuleMetaGroups(serializeRuleGroups(aestheticGroups()));
+        setLastSavedCollapsedAlts(serializeExpandedRows(expandedRows()));
         setGroupLayoutReady(true);
         setLastSavedIncompat(serializeIncompatibilities(savedIncompatibilities()));
         setIncompatReady(true);

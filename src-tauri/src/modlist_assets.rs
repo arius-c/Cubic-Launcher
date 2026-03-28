@@ -50,6 +50,9 @@ pub struct ModlistGroupLayout {
     /// Aesthetic groups (visual section containers).
     #[serde(default)]
     pub aesthetic_groups: Vec<PersistedAestheticGroup>,
+    /// Row IDs whose alternatives panel is expanded (persisted across reloads).
+    #[serde(default)]
+    pub collapsed_alts: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -85,6 +88,9 @@ pub struct SaveModlistGroupsInput {
     /// Aesthetic groups (visual section containers).
     #[serde(default)]
     pub aesthetic_groups: Vec<PersistedAestheticGroup>,
+    /// Row IDs whose alternatives panel is expanded (persisted across reloads).
+    #[serde(default)]
+    pub collapsed_alts: Vec<String>,
 }
 
 #[tauri::command]
@@ -238,6 +244,7 @@ pub fn save_modlist_groups_from_root(
     let layout = ModlistGroupLayout {
         tags: input.tags.clone(),
         aesthetic_groups: input.aesthetic_groups.clone(),
+        collapsed_alts: input.collapsed_alts.clone(),
     };
     let layout_path = modlist_group_layout_path(root_dir, &input.modlist_name);
 
@@ -413,6 +420,7 @@ fn default_group_layout() -> ModlistGroupLayout {
     ModlistGroupLayout {
         tags: Vec::new(),
         aesthetic_groups: Vec::new(),
+        collapsed_alts: Vec::new(),
     }
 }
 
