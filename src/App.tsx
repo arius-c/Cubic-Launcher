@@ -29,6 +29,7 @@ import {
   minecraftVersions, setMinecraftVersions,
   LAUNCH_STAGES, wait,
   versionRules, setVersionRules, customConfigs, setCustomConfigs,
+  setResolvedModIds,
 } from "./store";
 import type { AestheticGroup, FunctionalGroup, LinkRule, ModRow, VersionRule, CustomConfig } from "./lib/types";
 
@@ -272,6 +273,23 @@ import { DebugPanel } from "./components/DebugPanel";
 // ─────────────────────────────────────────────────────────────────────────────
 
 const isTauri = () => typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+
+// ── Resolution helper ────────────────────────────────────────────────────────
+
+async function runResolution(modlistName: string, mcVersion: string, modLoader: string) {
+  if (!isTauri() || !modlistName) return;
+  try {
+    const activeIds: string[] = await invoke("resolve_modlist_command", {
+      modlistName,
+      mcVersion,
+      modLoader,
+    });
+    setResolvedModIds(new Set(activeIds));
+  } catch (e) {
+    logger.warn("App", "resolution failed", { error: e });
+    setResolvedModIds(new Set());
+  }
+}
 
 // ── Per-modlist version/loader cache (prevents bleed when switching modlists) ──
 const modlistVersionLoaderCache = new Map<string, { version: string; loader: string }>();
@@ -806,9 +824,9 @@ export default function App() {
       setAppLoading(false);
       logger.debug("App", "shell snapshot loaded", { modlists: (snap?.modlists ?? []).map((m: any) => m.name) });
 
-      { // [STUB] fetch_minecraft_versions_command
-        logger.debug("App", "invoke stubbed: fetch_minecraft_versions_command");
-        const versions = ["1.21.1", "1.20.6", "1.20.4", "1.19.4"];
+      {
+        const versions: string[] = await invoke("fetch_minecraft_versions_command");
+        logger.debug("App", "fetched minecraft versions", { count: versions.length });
         if (versions.length > 0) setMinecraftVersions(versions);
       }
 
@@ -830,6 +848,7 @@ export default function App() {
         setAdvancedReady(true);
         logger.debug("App", "boot completed", { firstList, rowCount: editorSnapshot?.rows?.length ?? modRowsState().length });
         void fetchModIcons(modRowsState());
+        void runResolution(firstList, selectedMcVersion(), selectedModLoader());
       } else {
         logger.debug("App", "boot completed — no mod lists found");
       }
@@ -881,6 +900,7 @@ export default function App() {
     setLastSavedAdvanced(JSON.stringify({ links: serializeLinks(savedLinks()), vr: versionRules(), cc: customConfigs() }));
     setAdvancedReady(true);
     void fetchModIcons(modRowsState());
+    void runResolution(name, selectedMcVersion(), selectedModLoader());
   };
 
   const handleReorderRules = async (orderedIds: string[]) => {
@@ -1315,6 +1335,7 @@ export default function App() {
     modlistVersionLoaderCache.set(modlistName, { version, loader: selectedModLoader() });
     setModListCards(cards => cards.map(c => c.name === modlistName ? { ...c, mcVersion: version } : c));
     void saveVersionLoader(modlistName, version, selectedModLoader());
+    void runResolution(modlistName, version, selectedModLoader());
   };
 
   const handleLoaderChange = (loader: string) => {
@@ -1323,6 +1344,7 @@ export default function App() {
     modlistVersionLoaderCache.set(modlistName, { version: selectedMcVersion(), loader });
     setModListCards(cards => cards.map(c => c.name === modlistName ? { ...c, modLoader: loader } : c));
     void saveVersionLoader(modlistName, selectedMcVersion(), loader);
+    void runResolution(modlistName, selectedMcVersion(), loader);
   };
 
   const handleSaveIncompatibilities = async () => {

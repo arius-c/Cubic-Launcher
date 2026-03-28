@@ -94,6 +94,8 @@ export const [draftLinks, setDraftLinks]                         = createSignal<
 export const [linkModalOpen, setLinkModalOpen]                   = createSignal(false);
 export const [linkModalModIds, setLinkModalModIds]               = createSignal<string[]>([]);
 export const [linksOverviewOpen, setLinksOverviewOpen]           = createSignal(false);
+/** Set of mod IDs that the resolver considers active for the current version + loader. */
+export const [resolvedModIds, setResolvedModIds]                 = createSignal<Set<string>>(new Set());
 export const [versionRules, setVersionRules]                     = createSignal<VersionRule[]>([]);
 export const [customConfigs, setCustomConfigs]                   = createSignal<CustomConfig[]>([]);
 export const [advancedPanelModId, setAdvancedPanelModId]         = createSignal<string | null>(null);

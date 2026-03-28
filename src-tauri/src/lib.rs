@@ -78,6 +78,7 @@ pub fn run() {
             modlist_assets::save_modlist_groups_command,
             modlist_assets::export_modlist_command,
             modlist_assets::read_image_as_data_url_command,
+            resolver::resolve_modlist_command,
             minecraft_downloader::fetch_minecraft_versions_command,
             minecraft_downloader::start_minecraft_predownload_command,
             launch_preview::start_launch_command

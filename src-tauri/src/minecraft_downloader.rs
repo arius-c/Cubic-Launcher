@@ -305,8 +305,8 @@ async fn download_file(client: &reqwest::Client, url: &str, dest: &Path) -> Resu
 
 // ── Version list ──────────────────────────────────────────────────────────────
 
-/// Returns all Minecraft release version IDs from the Mojang manifest, newest first.
-pub async fn fetch_release_versions(http_client: &reqwest::Client) -> Result<Vec<String>> {
+/// Returns all Minecraft version IDs from the Mojang manifest, newest first.
+pub async fn fetch_all_versions(http_client: &reqwest::Client) -> Result<Vec<String>> {
     let manifest: VersionManifest = http_client
         .get(VERSION_MANIFEST_URL)
         .send()
@@ -321,7 +321,6 @@ pub async fn fetch_release_versions(http_client: &reqwest::Client) -> Result<Vec
     Ok(manifest
         .versions
         .into_iter()
-        .filter(|v| v.version_type == "release")
         .map(|v| v.id)
         .collect())
 }
@@ -336,11 +335,11 @@ pub fn is_version_cached(launcher_paths: &LauncherPaths, version: &str) -> bool 
 
 // ── Tauri commands ────────────────────────────────────────────────────────────
 
-/// Returns all Minecraft release versions for the UI dropdown.
+/// Returns all Minecraft versions for the UI dropdown.
 #[tauri::command]
 pub async fn fetch_minecraft_versions_command() -> Result<Vec<String>, String> {
     let http_client = reqwest::Client::new();
-    fetch_release_versions(&http_client)
+    fetch_all_versions(&http_client)
         .await
         .map_err(|e| e.to_string())
 }
@@ -357,7 +356,7 @@ pub fn start_minecraft_predownload_command(
     tauri::async_runtime::spawn(async move {
         let http_client = reqwest::Client::new();
 
-        let versions = match fetch_release_versions(&http_client).await {
+        let versions = match fetch_all_versions(&http_client).await {
             Ok(v) => v,
             Err(e) => {
                 let _ = app_handle.emit(

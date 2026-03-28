@@ -1,9 +1,11 @@
 use std::collections::HashSet;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use serde::Serialize;
+use tauri::State;
 
-use crate::rules::{ModList, Rule, VersionRule, VersionRuleKind};
+use crate::launcher_paths::LauncherPaths;
+use crate::rules::{ModList, Rule, VersionRule, VersionRuleKind, RULES_FILENAME};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolutionTarget {
@@ -171,6 +173,43 @@ fn find_alt_by_depth(rule: &Rule, target_depth: usize) -> Option<&Rule> {
         // depth counting from their perspective.
     }
     None
+}
+
+// ── Tauri commands ────────────────────────────────────────────────────────────
+
+fn parse_mod_loader(value: &str) -> Result<ModLoader> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "fabric" => Ok(ModLoader::Fabric),
+        "quilt" => Ok(ModLoader::Quilt),
+        "forge" => Ok(ModLoader::Forge),
+        "neoforge" => Ok(ModLoader::NeoForge),
+        "vanilla" => Ok(ModLoader::Vanilla),
+        other => bail!("unsupported mod loader '{other}'"),
+    }
+}
+
+/// Returns the set of active (resolved) mod IDs for a given modlist + version + loader.
+#[tauri::command]
+pub fn resolve_modlist_command(
+    launcher_paths: State<'_, LauncherPaths>,
+    modlist_name: String,
+    mc_version: String,
+    mod_loader: String,
+) -> Result<Vec<String>, String> {
+    let rules_path = launcher_paths
+        .modlists_dir()
+        .join(&modlist_name)
+        .join(RULES_FILENAME);
+
+    let modlist = ModList::read_from_file(&rules_path).map_err(|e| e.to_string())?;
+
+    let target = ResolutionTarget {
+        minecraft_version: mc_version,
+        mod_loader: parse_mod_loader(&mod_loader).map_err(|e| e.to_string())?,
+    };
+
+    let result = resolve_modlist(&modlist, &target).map_err(|e| e.to_string())?;
+    Ok(result.active_mods.into_iter().collect())
 }
 
 #[cfg(test)]

@@ -13,7 +13,7 @@ import {
   toggleSelected, toggleExpanded, functionalGroupTagClass,
   removeFunctionalGroupMember, tagFilter, functionalGroups, tagFilterForcedExpanded,
   linksByModId, removeLink, removeIncompatibility,
-  setAdvancedPanelModId, selectedCount,
+  setAdvancedPanelModId, selectedCount, resolvedModIds,
 } from "../store";
 import {
   ChevronRightIcon, AlertTriangleIcon, PackageIcon, XIcon, MaterialIcon,
@@ -42,6 +42,11 @@ export function ModRuleItem(props: ModRuleItemProps) {
   const iconUrl    = () => props.row.modrinth_id ? modIcons().get(props.row.modrinth_id) : undefined;
   const containingGroup = () =>
     aestheticGroups().find(group => group.blockIds.includes(props.row.id)) ?? null;
+  const isResolved = () => {
+    const ids = resolvedModIds();
+    if (ids.size === 0) return null; // resolution not yet run
+    return ids.has(props.row.primaryModId ?? props.row.id);
+  };
 
   const stopDragPropagation = (event: MouseEvent | PointerEvent) => event.stopPropagation();
 
@@ -135,7 +140,9 @@ export function ModRuleItem(props: ModRuleItemProps) {
         {/* Info */}
         <div class="min-w-0 flex-1">
           <div class="flex flex-wrap items-center gap-1.5">
-            <span class="truncate font-medium text-foreground">{props.row.name}</span>
+            <span class={`truncate font-medium ${
+              isResolved() === true ? "text-green-400" : isResolved() === false ? "text-red-400" : "text-foreground"
+            }`}>{props.row.name}</span>
 
             {/* Source badge */}
             <span class={`inline-flex items-center rounded-md border px-1.5 py-0.5 text-[10px] font-medium ${
