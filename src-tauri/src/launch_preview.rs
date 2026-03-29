@@ -520,13 +520,13 @@ async fn prefetch_compatible_versions_for_selected(
 fn log_resolution(app_handle: &tauri::AppHandle, resolution: &ResolutionResult) -> Result<()> {
     for rule in &resolution.resolved_rules {
         match &rule.outcome {
-            RuleOutcome::Resolved { option_index } => emit_log(
+            RuleOutcome::Resolved { resolved_id } => emit_log(
                 app_handle,
                 ProcessLogStream::Stdout,
                 format!(
-                    "[Resolver] {} -> option {}",
+                    "[Resolver] {} -> {}",
                     rule.mod_id,
-                    option_index + 1,
+                    resolved_id,
                 ),
             )?,
             RuleOutcome::Unresolved { reason } => emit_log(

@@ -37,8 +37,8 @@ pub struct ResolvedRule {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuleOutcome {
     Resolved {
-        /// 0 = primary, 1+ = which alternative was used.
-        option_index: usize,
+        /// The mod_id that actually resolved (primary or a nested alternative).
+        resolved_id: String,
     },
     Unresolved {
         reason: FailureReason,
@@ -54,21 +54,13 @@ pub enum FailureReason {
 }
 
 pub fn resolve_modlist(modlist: &ModList, target: &ResolutionTarget) -> Result<ResolutionResult> {
+    // ── Pass 1: sequential resolve to build the initial active set ────────────
     let mut active_mods = HashSet::new();
     let mut resolved_rules = Vec::with_capacity(modlist.rules.len());
 
     for rule in &modlist.rules {
-        let outcome = try_resolve(rule, &active_mods, target, 0);
-        if let RuleOutcome::Resolved { option_index } = &outcome {
-            // Add the actually-resolved mod's id (primary or the chosen alternative).
-            let resolved_id = if *option_index == 0 {
-                &rule.mod_id
-            } else {
-                rule.alternatives
-                    .get(*option_index - 1)
-                    .map(|alt| &alt.mod_id)
-                    .unwrap_or(&rule.mod_id)
-            };
+        let outcome = try_resolve(rule, &active_mods, target);
+        if let RuleOutcome::Resolved { ref resolved_id } = outcome {
             active_mods.insert(resolved_id.clone());
         }
         resolved_rules.push(ResolvedRule {
@@ -77,8 +69,26 @@ pub fn resolve_modlist(modlist: &ModList, target: &ResolutionTarget) -> Result<R
         });
     }
 
+    // ── Pass 2: re-check each rule against the FULL active set ───────────────
+    // Pass 1 is sequential, so a loser that appears before its winner won't see
+    // the winner in active_mods.  Pass 2 uses the complete set from pass 1 to
+    // retroactively exclude those losers.
+    let full_active = active_mods.clone();
+    let mut final_active = HashSet::new();
+
+    for (i, rule) in modlist.rules.iter().enumerate() {
+        let outcome = try_resolve(rule, &full_active, target);
+        if let RuleOutcome::Resolved { ref resolved_id } = outcome {
+            final_active.insert(resolved_id.clone());
+        }
+        resolved_rules[i] = ResolvedRule {
+            mod_id: rule.mod_id.clone(),
+            outcome,
+        };
+    }
+
     Ok(ResolutionResult {
-        active_mods,
+        active_mods: final_active,
         resolved_rules,
     })
 }
@@ -87,7 +97,6 @@ fn try_resolve(
     rule: &Rule,
     active_mods: &HashSet<String>,
     target: &ResolutionTarget,
-    depth: usize,
 ) -> RuleOutcome {
     // 1. Check exclude_if
     if rule.exclude_if.iter().any(|id| active_mods.contains(id)) {
@@ -105,7 +114,7 @@ fn try_resolve(
     }
 
     RuleOutcome::Resolved {
-        option_index: depth,
+        resolved_id: rule.mod_id.clone(),
     }
 }
 
@@ -115,8 +124,8 @@ fn try_alternatives(
     target: &ResolutionTarget,
     reason: FailureReason,
 ) -> RuleOutcome {
-    for (i, alt) in rule.alternatives.iter().enumerate() {
-        let outcome = try_resolve(alt, active_mods, target, i + 1);
+    for alt in &rule.alternatives {
+        let outcome = try_resolve(alt, active_mods, target);
         if matches!(outcome, RuleOutcome::Resolved { .. }) {
             return outcome;
         }
@@ -128,8 +137,9 @@ fn try_alternatives(
 fn version_rules_conflict(version_rules: &[VersionRule], target: &ResolutionTarget) -> bool {
     for vr in version_rules {
         let version_matches = vr.mc_versions.iter().any(|v| v == &target.minecraft_version);
+        let vr_loader = vr.loader.to_ascii_lowercase();
         let loader_matches =
-            vr.loader == "any" || vr.loader == target.mod_loader.as_modrinth_loader();
+            vr_loader == "any" || vr_loader == target.mod_loader.as_modrinth_loader();
 
         match vr.kind {
             VersionRuleKind::Only => {
@@ -152,25 +162,19 @@ fn version_rules_conflict(version_rules: &[VersionRule], target: &ResolutionTarg
 /// Look up which Rule was actually resolved for a top-level rule (follows alternatives).
 pub fn find_resolved_rule<'a>(top_rule: &'a Rule, outcome: &RuleOutcome) -> Option<&'a Rule> {
     match outcome {
-        RuleOutcome::Resolved { option_index } => {
-            if *option_index == 0 {
-                Some(top_rule)
-            } else {
-                find_alt_by_depth(top_rule, *option_index)
-            }
-        }
+        RuleOutcome::Resolved { resolved_id } => find_rule_by_id(top_rule, resolved_id),
         RuleOutcome::Unresolved { .. } => None,
     }
 }
 
-fn find_alt_by_depth(rule: &Rule, target_depth: usize) -> Option<&Rule> {
-    for (i, alt) in rule.alternatives.iter().enumerate() {
-        if i + 1 == target_depth {
-            return Some(alt);
+fn find_rule_by_id<'a>(rule: &'a Rule, mod_id: &str) -> Option<&'a Rule> {
+    if rule.mod_id == mod_id {
+        return Some(rule);
+    }
+    for alt in &rule.alternatives {
+        if let Some(found) = find_rule_by_id(alt, mod_id) {
+            return Some(found);
         }
-        // Alternatives at this level are tried sequentially, not recursively nested
-        // for depth tracking. Each alternative's own alternatives would have their own
-        // depth counting from their perspective.
     }
     None
 }
@@ -209,7 +213,63 @@ pub fn resolve_modlist_command(
     };
 
     let result = resolve_modlist(&modlist, &target).map_err(|e| e.to_string())?;
-    Ok(result.active_mods.into_iter().collect())
+
+    // For rules whose primary didn't resolve, check ALL alternatives (not just
+    // the first winner) so the UI can show every viable fallback as green.
+    let mut ids = result.active_mods;
+    for (i, rule) in modlist.rules.iter().enumerate() {
+        let primary_resolved = matches!(
+            &result.resolved_rules[i].outcome,
+            RuleOutcome::Resolved { resolved_id } if resolved_id == &rule.mod_id
+        );
+        // Only expand alternatives when the primary itself was excluded.
+        if primary_resolved {
+            continue;
+        }
+        check_all_alts_recursive(rule, &mut ids, &target);
+    }
+
+    Ok(ids.into_iter().collect())
+}
+
+/// Recursively check every alternative in the tree and add viable ones to `ids`.
+/// Only marks an alt green if the alt *itself* passes all checks.
+/// Only recurses into an alt's children when the alt itself is NOT viable
+/// (its sub-alternatives are only relevant as fallbacks when it fails).
+fn check_all_alts_recursive(
+    rule: &Rule,
+    ids: &mut HashSet<String>,
+    target: &ResolutionTarget,
+) {
+    for alt in &rule.alternatives {
+        // Already resolved by the main resolver — it's viable, skip its children.
+        if ids.contains(&alt.mod_id) {
+            continue;
+        }
+        if alt_itself_viable(alt, ids, target) {
+            ids.insert(alt.mod_id.clone());
+            // Alt is viable — its sub-alternatives are irrelevant.
+        } else {
+            // Alt failed — check its sub-alternatives as fallbacks.
+            check_all_alts_recursive(alt, ids, target);
+        }
+    }
+}
+
+/// Returns true only if this specific rule passes all checks (exclude_if, requires,
+/// version_rules) — ignores its own alternatives.
+fn alt_itself_viable(
+    rule: &Rule,
+    active_mods: &HashSet<String>,
+    target: &ResolutionTarget,
+) -> bool {
+    if rule.exclude_if.iter().any(|id| active_mods.contains(id)) {
+        return false;
+    }
+    if rule.requires.iter().any(|id| !active_mods.contains(id)) {
+        return false;
+    }
+    !version_rules_conflict(&rule.version_rules, target)
 }
 
 #[cfg(test)]
@@ -256,7 +316,7 @@ mod tests {
         assert_eq!(result.resolved_rules.len(), 2);
         assert_eq!(
             result.resolved_rules[0].outcome,
-            RuleOutcome::Resolved { option_index: 0 }
+            RuleOutcome::Resolved { resolved_id: "sodium".into() }
         );
     }
 
@@ -282,7 +342,7 @@ mod tests {
         assert!(result.active_mods.contains("iris"));
         assert_eq!(
             result.resolved_rules[1].outcome,
-            RuleOutcome::Resolved { option_index: 1 }
+            RuleOutcome::Resolved { resolved_id: "iris".into() }
         );
     }
 
@@ -441,7 +501,7 @@ mod tests {
         assert!(result.active_mods.contains("c"));
         assert_eq!(
             result.resolved_rules[0].outcome,
-            RuleOutcome::Resolved { option_index: 2 }
+            RuleOutcome::Resolved { resolved_id: "c".into() }
         );
     }
 

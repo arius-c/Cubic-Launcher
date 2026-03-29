@@ -276,13 +276,16 @@ const isTauri = () => typeof window !== 'undefined' && '__TAURI_INTERNALS__' in 
 
 // ── Resolution helper ────────────────────────────────────────────────────────
 
-async function runResolution(modlistName: string, mcVersion: string, modLoader: string) {
-  if (!isTauri() || !modlistName) return;
+async function runResolution(modlistName?: string, mcVersion?: string, modLoader?: string) {
+  const name = modlistName ?? selectedModListName();
+  const ver  = mcVersion  ?? selectedMcVersion();
+  const ldr  = modLoader  ?? selectedModLoader();
+  if (!isTauri() || !name) return;
   try {
     const activeIds: string[] = await invoke("resolve_modlist_command", {
-      modlistName,
-      mcVersion,
-      modLoader,
+      modlistName: name,
+      mcVersion: ver,
+      modLoader: ldr,
     });
     setResolvedModIds(new Set(activeIds));
   } catch (e) {
@@ -510,6 +513,9 @@ async function loadEditorSnapshot(modlistName: string, resetGroups = false) {
     collectAdvanced(snap.rows ?? []);
     setVersionRules(extractedVR);
     setCustomConfigs(extractedCC);
+
+    // Re-resolve so green/red indicators update after any edit.
+    void runResolution(modlistName);
 
     return snap;
   } catch (err) {
@@ -739,7 +745,7 @@ export default function App() {
     }));
     void invoke("save_incompatibilities_command", {
       input: { modlistName, rules },
-    }).catch(err => {
+    }).then(() => runResolution()).catch(err => {
       setLastSavedIncompat("");
       pushUiError({ title: "Could not save incompatibilities", message: "The incompatibility rules could not be persisted.", detail: String(err), severity: "error", scope: "launch" });
     });
@@ -805,7 +811,7 @@ export default function App() {
 
     void invoke("save_advanced_batch_command", {
       input: { modlistName, requiresEntries, versionRulesEntries, customConfigsEntries },
-    }).catch(err => {
+    }).then(() => runResolution()).catch(err => {
       setLastSavedAdvanced("");
       pushUiError({ title: "Could not save rule config", message: "Failed to persist advanced config.", detail: String(err), severity: "error", scope: "launch" });
     });
@@ -819,16 +825,17 @@ export default function App() {
     const boot = async () => {
       logger.info("App", "boot started");
 
-      // Load shell + editor from backend (stubs return empty defaults in browser mode)
-      const snap = await loadShellSnapshot(null);
-      setAppLoading(false);
-      logger.debug("App", "shell snapshot loaded", { modlists: (snap?.modlists ?? []).map((m: any) => m.name) });
-
+      // Fetch MC versions first so the fallback in loadShellSnapshot is correct.
       {
         const versions: string[] = await invoke("fetch_minecraft_versions_command");
         logger.debug("App", "fetched minecraft versions", { count: versions.length });
         if (versions.length > 0) setMinecraftVersions(versions);
       }
+
+      // Load shell + editor from backend (stubs return empty defaults in browser mode)
+      const snap = await loadShellSnapshot(null);
+      setAppLoading(false);
+      logger.debug("App", "shell snapshot loaded", { modlists: (snap?.modlists ?? []).map((m: any) => m.name) });
 
       // Load editor data + icons for the selected mod list
       const firstList = snap?.modlists?.[0]?.name ?? "";
@@ -931,6 +938,7 @@ export default function App() {
         setAlternativesPanelParentId(id => (id && idRemap.has(id) ? idRemap.get(id)! : id));
         setAdvancedPanelModId(id => (id && idRemap.has(id) ? idRemap.get(id)! : id));
       });
+      void runResolution();
     } catch (err) {
       logger.error("App", "handleReorderRules failed", err);
       pushUiError({ title: "Reorder failed", message: "The new rule order could not be saved.", detail: String(err), severity: "error", scope: "launch" });
@@ -950,6 +958,7 @@ export default function App() {
       await invoke("save_alternative_order_command", {
         input: { modlistName: selectedModListName(), parentModId: rowMap().get(parentId)?.primaryModId ?? parentId, orderedAltIds: orderedAltIds.map(id => rowMap().get(id)?.primaryModId ?? id) },
       });
+      void runResolution();
       appendDebugTrace("alts.reorder.frontend", { parentId, status: "saved" });
     } catch (err) {
       appendDebugTrace("alts.reorder.frontend", { parentId, status: "error", detail: String(err) });
@@ -1216,6 +1225,9 @@ export default function App() {
     logger.info("App", "handleDeleteSelected started", { ids });
     const idSet = new Set(ids);
 
+    // Capture real mod IDs BEFORE the optimistic removal clears them from rowMap.
+    const backendModIds = ids.map(id => rowMap().get(id)?.primaryModId ?? id);
+
     // Optimistic update: remove top-level rules AND nested alternatives.
     setModRowsState(cur =>
       cur
@@ -1232,7 +1244,7 @@ export default function App() {
     setSelectedIds([]);
     if (!isTauri() || !selectedModListName()) { logger.warn("App", "handleDeleteSelected skipped — no backend"); return; }
     try {
-      await invoke("delete_rules_command", { input: { modlistName: selectedModListName(), modIds: ids.map(id => rowMap().get(id)?.primaryModId ?? id) } });
+      await invoke("delete_rules_command", { input: { modlistName: selectedModListName(), modIds: backendModIds } });
       const currentRows = modRowsState();
       const rebuiltRows = rebuildRowIds(currentRows);
       const idRemap = buildIdRemap(currentRows, rebuiltRows);
@@ -1243,6 +1255,7 @@ export default function App() {
         setFunctionalGroups(groups => remapFunctionalGroups(groups, idRemap, validIds));
         setAdvancedPanelModId(id => (id && idRemap.has(id) ? idRemap.get(id)! : (id && validIds.has(id) ? id : null)));
       });
+      void runResolution();
       logger.debug("App", "handleDeleteSelected completed");
     } catch (err) {
       logger.error("App", "handleDeleteSelected failed", err);
@@ -1271,7 +1284,7 @@ export default function App() {
     if (!isTauri() || !selectedModListName()) { logger.warn("App", "handleRenameRule skipped — no backend"); return; }
     try {
       await invoke("rename_rule_command", { input: { modlistName: selectedModListName(), modId: rowMap().get(id)?.primaryModId ?? id, newModId: name } });
-      // Optimistic update already applied — no reload needed.
+      void runResolution();
       logger.debug("App", "handleRenameRule completed");
     } catch (err) {
       logger.error("App", "handleRenameRule failed", err);
