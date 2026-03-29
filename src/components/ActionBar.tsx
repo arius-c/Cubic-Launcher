@@ -4,7 +4,9 @@ import {
   selectedCount, createAestheticGroup as createGroup, openIncompatibilityEditor,
   selectedTopLevelId, openAlternativesPanel, setFunctionalGroupModalOpen,
   functionalGroups, tagFilter, setTagFilter, toggleTagFilter,
-  functionalGroupTagClass, openLinkModal, savedLinks, setLinksOverviewOpen,
+  functionalGroupTagClass, functionalGroupTagStyle,
+  addModToFunctionalGroup, selectedIds,
+  openLinkModal, savedLinks, setLinksOverviewOpen,
 } from "../store";
 import { MaterialIcon, XIcon } from "./icons";
 
@@ -38,13 +40,51 @@ export function ActionBar(props: ActionBarProps) {
             <MaterialIcon name="delete" size="md" />
             Delete
           </button>
-          <button
-            onClick={() => setFunctionalGroupModalOpen(true)}
-            class="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-primary hover:text-white hover:bg-primary/40 rounded-lg border border-primary/30 transition-colors duration-75"
-          >
-            <MaterialIcon name="folder_special" size="md" />
-            Add Tag
-          </button>
+          {(() => {
+            const [tagMenuOpen, setTagMenuOpen] = createSignal(false);
+            return (
+              <div class="relative">
+                <button
+                  onClick={() => setTagMenuOpen(o => !o)}
+                  class="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-primary hover:text-white hover:bg-primary/40 rounded-lg border border-primary/30 transition-colors duration-75"
+                >
+                  <MaterialIcon name="folder_special" size="md" />
+                  Add Tag
+                  <MaterialIcon name={tagMenuOpen() ? "expand_less" : "expand_more"} size="sm" />
+                </button>
+                <Show when={tagMenuOpen()}>
+                  <div class="fixed inset-0 z-40" onClick={() => setTagMenuOpen(false)} />
+                  <div class="absolute left-0 top-full mt-1 z-50 min-w-[180px] bg-bgPanel border border-borderColor rounded-lg shadow-lg overflow-hidden">
+                    {/* Create new tag */}
+                    <button
+                      onClick={() => { setTagMenuOpen(false); setFunctionalGroupModalOpen(true); }}
+                      class="w-full flex items-center gap-2 px-3 py-2 text-sm text-primary hover:bg-primary/10 transition-colors border-b border-borderColor"
+                    >
+                      <MaterialIcon name="add" size="sm" />
+                      Create New Tag
+                    </button>
+                    {/* Existing tags */}
+                    <For each={functionalGroups()}>
+                      {g => (
+                        <button
+                          onClick={() => {
+                            for (const id of selectedIds()) addModToFunctionalGroup(g.id, id);
+                            setTagMenuOpen(false);
+                          }}
+                          class="w-full flex items-center gap-2 px-3 py-2 text-sm hover:bg-muted/20 transition-colors"
+                        >
+                          <span class={functionalGroupTagClass(g.tone)} style={functionalGroupTagStyle(g.tone)}>{g.name}</span>
+                        </button>
+                      )}
+                    </For>
+                    <Show when={functionalGroups().length === 0}>
+                      <div class="px-3 py-2 text-xs text-muted-foreground">No tags yet.</div>
+                    </Show>
+                  </div>
+                </Show>
+              </div>
+            );
+          })()}
           <button
             onClick={openLinkModal}
             disabled={selectedCount() < 2}
@@ -134,7 +174,7 @@ export function ActionBar(props: ActionBarProps) {
                           active() ? "bg-primary/10" : "hover:bg-muted/20"
                         }`}
                       >
-                        <span class={functionalGroupTagClass(g.tone)}>
+                        <span class={functionalGroupTagClass(g.tone)} style={functionalGroupTagStyle(g.tone)}>
                           {g.name}
                         </span>
                         <Show when={active()}>

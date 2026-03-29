@@ -22,7 +22,7 @@ import {
   functionalGroupModalOpen, setFunctionalGroupModalOpen,
   newFunctionalGroupName, setNewFunctionalGroupName,
   functionalGroupTone, setFunctionalGroupTone,
-  createFunctionalGroup, selectedModListName,
+  createFunctionalGroup, selectedModListName, toneToHue, huePreviewColor,
   aestheticGroups, setAestheticGroups, nextAestheticGroupName,
   /* Incompatibilities */
   incompatibilityModalOpen, setIncompatibilityModalOpen,
@@ -513,27 +513,29 @@ export function InstancePresentationModal(props: { onSave: () => Promise<void>; 
 
 // ── Functional Group ──────────────────────────────────────────────────────────
 export function FunctionalGroupModal() {
-  const tones = ["violet", "sky", "amber"];
+  const currentHue = () => toneToHue(functionalGroupTone());
   return (
     <Show when={functionalGroupModalOpen()}>
       <Modal onClose={() => setFunctionalGroupModalOpen(false)}>
-        <ModalHeader title="Create Functional Group" description="Mods in a functional group must all be compatible or the group fails." onClose={() => setFunctionalGroupModalOpen(false)} />
+        <ModalHeader title="Create Tag" description="Tags let you label and filter mods by category." onClose={() => setFunctionalGroupModalOpen(false)} />
         <div class="space-y-4 p-6">
           <div>
-            <label class="mb-1.5 block text-sm font-medium text-foreground">Group Name</label>
+            <label class="mb-1.5 block text-sm font-medium text-foreground">Tag Name</label>
             <input type="text" value={newFunctionalGroupName()} onInput={e => setNewFunctionalGroupName(e.currentTarget.value)} placeholder="Performance Core" class="w-full rounded-md border border-input bg-input px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring" autofocus />
           </div>
           <div>
             <label class="mb-1.5 block text-sm font-medium text-foreground">Tag Color</label>
-            <div class="flex gap-2">
-              <For each={tones}>
-                {t => (
-                  <button
-                    onClick={() => setFunctionalGroupTone(t)}
-                    class={`h-7 w-7 rounded-full border-2 transition-all ${t === "violet" ? "bg-primary" : t === "sky" ? "bg-sky-500" : "bg-amber-500"} ${functionalGroupTone() === t ? "border-foreground scale-110" : "border-transparent"}`}
-                  />
-                )}
-              </For>
+            <div class="flex items-center gap-3">
+              <div class="h-7 w-7 rounded-full shrink-0 border border-border" style={`background-color: ${huePreviewColor(currentHue())}`} />
+              <input
+                type="range"
+                min="0"
+                max="360"
+                value={currentHue()}
+                onInput={e => setFunctionalGroupTone(e.currentTarget.value)}
+                class="flex-1 h-3 appearance-none rounded-full cursor-pointer"
+                style="background: linear-gradient(to right, hsl(0,70%,55%), hsl(30,70%,55%), hsl(60,70%,55%), hsl(90,70%,55%), hsl(120,70%,55%), hsl(150,70%,55%), hsl(180,70%,55%), hsl(210,70%,55%), hsl(240,70%,55%), hsl(270,70%,55%), hsl(300,70%,55%), hsl(330,70%,55%), hsl(360,70%,55%));"
+              />
             </div>
           </div>
         </div>

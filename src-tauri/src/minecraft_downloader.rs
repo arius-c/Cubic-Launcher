@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha1::{Digest, Sha1};
 use tauri::{Emitter, State};
 use tokio::task::JoinSet;
@@ -335,13 +335,47 @@ pub fn is_version_cached(launcher_paths: &LauncherPaths, version: &str) -> bool 
 
 // ── Tauri commands ────────────────────────────────────────────────────────────
 
-/// Returns all Minecraft versions for the UI dropdown.
+/// Payload returned to the frontend with releases and releases+snapshots lists.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MinecraftVersionsPayload {
+    pub releases: Vec<String>,
+    pub with_snapshots: Vec<String>,
+}
+
+/// Returns Minecraft versions for the UI dropdown, split into releases and releases+snapshots.
 #[tauri::command]
-pub async fn fetch_minecraft_versions_command() -> Result<Vec<String>, String> {
+pub async fn fetch_minecraft_versions_command() -> Result<MinecraftVersionsPayload, String> {
     let http_client = reqwest::Client::new();
-    fetch_all_versions(&http_client)
+    let manifest: VersionManifest = http_client
+        .get(VERSION_MANIFEST_URL)
+        .send()
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let releases: Vec<String> = manifest
+        .versions
+        .iter()
+        .filter(|v| v.version_type == "release")
+        .map(|v| v.id.clone())
+        .collect();
+
+    let with_snapshots: Vec<String> = manifest
+        .versions
+        .iter()
+        .filter(|v| v.version_type == "release" || v.version_type == "snapshot")
+        .map(|v| v.id.clone())
+        .collect();
+
+    Ok(MinecraftVersionsPayload {
+        releases,
+        with_snapshots,
+    })
 }
 
 /// Spawns a background task that pre-downloads every missing Minecraft release version.

@@ -34,6 +34,8 @@ export const [modListCards, setModListCards]                     = createSignal<
 export const [selectedModListName, setSelectedModListName]       = createSignal<string>("");
 export const [search, setSearch]                                 = createSignal("");
 export const [minecraftVersions, setMinecraftVersions]           = createSignal<string[]>(["1.21.1", "1.20.6", "1.20.4", "1.19.4"]);
+export const [mcWithSnapshots, setMcWithSnapshots]               = createSignal<string[]>([]);
+export const [showSnapshots, setShowSnapshots]                   = createSignal(false);
 export const [selectedMcVersion, setSelectedMcVersion]           = createSignal("1.21.1");
 export const [selectedModLoader, setSelectedModLoader]           = createSignal<string>("Fabric");
 export const [launchState, setLaunchState]                       = createSignal<"idle" | "resolving" | "ready" | "running">("idle");
@@ -94,8 +96,8 @@ export const [draftLinks, setDraftLinks]                         = createSignal<
 export const [linkModalOpen, setLinkModalOpen]                   = createSignal(false);
 export const [linkModalModIds, setLinkModalModIds]               = createSignal<string[]>([]);
 export const [linksOverviewOpen, setLinksOverviewOpen]           = createSignal(false);
-/** Set of mod IDs that the resolver considers active for the current version + loader. */
-export const [resolvedModIds, setResolvedModIds]                 = createSignal<Set<string>>(new Set());
+/** Set of mod IDs that the resolver considers active for the current version + loader. null = not yet run. */
+export const [resolvedModIds, setResolvedModIds]                 = createSignal<Set<string> | null>(null);
 export const [versionRules, setVersionRules]                     = createSignal<VersionRule[]>([]);
 export const [customConfigs, setCustomConfigs]                   = createSignal<CustomConfig[]>([]);
 export const [advancedPanelModId, setAdvancedPanelModId]         = createSignal<string | null>(null);
@@ -389,14 +391,36 @@ export function rowMatchesQuery(row: ModRow, q: string): boolean {
   return row.name.toLowerCase().includes(q) || (row.alternatives ?? []).some(a => a.name.toLowerCase().includes(q));
 }
 
+const TAG_BASE_CLASS = "inline-flex items-center gap-0.5 rounded-md border px-1.5 py-0.5 text-[10px]";
+
+const LEGACY_TONE_CLASSES: Record<string, string> = {
+  violet: `${TAG_BASE_CLASS} border-primary/30 bg-primary/15 text-primary`,
+  sky:    `${TAG_BASE_CLASS} border-sky-500/30 bg-sky-500/15 text-sky-300`,
+  amber:  `${TAG_BASE_CLASS} border-amber-500/30 bg-amber-500/15 text-amber-300`,
+};
+
+const LEGACY_TONE_HUES: Record<string, number> = { violet: 270, sky: 200, amber: 38 };
+
 export function functionalGroupTagClass(tone: string): string {
-  const base = "inline-flex items-center gap-0.5 rounded-md border px-1.5 py-0.5 text-[10px]";
-  const map: Record<string, string> = {
-    violet: `${base} border-primary/30 bg-primary/15 text-primary`,
-    sky:    `${base} border-sky-500/30 bg-sky-500/15 text-sky-300`,
-    amber:  `${base} border-amber-500/30 bg-amber-500/15 text-amber-300`,
-  };
-  return map[tone] ?? map["violet"];
+  return LEGACY_TONE_CLASSES[tone] ?? TAG_BASE_CLASS;
+}
+
+/** Returns inline style string for tag color. Empty string for legacy tones (handled by classes). */
+export function functionalGroupTagStyle(tone: string): string {
+  if (LEGACY_TONE_CLASSES[tone]) return "";
+  const hue = parseInt(tone, 10);
+  if (isNaN(hue)) return "";
+  return `border-color: hsl(${hue} 60% 50% / 0.3); background-color: hsl(${hue} 60% 50% / 0.15); color: hsl(${hue} 70% 65%);`;
+}
+
+/** Returns the hue for any tone (legacy name or numeric string). */
+export function toneToHue(tone: string): number {
+  return LEGACY_TONE_HUES[tone] ?? (parseInt(tone, 10) || 270);
+}
+
+/** Returns the dot preview color for a given hue. */
+export function huePreviewColor(hue: number): string {
+  return `hsl(${hue} 70% 55%)`;
 }
 
 function createsPriorityParadox(rules: IncompatibilityRule[], allIds: string[]): boolean {

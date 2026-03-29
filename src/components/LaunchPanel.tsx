@@ -3,7 +3,7 @@ import { MOD_LOADERS } from "../lib/types";
 import {
   selectedMcVersion, setSelectedMcVersion,
   selectedModLoader, setSelectedModLoader,
-  minecraftVersions,
+  minecraftVersions, mcWithSnapshots, showSnapshots, setShowSnapshots,
   launchState, launchProgress, activeLaunchStage,
   launchLogs, logViewerOpen, setLogViewerOpen,
   activeAccount, accounts, setAccountsModalOpen,
@@ -168,11 +168,20 @@ export function LaunchPanel(props: LaunchPanelProps) {
                 onChange={e => { props.onVersionChange ? props.onVersionChange(e.currentTarget.value) : setSelectedMcVersion(e.currentTarget.value); }}
                 class="bg-transparent border-none text-xs text-textMuted focus:outline-none cursor-pointer"
               >
-                <For each={minecraftVersions()}>
+                <For each={showSnapshots() ? mcWithSnapshots() : minecraftVersions()}>
                   {v => <option value={v} class="bg-bgPanel">{v}</option>}
                 </For>
               </select>
             </div>
+            <label class="flex items-center gap-1 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={showSnapshots()}
+                onChange={e => setShowSnapshots(e.currentTarget.checked)}
+                class="accent-accentColor w-3 h-3"
+              />
+              <span class="text-xs text-textMuted">Show Snapshots</span>
+            </label>
           </div>
         </div>
 

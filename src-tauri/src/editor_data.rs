@@ -570,24 +570,62 @@ pub fn add_nested_alternative_from_root(
 pub fn remove_alternative_from_root(root_dir: &Path, input: &RemoveAlternativeInput) -> Result<()> {
     let mut modlist = load_modlist(root_dir, &input.modlist_name)?;
 
-    let parent = modlist
-        .find_rule_mut(&input.parent_mod_id)
-        .with_context(|| format!("rule '{}' not found", input.parent_mod_id))?;
+    // Extract the alternative from its parent (keeping all its data).
+    let extracted = extract_alternative(&mut modlist, &input.parent_mod_id, &input.alt_mod_id)?;
 
-    let initial_len = parent.alternatives.len();
-    parent
-        .alternatives
-        .retain(|alt| alt.mod_id != input.alt_mod_id);
-
-    if parent.alternatives.len() == initial_len {
-        bail!(
-            "alternative '{}' not found under rule '{}'",
-            input.alt_mod_id,
-            input.parent_mod_id
-        );
+    // Promote: insert the extracted rule at the same level as the parent.
+    if let Some(pos) = modlist.rules.iter().position(|r| r.mod_id == input.parent_mod_id) {
+        // Parent is a top-level rule → insert the alt as a new top-level rule right after it.
+        modlist.rules.insert(pos + 1, extracted);
+    } else {
+        // Parent is nested → insert as a sibling alternative of the parent (under grandparent).
+        insert_as_sibling(&mut modlist.rules, &input.parent_mod_id, extracted)?;
     }
 
     save_modlist(root_dir, &input.modlist_name, &modlist)
+}
+
+/// Remove the alternative with `alt_mod_id` from the rule with `parent_mod_id` and return it.
+fn extract_alternative(
+    modlist: &mut ModList,
+    parent_mod_id: &str,
+    alt_mod_id: &str,
+) -> Result<Rule> {
+    let parent = modlist
+        .find_rule_mut(parent_mod_id)
+        .with_context(|| format!("rule '{}' not found", parent_mod_id))?;
+
+    let pos = parent
+        .alternatives
+        .iter()
+        .position(|alt| alt.mod_id == alt_mod_id)
+        .with_context(|| {
+            format!(
+                "alternative '{}' not found under rule '{}'",
+                alt_mod_id, parent_mod_id
+            )
+        })?;
+
+    Ok(parent.alternatives.remove(pos))
+}
+
+/// Recursively find the rule whose alternatives contain `sibling_mod_id`,
+/// then insert `new_rule` right after that sibling in the alternatives list.
+fn insert_as_sibling(rules: &mut Vec<Rule>, sibling_mod_id: &str, new_rule: Rule) -> Result<()> {
+    for rule in rules.iter_mut() {
+        if let Some(pos) = rule
+            .alternatives
+            .iter()
+            .position(|a| a.mod_id == sibling_mod_id)
+        {
+            rule.alternatives.insert(pos + 1, new_rule);
+            return Ok(());
+        }
+        if insert_as_sibling(&mut rule.alternatives, sibling_mod_id, new_rule.clone()).is_ok() {
+            return Ok(());
+        }
+    }
+    bail!("could not find parent of '{}'", sibling_mod_id)
 }
 
 pub fn save_incompatibilities_from_root(

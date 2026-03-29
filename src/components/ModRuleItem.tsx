@@ -10,8 +10,9 @@ import {
   selectedIds, expandedRows, modIcons,
   functionalGroupsByBlockId, conflictModIds, conflictPairsForId, rowMap,
   aestheticGroups, removeRowsFromAestheticGroups,
-  toggleSelected, toggleExpanded, functionalGroupTagClass,
-  removeFunctionalGroupMember, tagFilter, functionalGroups, tagFilterForcedExpanded,
+  toggleSelected, toggleExpanded, functionalGroupTagClass, functionalGroupTagStyle,
+  removeFunctionalGroupMember,
+  tagFilter, functionalGroups, tagFilterForcedExpanded,
   linksByModId, removeLink, removeIncompatibility,
   setAdvancedPanelModId, selectedCount, resolvedModIds,
 } from "../store";
@@ -44,7 +45,7 @@ export function ModRuleItem(props: ModRuleItemProps) {
     aestheticGroups().find(group => group.blockIds.includes(props.row.id)) ?? null;
   const isResolved = () => {
     const ids = resolvedModIds();
-    if (ids.size === 0) return null; // resolution not yet run
+    if (ids === null) return null; // resolution not yet run
     return ids.has(props.row.primaryModId ?? props.row.id);
   };
 
@@ -207,7 +208,7 @@ export function ModRuleItem(props: ModRuleItemProps) {
             {/* Functional group tags */}
             <For each={fGroups()}>
               {g => (
-                <span class={functionalGroupTagClass(g.tone)}>
+                <span class={functionalGroupTagClass(g.tone)} style={functionalGroupTagStyle(g.tone)}>
                   {g.name}
                   <button
                     onClick={e => { e.stopPropagation(); removeFunctionalGroupMember(g.id, props.row.id); }}
@@ -221,6 +222,7 @@ export function ModRuleItem(props: ModRuleItemProps) {
                 </span>
               )}
             </For>
+
 
             {/* Link tags */}
             <For each={linksByModId().get(props.row.id) ?? []}>

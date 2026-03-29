@@ -5,7 +5,8 @@ use serde::Serialize;
 use tauri::State;
 
 use crate::launcher_paths::LauncherPaths;
-use crate::rules::{ModList, Rule, VersionRule, VersionRuleKind, RULES_FILENAME};
+use crate::modrinth::ModrinthClient;
+use crate::rules::{ModList, ModSource, Rule, VersionRule, VersionRuleKind, RULES_FILENAME};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolutionTarget {
@@ -194,7 +195,7 @@ fn parse_mod_loader(value: &str) -> Result<ModLoader> {
 
 /// Returns the set of active (resolved) mod IDs for a given modlist + version + loader.
 #[tauri::command]
-pub fn resolve_modlist_command(
+pub async fn resolve_modlist_command(
     launcher_paths: State<'_, LauncherPaths>,
     modlist_name: String,
     mc_version: String,
@@ -227,6 +228,45 @@ pub fn resolve_modlist_command(
             continue;
         }
         check_all_alts_recursive(rule, &mut ids, &target);
+    }
+
+    // ── Modrinth availability check ─────────────────────────────────────────
+    // For each resolved mod sourced from Modrinth, verify that a compatible
+    // version actually exists for the target MC version + loader.
+    let modrinth_ids: Vec<String> = ids
+        .iter()
+        .filter(|id| {
+            modlist
+                .find_rule(id)
+                .map_or(false, |rule| rule.source == ModSource::Modrinth)
+        })
+        .cloned()
+        .collect();
+
+    if !modrinth_ids.is_empty() {
+        let client = ModrinthClient::new();
+        let mut tasks = tokio::task::JoinSet::new();
+
+        for mod_id in modrinth_ids {
+            let client = client.clone();
+            let target = target.clone();
+            tasks.spawn(async move {
+                let available = client
+                    .fetch_project_versions(&mod_id, &target)
+                    .await
+                    .map(|v| !v.is_empty())
+                    .unwrap_or(true); // on network error, keep the mod
+                (mod_id, available)
+            });
+        }
+
+        while let Some(join_result) = tasks.join_next().await {
+            if let Ok((mod_id, available)) = join_result {
+                if !available {
+                    ids.remove(&mod_id);
+                }
+            }
+        }
     }
 
     Ok(ids.into_iter().collect())

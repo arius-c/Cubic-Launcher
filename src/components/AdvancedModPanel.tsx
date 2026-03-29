@@ -5,13 +5,15 @@ import {
   versionRules, addVersionRule, removeVersionRule, updateVersionRule,
   customConfigs, addCustomConfig, removeCustomConfig, updateCustomConfig,
   functionalGroups, functionalGroupsByBlockId, addModToFunctionalGroup, removeFunctionalGroupMember,
-  createFunctionalGroupForMod, functionalGroupTagClass,
+  createFunctionalGroupForMod, functionalGroupTagClass, functionalGroupTagStyle,
   savedLinks, setSavedLinks,
+  savedIncompatibilities, setSavedIncompatibilities, conflictPairsForId,
   linksByModId, rowMap,
   parentIdByChildId,
+  openAlternativesPanel,
 } from "../store";
 import { MOD_LOADERS } from "../lib/types";
-import { minecraftVersions } from "../store";
+import { minecraftVersions, mcWithSnapshots, showSnapshots, setShowSnapshots } from "../store";
 import { MaterialIcon, XIcon } from "./icons";
 
 const isTauri = () => "__TAURI_INTERNALS__" in window;
@@ -28,7 +30,7 @@ function SectionHeader(props: { title: string }) {
 }
 
 // ── Main component ─────────────────────────────────────────────────────────────
-export function AdvancedModPanel() {
+export function AdvancedModPanel(props: { onDelete?: (modId: string) => void }) {
   const row   = () => advancedPanelMod();
   const modId = () => advancedPanelModId()!;
 
@@ -112,6 +114,55 @@ export function AdvancedModPanel() {
   const parentRow = () => { const pid = parentId(); return pid ? rowMap().get(pid) : undefined; };
   const childRows = () => row()?.alternatives ?? [];
 
+  // ── Incompatibilities ──────────────────────────────────────────────────────
+  const [addingIncompat, setAddingIncompat]               = createSignal(false);
+  const [newIncompatPartnerId, setNewIncompatPartnerId]   = createSignal('');
+  const [newIncompatMeWins, setNewIncompatMeWins]         = createSignal(true);
+
+  const myIncompats = () => {
+    const me = modId();
+    return savedIncompatibilities()
+      .filter(r => r.winnerId === me || r.loserId === me)
+      .map(r => ({
+        otherId: r.winnerId === me ? r.loserId : r.winnerId,
+        meWins: r.winnerId === me,
+      }));
+  };
+
+  const availableIncompatPartners = () => {
+    const me = modId();
+    const existing = new Set(myIncompats().map(p => p.otherId));
+    return [...rowMap().entries()]
+      .filter(([id]) => id !== me && !existing.has(id))
+      .map(([id, r]) => ({ id, name: r.name }));
+  };
+
+  const commitIncompat = () => {
+    const partner = newIncompatPartnerId();
+    if (!partner) return;
+    const me = modId();
+    const winnerId = newIncompatMeWins() ? me : partner;
+    const loserId  = newIncompatMeWins() ? partner : me;
+    setSavedIncompatibilities(cur => [...cur, { winnerId, loserId }]);
+    setAddingIncompat(false); setNewIncompatPartnerId(''); setNewIncompatMeWins(true);
+  };
+
+  const swapIncompat = (otherId: string) => {
+    const me = modId();
+    setSavedIncompatibilities(cur => cur.map(r => {
+      if (r.winnerId === me && r.loserId === otherId) return { winnerId: otherId, loserId: me };
+      if (r.winnerId === otherId && r.loserId === me) return { winnerId: me, loserId: otherId };
+      return r;
+    }));
+  };
+
+  const removeIncompat = (otherId: string) => {
+    const me = modId();
+    setSavedIncompatibilities(cur => cur.filter(r =>
+      !((r.winnerId === me && r.loserId === otherId) || (r.winnerId === otherId && r.loserId === me))
+    ));
+  };
+
   // ── Custom Configs ─────────────────────────────────────────────────────────
   const myConfigs = () => customConfigs().filter(c => c.modId === modId());
 
@@ -175,7 +226,7 @@ export function AdvancedModPanel() {
                         class="rounded border border-border bg-input px-2 py-1 text-xs text-foreground"
                       >
                         <option value="">Any version</option>
-                        <For each={minecraftVersions()}>
+                        <For each={showSnapshots() ? mcWithSnapshots() : minecraftVersions()}>
                           {v => <option value={v}>{v}</option>}
                         </For>
                       </select>
@@ -216,7 +267,7 @@ export function AdvancedModPanel() {
                         class="rounded border border-border bg-input px-2 py-1 text-xs text-foreground"
                       >
                         <option value="">Select version…</option>
-                        <For each={minecraftVersions()}>
+                        <For each={showSnapshots() ? mcWithSnapshots() : minecraftVersions()}>
                           {v => <option value={v}>{v}</option>}
                         </For>
                       </select>
@@ -246,15 +297,26 @@ export function AdvancedModPanel() {
                   </div>
                 </Show>
 
-                <Show when={!addingRule()}>
-                  <button
-                    onClick={() => setAddingRule(true)}
-                    class="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
-                  >
-                    <MaterialIcon name="add" size="sm" />
-                    Add Rule
-                  </button>
-                </Show>
+                <div class="flex items-center justify-between">
+                  <Show when={!addingRule()}>
+                    <button
+                      onClick={() => setAddingRule(true)}
+                      class="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
+                    >
+                      <MaterialIcon name="add" size="sm" />
+                      Add Rule
+                    </button>
+                  </Show>
+                  <label class="flex items-center gap-1 cursor-pointer select-none ml-auto">
+                    <input
+                      type="checkbox"
+                      checked={showSnapshots()}
+                      onChange={e => setShowSnapshots(e.currentTarget.checked)}
+                      class="accent-accentColor w-3 h-3"
+                    />
+                    <span class="text-xs text-muted-foreground">Show Snapshots</span>
+                  </label>
+                </div>
               </div>
             </div>
 
@@ -265,7 +327,7 @@ export function AdvancedModPanel() {
                 <div class="flex flex-wrap gap-1.5">
                   <For each={myFGroups()}>
                     {g => (
-                      <span class={functionalGroupTagClass(g.tone)}>
+                      <span class={functionalGroupTagClass(g.tone)} style={functionalGroupTagStyle(g.tone)}>
                         {g.name}
                         <button
                           onClick={() => removeFunctionalGroupMember(g.id, modId())}
@@ -301,7 +363,7 @@ export function AdvancedModPanel() {
                             onClick={() => { addModToFunctionalGroup(g.id, modId()); setAddingTag(false); }}
                             class="w-full flex items-center gap-2 px-3 py-2 text-sm hover:bg-muted/30 transition-colors"
                           >
-                            <span class={functionalGroupTagClass(g.tone)}>{g.name}</span>
+                            <span class={functionalGroupTagClass(g.tone)} style={functionalGroupTagStyle(g.tone)}>{g.name}</span>
                           </button>
                         )}
                       </For>
@@ -429,7 +491,7 @@ export function AdvancedModPanel() {
                 </Show>
                 <Show when={childRows().length > 0}>
                   <div class="flex flex-wrap items-center gap-2">
-                    <span class="text-xs text-muted-foreground shrink-0">Children:</span>
+                    <span class="text-xs text-muted-foreground shrink-0">Alternatives:</span>
                     <For each={childRows()}>
                       {child => (
                         <button
@@ -443,7 +505,85 @@ export function AdvancedModPanel() {
                   </div>
                 </Show>
                 <Show when={!parentRow() && childRows().length === 0}>
-                  <span class="text-xs text-muted-foreground">No parent or child mods.</span>
+                  <span class="text-xs text-muted-foreground">No parent or alternatives.</span>
+                </Show>
+                <button
+                  onClick={() => openAlternativesPanel(modId())}
+                  class="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
+                >
+                  <MaterialIcon name="add" size="sm" />
+                  Add Alternative
+                </button>
+              </div>
+            </div>
+
+            {/* ── Incompatibilities ─────────────────────────────────── */}
+            <div>
+              <SectionHeader title="Incompatibilities" />
+              <div class="p-4 space-y-2">
+                <For each={myIncompats()}>
+                  {item => {
+                    const otherName = () => rowMap().get(item.otherId)?.name ?? item.otherId;
+                    return (
+                      <div class="flex items-center gap-2 rounded-md border border-border bg-background p-2">
+                        <span class="text-sm font-medium text-foreground truncate min-w-0 flex-1 text-right">{row()!.name}</span>
+                        <button
+                          onClick={() => swapIncompat(item.otherId)}
+                          class="shrink-0 rounded px-1.5 py-0.5 text-xs font-bold text-primary hover:bg-primary/20 transition-colors"
+                          title={item.meWins ? `${row()!.name} wins — click to swap` : `${otherName()} wins — click to swap`}
+                        >
+                          {item.meWins ? ">" : "<"}
+                        </button>
+                        <span class="text-sm font-medium text-foreground truncate min-w-0 flex-1">{otherName()}</span>
+                        <button
+                          onClick={() => removeIncompat(item.otherId)}
+                          class="shrink-0 flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-destructive/10 hover:text-destructive transition-colors"
+                        >
+                          <XIcon class="h-3.5 w-3.5" />
+                        </button>
+                      </div>
+                    );
+                  }}
+                </For>
+                <Show when={myIncompats().length === 0 && !addingIncompat()}>
+                  <span class="text-xs text-muted-foreground">No incompatibilities defined.</span>
+                </Show>
+
+                {/* Add incompatibility form */}
+                <Show when={addingIncompat()}>
+                  <div class="rounded-md border border-primary/30 bg-primary/5 p-3 space-y-2">
+                    <div class="flex items-center gap-2">
+                      <span class="text-sm font-medium text-foreground truncate min-w-0 flex-1 text-right">{row()!.name}</span>
+                      <button
+                        onClick={() => setNewIncompatMeWins(w => !w)}
+                        class="shrink-0 rounded px-1.5 py-0.5 text-xs font-bold text-primary hover:bg-primary/20 transition-colors"
+                        title="Click to swap direction"
+                      >
+                        {newIncompatMeWins() ? ">" : "<"}
+                      </button>
+                      <select
+                        value={newIncompatPartnerId()}
+                        onChange={e => setNewIncompatPartnerId(e.currentTarget.value)}
+                        class="flex-1 min-w-0 rounded border border-border bg-input px-2 py-1 text-xs text-foreground"
+                      >
+                        <option value="">Select mod…</option>
+                        <For each={availableIncompatPartners()}>
+                          {p => <option value={p.id}>{p.name}</option>}
+                        </For>
+                      </select>
+                    </div>
+                    <div class="flex gap-2">
+                      <button onClick={commitIncompat} disabled={!newIncompatPartnerId()} class="rounded-md bg-primary px-3 py-1 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50">Add</button>
+                      <button onClick={() => { setAddingIncompat(false); setNewIncompatPartnerId(''); }} class="rounded-md bg-secondary px-3 py-1 text-xs text-secondary-foreground hover:bg-secondary/80">Cancel</button>
+                    </div>
+                  </div>
+                </Show>
+
+                <Show when={!addingIncompat()}>
+                  <button onClick={() => setAddingIncompat(true)} class="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors">
+                    <MaterialIcon name="add" size="sm" />
+                    Add Incompatibility
+                  </button>
                 </Show>
               </div>
             </div>
@@ -542,6 +682,19 @@ export function AdvancedModPanel() {
               Add Custom Config
             </button>
           </div>
+
+          {/* ── Delete mod ──────────────────────────────────────────────── */}
+          <Show when={props.onDelete}>
+            <div class="border-t border-border p-4 shrink-0">
+              <button
+                onClick={() => { props.onDelete!(modId()); setAdvancedPanelModId(null); }}
+                class="flex w-full items-center justify-center gap-1.5 rounded-md border border-destructive/40 bg-destructive/10 px-4 py-2 text-sm font-medium text-destructive hover:bg-destructive/20 transition-colors"
+              >
+                <XIcon class="h-4 w-4" />
+                Delete Mod
+              </button>
+            </div>
+          </Show>
 
         </div>
       </div>

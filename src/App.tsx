@@ -26,7 +26,7 @@ import {
   alternativesPanelParent, setAlternativesPanelParentId,
   setAdvancedPanelModId, rowMap,
   launchState, selectedModList, setAppLoading, setModIcons, modIcons,
-  minecraftVersions, setMinecraftVersions,
+  minecraftVersions, setMinecraftVersions, setMcWithSnapshots,
   LAUNCH_STAGES, wait,
   versionRules, setVersionRules, customConfigs, setCustomConfigs,
   setResolvedModIds,
@@ -290,7 +290,7 @@ async function runResolution(modlistName?: string, mcVersion?: string, modLoader
     setResolvedModIds(new Set(activeIds));
   } catch (e) {
     logger.warn("App", "resolution failed", { error: e });
-    setResolvedModIds(new Set());
+    setResolvedModIds(null);
   }
 }
 
@@ -827,9 +827,10 @@ export default function App() {
 
       // Fetch MC versions first so the fallback in loadShellSnapshot is correct.
       {
-        const versions: string[] = await invoke("fetch_minecraft_versions_command");
-        logger.debug("App", "fetched minecraft versions", { count: versions.length });
-        if (versions.length > 0) setMinecraftVersions(versions);
+        const payload: { releases: string[]; withSnapshots: string[] } = await invoke("fetch_minecraft_versions_command");
+        logger.debug("App", "fetched minecraft versions", { releases: payload.releases.length, withSnapshots: payload.withSnapshots.length });
+        if (payload.releases.length > 0) setMinecraftVersions(payload.releases);
+        if (payload.withSnapshots.length > 0) setMcWithSnapshots(payload.withSnapshots);
       }
 
       // Load shell + editor from backend (stubs return empty defaults in browser mode)
@@ -1040,17 +1041,30 @@ export default function App() {
 
   const handleRemoveAlternative = async (altRowId: string) => {
     if (!isTauri()) {
-      setModRowsState(rows =>
-        rows
-          .filter(r => r.id !== altRowId)
-          .map(function removeDeep(r: ModRow): ModRow {
-            if (!r.alternatives?.length) return r;
-            const filtered = r.alternatives
-              .filter(a => a.id !== altRowId)
-              .map(removeDeep);
+      setModRowsState(rows => {
+        // Find and extract the alt, then promote it to its parent's level.
+        let extracted: ModRow | null = null;
+        let parentId: string | null = null;
+        const withoutAlt = rows.map(function removeDeep(r: ModRow): ModRow {
+          if (!r.alternatives?.length) return r;
+          const altIdx = r.alternatives.findIndex(a => a.id === altRowId);
+          if (altIdx !== -1) {
+            extracted = r.alternatives[altIdx];
+            parentId = r.id;
+            const filtered = [...r.alternatives.slice(0, altIdx), ...r.alternatives.slice(altIdx + 1)].map(removeDeep);
             return { ...r, alternatives: filtered };
-          })
-      );
+          }
+          return { ...r, alternatives: r.alternatives.map(removeDeep) };
+        });
+        if (!extracted) return withoutAlt;
+        // Insert after parent at the same level
+        const topIdx = withoutAlt.findIndex(r => r.id === parentId);
+        if (topIdx !== -1) {
+          return [...withoutAlt.slice(0, topIdx + 1), extracted, ...withoutAlt.slice(topIdx + 1)];
+        }
+        // Parent is nested — insert as sibling alt (simplified: append to top for now)
+        return [...withoutAlt, extracted];
+      });
       return;
     }
     if (!selectedModListName()) { logger.warn("App", "handleRemoveAlternative skipped — no modlist"); return; }
@@ -1573,7 +1587,7 @@ export default function App() {
       <FunctionalGroupModal />
       <LinkModal />
       <LinksOverviewModal />
-      <AdvancedModPanel />
+      <AdvancedModPanel onDelete={id => { setSelectedIds([id]); void handleDeleteSelected(); }} />
       <InstancePresentationModal onSave={handleSavePresentation} onDelete={handleDeleteModList} />
       <RenameRuleModal onRename={handleRenameRule} />
       <IncompatibilitiesModal onSave={handleSaveIncompatibilities} />
