@@ -36,6 +36,8 @@ export type ModrinthResult = {
   author: string;
   description: string;
   categories: string[];
+  iconUrl?: string;
+  downloads?: number;
 };
 
 export type AestheticGroup = {

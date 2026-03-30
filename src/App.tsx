@@ -640,11 +640,17 @@ function collectModrinthIds(rows: ModRow[]): Set<string> {
   return ids;
 }
 
-async function fetchModIcons(rows: ModRow[]) {
+/** Cache of slug → display name, persisted across reloads so names survive editor refreshes. */
+const modNameCache = new Map<string, string>();
+
+async function fetchModMetadata(rows: ModRow[]) {
   const ids = [...collectModrinthIds(rows)];
   if (ids.length === 0) return;
 
-  // Skip IDs we already have icons for
+  // Always patch names from cache first (instant, no network).
+  patchModNames();
+
+  // Fetch metadata for any IDs we haven't seen yet.
   const missing = ids.filter(id => !modIcons().has(id));
   if (missing.length === 0) return;
 
@@ -655,15 +661,41 @@ async function fetchModIcons(rows: ModRow[]) {
       { headers: { "User-Agent": "CubicLauncher/0.1.0" } }
     );
     if (!res.ok) return;
-    const projects: Array<{ slug: string; icon_url?: string | null }> = await res.json();
-    const updated = new Map(modIcons());
+    const projects: Array<{ id: string; slug: string; title: string; icon_url?: string | null }> = await res.json();
+    const updatedIcons = new Map(modIcons());
     for (const p of projects) {
-      if (p.slug && p.icon_url) updated.set(p.slug, p.icon_url);
+      // Store under both project ID and slug so lookups work regardless of
+      // which identifier the mod was originally added with.
+      if (p.icon_url) {
+        if (p.id) updatedIcons.set(p.id, p.icon_url);
+        if (p.slug) updatedIcons.set(p.slug, p.icon_url);
+      }
+      if (p.title) {
+        if (p.id) modNameCache.set(p.id, p.title);
+        if (p.slug) modNameCache.set(p.slug, p.title);
+      }
     }
-    setModIcons(updated);
+    setModIcons(updatedIcons);
+    patchModNames();
   } catch {
-    // Icons are decorative — swallow errors silently
+    // Metadata is best-effort — swallow errors silently
   }
+}
+
+/** Apply cached display names to any row still showing a slug/id as its name. */
+function patchModNames() {
+  if (modNameCache.size === 0) return;
+  setModRowsState(cur => cur.map(function patch(r: ModRow): ModRow {
+    const realName = r.modrinth_id ? modNameCache.get(r.modrinth_id) : undefined;
+    // Patch if the name still looks like a raw identifier (matches the modrinth_id).
+    const needsPatch = realName && (r.name === r.modrinth_id || r.name === r.primaryModId);
+    const nameFixed = needsPatch ? { ...r, name: realName } : r;
+    if (nameFixed.alternatives?.length) {
+      const patchedAlts = nameFixed.alternatives.map(patch);
+      return { ...nameFixed, alternatives: patchedAlts };
+    }
+    return nameFixed;
+  }));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -855,7 +887,7 @@ export default function App() {
         setLastSavedAdvanced(JSON.stringify({ links: serializeLinks(savedLinks()), vr: versionRules(), cc: customConfigs() }));
         setAdvancedReady(true);
         logger.debug("App", "boot completed", { firstList, rowCount: editorSnapshot?.rows?.length ?? modRowsState().length });
-        void fetchModIcons(modRowsState());
+        void fetchModMetadata(modRowsState());
         void runResolution(firstList, selectedMcVersion(), selectedModLoader());
       } else {
         logger.debug("App", "boot completed — no mod lists found");
@@ -907,7 +939,7 @@ export default function App() {
     setLinksReady(true);
     setLastSavedAdvanced(JSON.stringify({ links: serializeLinks(savedLinks()), vr: versionRules(), cc: customConfigs() }));
     setAdvancedReady(true);
-    void fetchModIcons(modRowsState());
+    void fetchModMetadata(modRowsState());
     void runResolution(name, selectedMcVersion(), selectedModLoader());
   };
 
@@ -1032,7 +1064,7 @@ export default function App() {
           parentNamePath,
         });
       }
-      void fetchModIcons(modRowsState());
+      void fetchModMetadata(modRowsState());
     } catch (err) {
       appendDebugTrace("alts.add.frontend", { status: "error", parentId, altRowId, detail: String(err) });
       pushUiError({ title: "Could not add alternative", message: "The mod could not be added as a fallback.", detail: String(err), severity: "error", scope: "launch" });
@@ -1191,7 +1223,7 @@ export default function App() {
       alternatives: [],
     };
     setModRowsState(c => [...c, tempRow]);
-    void fetchModIcons([tempRow]);
+    void fetchModMetadata([tempRow]);
 
     if (!isTauri()) { logger.warn("App", "handleAddModrinth skipped — no backend"); return; }
     try {

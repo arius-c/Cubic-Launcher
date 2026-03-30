@@ -55,11 +55,18 @@ pub enum FailureReason {
 }
 
 pub fn resolve_modlist(modlist: &ModList, target: &ResolutionTarget) -> Result<ResolutionResult> {
+    // ── Pre-process: strip mutual requires ──────────────────────────────────
+    // Mutual links (A requires B AND B requires A) create a deadlock — neither
+    // can activate first.  We detect these pairs across the entire rule tree
+    // and remove them so the normal resolution handles everything correctly.
+    let mut rules = modlist.rules.clone();
+    strip_mutual_requires(&mut rules);
+
     // ── Pass 1: sequential resolve to build the initial active set ────────────
     let mut active_mods = HashSet::new();
-    let mut resolved_rules = Vec::with_capacity(modlist.rules.len());
+    let mut resolved_rules = Vec::with_capacity(rules.len());
 
-    for rule in &modlist.rules {
+    for rule in &rules {
         let outcome = try_resolve(rule, &active_mods, target);
         if let RuleOutcome::Resolved { ref resolved_id } = outcome {
             active_mods.insert(resolved_id.clone());
@@ -71,13 +78,10 @@ pub fn resolve_modlist(modlist: &ModList, target: &ResolutionTarget) -> Result<R
     }
 
     // ── Pass 2: re-check each rule against the FULL active set ───────────────
-    // Pass 1 is sequential, so a loser that appears before its winner won't see
-    // the winner in active_mods.  Pass 2 uses the complete set from pass 1 to
-    // retroactively exclude those losers.
     let full_active = active_mods.clone();
     let mut final_active = HashSet::new();
 
-    for (i, rule) in modlist.rules.iter().enumerate() {
+    for (i, rule) in rules.iter().enumerate() {
         let outcome = try_resolve(rule, &full_active, target);
         if let RuleOutcome::Resolved { ref resolved_id } = outcome {
             final_active.insert(resolved_id.clone());
@@ -92,6 +96,47 @@ pub fn resolve_modlist(modlist: &ModList, target: &ResolutionTarget) -> Result<R
         active_mods: final_active,
         resolved_rules,
     })
+}
+
+/// Collect all mod IDs and their requires across the entire rule tree.
+fn collect_all_requires(rules: &[Rule]) -> Vec<(String, Vec<String>)> {
+    let mut result = Vec::new();
+    for rule in rules {
+        result.push((rule.mod_id.clone(), rule.requires.clone()));
+        result.extend(collect_all_requires(&rule.alternatives));
+    }
+    result
+}
+
+/// Detect mutual requires (A requires B AND B requires A) and remove both
+/// directions so the resolver doesn't deadlock.
+fn strip_mutual_requires(rules: &mut Vec<Rule>) {
+    // Build a set of all mutual pairs.
+    let all_reqs = collect_all_requires(rules);
+    let req_set: HashSet<(&str, &str)> = all_reqs
+        .iter()
+        .flat_map(|(from, tos)| tos.iter().map(move |to| (from.as_str(), to.as_str())))
+        .collect();
+
+    let mut mutual_pairs = HashSet::new();
+    for &(a, b) in &req_set {
+        if req_set.contains(&(b, a)) {
+            mutual_pairs.insert((a.to_string(), b.to_string()));
+        }
+    }
+
+    if mutual_pairs.is_empty() {
+        return;
+    }
+
+    // Recursively remove mutual requires from all rules.
+    fn remove_mutual(rules: &mut Vec<Rule>, pairs: &HashSet<(String, String)>) {
+        for rule in rules.iter_mut() {
+            rule.requires.retain(|req| !pairs.contains(&(rule.mod_id.clone(), req.clone())));
+            remove_mutual(&mut rule.alternatives, pairs);
+        }
+    }
+    remove_mutual(rules, &mutual_pairs);
 }
 
 fn try_resolve(
@@ -264,6 +309,24 @@ pub async fn resolve_modlist_command(
             if let Ok((mod_id, available)) = join_result {
                 if !available {
                     ids.remove(&mod_id);
+                }
+            }
+        }
+    }
+
+    // ── Cascade: remove mods whose requires are unsatisfied ────────────────
+    // The Modrinth check (or version rules) may have removed a mod that
+    // others depend on.  Iteratively remove any mod whose original requires
+    // are no longer fully satisfied.
+    let mut cascade_changed = true;
+    while cascade_changed {
+        cascade_changed = false;
+        let snapshot: Vec<String> = ids.iter().cloned().collect();
+        for mod_id in &snapshot {
+            if let Some(rule) = modlist.find_rule(mod_id) {
+                if rule.requires.iter().any(|req| !ids.contains(req)) {
+                    ids.remove(mod_id);
+                    cascade_changed = true;
                 }
             }
         }

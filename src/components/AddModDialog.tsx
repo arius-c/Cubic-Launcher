@@ -14,9 +14,16 @@ interface AddModDialogProps {
   onUploadLocal: () => Promise<void>;
 }
 
+function formatDownloads(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+  return String(n);
+}
+
 // ── Modrinth search ────────────────────────────────────────────────────────────
 
 interface ModrinthHit {
+  slug: string;
   project_id: string;
   title: string;
   description: string;
@@ -35,11 +42,13 @@ async function searchModrinth(query: string): Promise<ModrinthResult[]> {
     if (!res.ok) throw new Error(`Modrinth returned HTTP ${res.status}`);
     const data: { hits: ModrinthHit[] } = await res.json();
     return data.hits.map(h => ({
-      id: h.project_id,
+      id: h.slug || h.project_id,
       name: h.title,
       author: h.author,
       description: h.description,
       categories: h.categories.slice(0, 3),
+      iconUrl: h.icon_url,
+      downloads: h.downloads,
     }));
   } catch {
     // Fall back to local mock on network failure or CORS
@@ -195,12 +204,20 @@ export function AddModDialog(props: AddModDialogProps) {
                   <Show when={searching()}>
                     <Loader2Icon class="absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 animate-spin text-muted-foreground" />
                   </Show>
+                  <Show when={addModSearch()}>
+                    <button
+                      onClick={() => setAddModSearch("")}
+                      class="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground transition-colors"
+                    >
+                      <XIcon class="h-4 w-4" />
+                    </button>
+                  </Show>
                   <input
                     type="text"
-                    placeholder="Search mods on Modrinth…"
+                    placeholder="Search mods..."
                     value={addModSearch()}
                     onInput={e => setAddModSearch(e.currentTarget.value)}
-                    class="h-10 w-full rounded-md border border-input bg-input pl-10 pr-10 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+                    class="h-11 w-full rounded-xl border border-input bg-input pl-10 pr-10 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/50 focus:border-primary transition-all"
                     autofocus
                   />
                 </div>
@@ -211,49 +228,60 @@ export function AddModDialog(props: AddModDialogProps) {
                   </p>
                 </Show>
 
-                <div class="space-y-2">
+                <div class="space-y-1.5">
                   <For each={searchResults()}>
                     {mod => {
                       const isAdded  = () => addedIds().has(mod.id);
                       const isAdding = () => addingIds().has(mod.id);
 
                       return (
-                        <div class="flex items-start gap-3 rounded-md border border-border bg-background p-3 transition-colors hover:bg-muted/30">
-                          <div class="flex h-12 w-12 shrink-0 items-center justify-center rounded-md bg-muted">
-                            <PackageIcon class="h-6 w-6 text-muted-foreground" />
-                          </div>
+                        <div class="flex items-center gap-3 rounded-lg p-2.5 transition-colors hover:bg-muted/40 cursor-pointer group" onClick={() => { if (!isAdded() && !isAdding()) void handleAdd(mod.id, mod.name); }}>
+                          <Show when={mod.iconUrl} fallback={
+                            <div class="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg bg-muted">
+                              <PackageIcon class="h-5 w-5 text-muted-foreground" />
+                            </div>
+                          }>
+                            <img src={mod.iconUrl} alt="" class="h-11 w-11 shrink-0 rounded-lg object-cover bg-muted" loading="lazy" />
+                          </Show>
                           <div class="min-w-0 flex-1">
-                            <div class="flex flex-wrap items-center gap-2">
-                              <span class="font-medium text-foreground">{mod.name}</span>
-                              <For each={mod.categories.slice(0, 2)}>
+                            <div class="flex items-center gap-2">
+                              <span class="font-semibold text-sm text-foreground truncate">{mod.name}</span>
+                              <span class="text-xs text-muted-foreground shrink-0">by {mod.author}</span>
+                            </div>
+                            <p class="line-clamp-1 text-xs text-muted-foreground mt-0.5">{mod.description}</p>
+                            <div class="flex items-center gap-2 mt-0.5">
+                              <Show when={mod.downloads != null}>
+                                <span class="text-[10px] text-muted-foreground/70">{formatDownloads(mod.downloads!)} downloads</span>
+                              </Show>
+                              <For each={mod.categories.slice(0, 3)}>
                                 {cat => (
-                                  <span class="rounded-md border border-border bg-secondary px-1.5 py-0.5 text-[10px] text-secondary-foreground">
+                                  <span class="rounded px-1 py-px text-[10px] text-muted-foreground/70 bg-muted">
                                     {cat}
                                   </span>
                                 )}
                               </For>
                             </div>
-                            <p class="mt-0.5 line-clamp-2 text-sm text-muted-foreground">{mod.description}</p>
-                            <p class="mt-1 text-xs text-muted-foreground">by {mod.author}</p>
                           </div>
-                          <button
-                            onClick={() => void handleAdd(mod.id, mod.name)}
-                            disabled={isAdded() || isAdding()}
-                            class={`flex h-8 shrink-0 items-center gap-1.5 rounded-md px-3 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${
-                              isAdded()
-                                ? "bg-success/20 text-success"
-                                : "bg-primary text-primary-foreground hover:bg-primary/90"
-                            }`}
-                          >
+                          <div class="shrink-0">
+                            <Show when={isAdded()}>
+                              <span class="flex h-8 items-center gap-1 rounded-lg px-3 text-xs font-medium bg-green-500/15 text-green-500">
+                                <CheckIcon class="h-3.5 w-3.5" />
+                                Added
+                              </span>
+                            </Show>
                             <Show when={isAdding()}>
-                              <Loader2Icon class="h-3.5 w-3.5 animate-spin" />
+                              <span class="flex h-8 items-center rounded-lg px-3">
+                                <Loader2Icon class="h-4 w-4 animate-spin text-muted-foreground" />
+                              </span>
                             </Show>
-                            <Show when={isAdded() && !isAdding()}>
-                              <CheckIcon class="h-3.5 w-3.5" />
-                              Added
+                            <Show when={!isAdded() && !isAdding()}>
+                              <button
+                                class="flex h-8 items-center rounded-lg px-3 text-xs font-medium bg-primary text-primary-foreground hover:bg-primary/90 opacity-0 group-hover:opacity-100 transition-opacity"
+                              >
+                                Install
+                              </button>
                             </Show>
-                            <Show when={!isAdded() && !isAdding()}>Add</Show>
-                          </button>
+                          </div>
                         </div>
                       );
                     }}

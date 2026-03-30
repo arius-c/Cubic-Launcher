@@ -224,39 +224,52 @@ export function ModRuleItem(props: ModRuleItemProps) {
             </For>
 
 
-            {/* Link tags */}
-            <For each={linksByModId().get(props.row.id) ?? []}>
-              {link => {
-                const partnerName = () => rowMap().get(link.partnerId)?.name ?? link.partnerId;
-                const icon = () =>
-                  link.direction === "mutual" ? "\u21C4"
-                  : link.direction === "requires" ? "\u2192"
-                  : "\u2190";
-                const label = () => `${icon()} ${partnerName()}`;
-                const title = () =>
-                  link.direction === "mutual" ? `Linked with ${partnerName()} (mutual)`
-                  : link.direction === "requires" ? `Requires ${partnerName()}`
-                  : `Required by ${partnerName()}`;
+            {/* Links badge with dropdown */}
+            <Show when={(linksByModId().get(props.row.id) ?? []).length > 0}>
+              {(() => {
+                const [linksOpen, setLinksOpen] = createSignal(false);
+                const myLinks = () => linksByModId().get(props.row.id) ?? [];
                 return (
-                  <span
-                    title={title()}
-                    class="inline-flex items-center gap-0.5 rounded-md border border-cyan-500/30 bg-cyan-500/10 px-1.5 py-0.5 text-[10px] font-medium text-cyan-400"
-                  >
-                    <MaterialIcon name="link" size="sm" class="-ml-0.5" />
-                    {label()}
+                  <div class="relative inline-block" onPointerDown={stopDragPropagation} onMouseDown={stopDragPropagation}>
                     <button
-                      onClick={e => { e.stopPropagation(); removeLink(props.row.id, link.partnerId); }}
-                      onPointerDown={stopDragPropagation}
-                      onMouseDown={stopDragPropagation}
-                      class="ml-0.5 opacity-40 hover:opacity-100 transition-opacity"
-                      title={`Remove link with "${partnerName()}"`}
+                      onClick={e => { e.stopPropagation(); setLinksOpen(o => !o); }}
+                      class="inline-flex items-center gap-0.5 rounded-md border border-cyan-500/30 bg-cyan-500/10 px-1.5 py-0.5 text-[10px] font-medium text-cyan-400 hover:bg-cyan-500/20 transition-colors"
                     >
-                      <XIcon class="h-2.5 w-2.5" />
+                      <MaterialIcon name="link" size="sm" class="-ml-0.5" />
+                      Links ({myLinks().length})
                     </button>
-                  </span>
+                    <Show when={linksOpen()}>
+                      <div class="fixed inset-0 z-10" onClick={() => setLinksOpen(false)} />
+                      <div class="absolute left-0 top-full mt-1 z-20 min-w-[220px] rounded-lg border border-border bg-card shadow-lg overflow-hidden">
+                        <For each={myLinks()}>
+                          {link => {
+                            const partnerName = () => rowMap().get(link.partnerId)?.name ?? link.partnerId;
+                            const arrow = () =>
+                              link.direction === "mutual" ? "\u21C4"
+                              : link.direction === "requires" ? "\u2192"
+                              : "\u2190";
+                            return (
+                              <div class="flex items-center gap-1.5 px-3 py-1.5 text-xs hover:bg-muted/30">
+                                <span class="truncate text-foreground">{props.row.name}</span>
+                                <span class="text-cyan-400 shrink-0 font-bold">{arrow()}</span>
+                                <span class="truncate text-foreground flex-1">{partnerName()}</span>
+                                <button
+                                  onClick={e => { e.stopPropagation(); removeLink(props.row.id, link.partnerId); }}
+                                  class="shrink-0 text-muted-foreground hover:text-destructive transition-colors"
+                                  title={`Remove link`}
+                                >
+                                  <XIcon class="h-3 w-3" />
+                                </button>
+                              </div>
+                            );
+                          }}
+                        </For>
+                      </div>
+                    </Show>
+                  </div>
                 );
-              }}
-            </For>
+              })()}
+            </Show>
           </div>
 
           <Show when={props.row.modrinth_id && !isLocal()}>
