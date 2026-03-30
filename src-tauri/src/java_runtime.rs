@@ -42,10 +42,14 @@ pub struct CommandJavaBinaryInspector;
 
 impl JavaBinaryInspector for CommandJavaBinaryInspector {
     fn inspect(&self, path: &Path) -> Result<Option<JavaProbe>> {
-        let output = Command::new(path)
-            .arg("-version")
-            .output()
-            .with_context(|| format!("failed to execute '{}' with -version", path.display()))?;
+        if !path.exists() {
+            return Ok(None);
+        }
+
+        let output = match Command::new(path).arg("-version").output() {
+            Ok(output) => output,
+            Err(_) => return Ok(None), // binary not executable or missing
+        };
 
         let combined_output = format!(
             "{}\n{}",
@@ -161,13 +165,20 @@ pub fn select_java_for_minecraft(
 ) -> Result<Option<JavaInstallation>> {
     let required_version = required_java_version_for_minecraft(minecraft_version)?;
 
+    // Prefer exact match, but accept any version >= required (Java is backward compatible).
+    // Among compatible versions, prefer the closest to the required version.
     Ok(installations
         .iter()
-        .filter(|installation| installation.version == required_version)
+        .filter(|installation| installation.version >= required_version)
         .cloned()
         .min_by(|left, right| {
-            left.source
-                .cmp(&right.source)
+            // Prefer exact match over higher versions.
+            let left_exact = left.version == required_version;
+            let right_exact = right.version == required_version;
+            right_exact
+                .cmp(&left_exact)
+                .then(left.version.cmp(&right.version))
+                .then(left.source.cmp(&right.source))
                 .then(left.path.cmp(&right.path))
         }))
 }
@@ -188,6 +199,12 @@ pub fn required_java_version_for_minecraft(minecraft_version: &str) -> Result<u3
     let minor = parts[1];
     let patch = parts.get(2).copied().unwrap_or(0);
 
+    // New format from 2026: year.drop (e.g. 26.1 = first drop of 2026).
+    // 26.1+ requires Java 25.
+    if major >= 26 {
+        return Ok(25);
+    }
+
     if major != 1 {
         bail!("unsupported Minecraft major version '{minecraft_version}'");
     }
@@ -197,6 +214,7 @@ pub fn required_java_version_for_minecraft(minecraft_version: &str) -> Result<u3
         17 => 16,
         18 | 19 => 17,
         20 if patch <= 4 => 17,
+        21..=255 => 21,
         _ => 21,
     };
 
@@ -249,6 +267,8 @@ pub fn candidates_from_java_home_root(
 
     let mut candidates = java_binary_candidates_for_home(root, source);
 
+    // Scan two levels deep to find Adoptium-style layouts:
+    // java-runtimes/java-25/jdk-25.0.1+9-jre/bin/java.exe
     for entry in std::fs::read_dir(root)
         .with_context(|| format!("failed to scan Java root directory {}", root.display()))?
     {
@@ -258,7 +278,19 @@ pub fn candidates_from_java_home_root(
                 root.display()
             )
         })?;
-        candidates.extend(java_binary_candidates_for_home(&entry.path(), source));
+        let child = entry.path();
+        candidates.extend(java_binary_candidates_for_home(&child, source));
+
+        // Second level: scan subdirectories of each child.
+        if child.is_dir() {
+            if let Ok(grandchildren) = std::fs::read_dir(&child) {
+                for gc in grandchildren.flatten() {
+                    if gc.path().is_dir() {
+                        candidates.extend(java_binary_candidates_for_home(&gc.path(), source));
+                    }
+                }
+            }
+        }
     }
 
     deduplicate_candidates(candidates)

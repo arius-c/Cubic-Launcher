@@ -1,5 +1,6 @@
 import { createEffect, createSignal, onMount, onCleanup, batch } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { appendDebugTrace } from "./lib/debugTrace";
 import { logger } from "./lib/logger";
 import { updateAltsDeep } from "./lib/dragUtils";
@@ -893,6 +894,32 @@ export default function App() {
         logger.debug("App", "boot completed — no mod lists found");
       }
 
+      // ── Register Tauri event listeners ──────────────────────────────────
+      if (isTauri()) {
+        unlisteners.push(await listen<{ state: string; progress: number; stage: string; detail: string }>("launch-progress", (event) => {
+          const { state, progress, stage, detail } = event.payload;
+          setLaunchState(state as "idle" | "resolving" | "ready" | "running");
+          setLaunchProgress(progress);
+          setLaunchStageLabel(stage);
+          setLaunchStageDetail(detail);
+        }));
+
+        unlisteners.push(await listen<{ stream: string; line: string }>("minecraft-log", (event) => {
+          setLaunchLogs(cur => [...cur, event.payload.line]);
+        }));
+
+        unlisteners.push(await listen<{ title: string; message: string; detail: string }>("launcher-error", (event) => {
+          pushUiError({ title: event.payload.title, message: event.payload.message, detail: event.payload.detail, severity: "error", scope: "launch" });
+        }));
+
+        unlisteners.push(await listen<{ success: boolean; exitCode: number | null }>("minecraft-exit", (event) => {
+          setLaunchState("idle");
+          setLaunchProgress(0);
+          setLaunchStageLabel("Ready");
+          setLaunchStageDetail(event.payload.success ? "Minecraft exited normally." : `Minecraft exited with code ${event.payload.exitCode ?? "unknown"}.`);
+        }));
+      }
+
       if (disposed) unlisteners.forEach(u => u());
     };
 
@@ -1626,7 +1653,6 @@ export default function App() {
       <AlternativesPanel onSave={handleSaveAlternativeOrder} onAddAlternative={handleAddAlternative} onRemoveAlternative={handleRemoveAlternative} />
       <ErrorCenter />
       <ExportModal onExport={handleExport} />
-      <DebugPanel />
     </div>
   );
 }

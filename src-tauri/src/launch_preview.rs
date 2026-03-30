@@ -8,6 +8,7 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, State};
 
+use crate::adoptium::{AdoptiumClient, host_adoptium_os, normalize_adoptium_architecture, plan_runtime_download};
 use crate::app_shell::{load_shell_snapshot_from_root, ShellGlobalSettings, ShellModListOverrides};
 use crate::minecraft_downloader::{ensure_minecraft_version, extract_natives};
 use crate::dependencies::{resolve_required_dependencies_with_client, DependencyLink};
@@ -30,15 +31,20 @@ use crate::process_streaming::{
     TauriProcessEventSink, MINECRAFT_LOG_EVENT,
 };
 use crate::resolver::{
-    resolve_modlist, find_resolved_rule, ModLoader, ResolutionResult, ResolutionTarget,
+    resolve_modlist, ModLoader, ResolutionResult, ResolutionTarget,
     FailureReason, RuleOutcome,
 };
-use crate::rules::{ModList, ModSource, RULES_FILENAME};
+use crate::rules::{ModList, ModSource, Rule, RULES_FILENAME};
 use crate::token_storage::KeyringSecretStore;
+
+use std::sync::Mutex;
 
 pub const LAUNCH_PROGRESS_EVENT: &str = "launch-progress";
 const DOWNLOAD_PROGRESS_EVENT: &str = "download-progress";
 const LAUNCHER_ERROR_EVENT: &str = "launcher-error";
+
+/// Tracks the PID of the currently running Minecraft process so it can be killed.
+static ACTIVE_MC_PID: Mutex<Option<u32>> = Mutex::new(None);
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -153,6 +159,27 @@ pub fn start_launch_command(
     Ok(())
 }
 
+/// Kills the currently running Minecraft process, if any.
+#[tauri::command]
+pub fn stop_minecraft_command() -> Result<(), String> {
+    let pid = ACTIVE_MC_PID.lock().unwrap().take();
+    if let Some(pid) = pid {
+        #[cfg(target_os = "windows")]
+        {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/F", "/PID", &pid.to_string()])
+                .output();
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            unsafe { libc::kill(pid as i32, libc::SIGTERM); }
+        }
+        Ok(())
+    } else {
+        Err("No Minecraft process is running.".into())
+    }
+}
+
 async fn run_launch_pipeline(
     app_handle: tauri::AppHandle,
     launcher_paths: LauncherPaths,
@@ -198,10 +225,10 @@ async fn run_launch_pipeline(
     let resolution = resolve_modlist(&modlist, &target)?;
     log_resolution(&app_handle, &resolution)?;
 
-    let selected_mods = collect_selected_mods(&modlist, &resolution);
+    let selected_mods = collect_selected_mods(&modlist, &resolution, &target);
     let compatible_versions =
         prefetch_compatible_versions_for_selected(&selected_mods, &modrinth_client, &target).await?;
-    let parent_versions = collect_resolved_parent_versions(&selected_mods, &compatible_versions)?;
+    let parent_versions = collect_resolved_parent_versions(&selected_mods, &compatible_versions);
     let dependency_resolution =
         resolve_required_dependencies_with_client(&parent_versions, &target, &modrinth_client)
             .await?;
@@ -334,7 +361,7 @@ async fn run_launch_pipeline(
     );
     substitute_loader_placeholders(&mut loader_metadata, &placeholders);
 
-    let java_binary_path = select_java_binary(&launcher_paths, &effective_settings, &target)?;
+    let java_binary_path = select_or_download_java(&app_handle, &launcher_paths, &effective_settings, &target).await?;
     emit_log(
         &app_handle,
         ProcessLogStream::Stdout,
@@ -365,21 +392,35 @@ async fn run_launch_pipeline(
     let sink: Arc<dyn ProcessEventSink> = Arc::new(TauriProcessEventSink::new(app_handle.clone()));
     let process = spawn_and_stream_process(prepared_command, sink)?;
 
+    let pid = process.pid;
+    *ACTIVE_MC_PID.lock().unwrap() = Some(pid);
+
     emit_progress(
         &app_handle,
         "running",
         100,
         "Launching Minecraft",
-        &format!("Minecraft process started with PID {}.", process.pid),
+        &format!("Minecraft process started with PID {}.", pid),
     )?;
     emit_log(
         &app_handle,
         ProcessLogStream::Stdout,
-        format!(
-            "[Launch] Spawned Minecraft process with PID {}",
-            process.pid
-        ),
+        format!("[Launch] Spawned Minecraft process with PID {}", pid),
     )?;
+
+    // Wait for exit in background and clear the stored PID.
+    let app_for_wait = app_handle.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _ = process.wait();
+        *ACTIVE_MC_PID.lock().unwrap() = None;
+        let _ = emit_progress(
+            &app_for_wait,
+            "idle",
+            0,
+            "Ready",
+            "Minecraft has exited.",
+        );
+    });
 
     Ok(())
 }
@@ -553,17 +594,38 @@ fn describe_failure_reason(reason: FailureReason) -> &'static str {
     }
 }
 
-/// Collect the actually-resolved mods from the resolution, looking up Rule data in the modlist.
-fn collect_selected_mods(modlist: &ModList, resolution: &ResolutionResult) -> Vec<SelectedMod> {
+/// Collect mods for launch.  When a primary resolves, only it is included.
+/// When a primary fails, all of its DIRECT alternatives that individually
+/// pass (exclude_if, requires, version_rules) are included.
+fn collect_selected_mods(
+    modlist: &ModList,
+    resolution: &ResolutionResult,
+    target: &ResolutionTarget,
+) -> Vec<SelectedMod> {
     let mut selected = Vec::new();
+    let active: HashSet<String> = resolution.active_mods.clone();
 
     for (i, resolved) in resolution.resolved_rules.iter().enumerate() {
-        if let Some(top_rule) = modlist.rules.get(i) {
-            if let Some(actual_rule) = find_resolved_rule(top_rule, &resolved.outcome) {
+        let Some(top_rule) = modlist.rules.get(i) else { continue };
+
+        match &resolved.outcome {
+            RuleOutcome::Resolved { resolved_id } if *resolved_id == top_rule.mod_id => {
+                // Primary resolved — include only it.
                 selected.push(SelectedMod {
-                    mod_id: actual_rule.mod_id.clone(),
-                    source: actual_rule.source.clone(),
+                    mod_id: top_rule.mod_id.clone(),
+                    source: top_rule.source.clone(),
                 });
+            }
+            _ => {
+                // Primary failed — include every DIRECT viable alternative.
+                for alt in &top_rule.alternatives {
+                    if alt_viable_for_launch(alt, &active, target) {
+                        selected.push(SelectedMod {
+                            mod_id: alt.mod_id.clone(),
+                            source: alt.source.clone(),
+                        });
+                    }
+                }
             }
         }
     }
@@ -571,10 +633,39 @@ fn collect_selected_mods(modlist: &ModList, resolution: &ResolutionResult) -> Ve
     selected
 }
 
+fn alt_viable_for_launch(
+    rule: &Rule,
+    active_mods: &HashSet<String>,
+    target: &ResolutionTarget,
+) -> bool {
+    use crate::rules::VersionRuleKind;
+    if rule.exclude_if.iter().any(|id| active_mods.contains(id)) {
+        return false;
+    }
+    if rule.requires.iter().any(|id| !active_mods.contains(id)) {
+        return false;
+    }
+    for vr in &rule.version_rules {
+        let version_matches = vr.mc_versions.iter().any(|v| v == &target.minecraft_version);
+        let vr_loader = vr.loader.to_ascii_lowercase();
+        let loader_matches =
+            vr_loader == "any" || vr_loader == target.mod_loader.as_modrinth_loader();
+        match vr.kind {
+            VersionRuleKind::Only => {
+                if !(version_matches && loader_matches) { return false; }
+            }
+            VersionRuleKind::Exclude => {
+                if version_matches && loader_matches { return false; }
+            }
+        }
+    }
+    true
+}
+
 fn collect_resolved_parent_versions(
     selected_mods: &[SelectedMod],
     compatible_versions: &HashMap<String, ModrinthVersion>,
-) -> Result<Vec<ModrinthVersion>> {
+) -> Vec<ModrinthVersion> {
     let mut versions = Vec::new();
     let mut seen_projects = HashSet::new();
 
@@ -585,18 +676,15 @@ fn collect_resolved_parent_versions(
             continue;
         }
 
-        let version = compatible_versions
-            .get(&selected.mod_id)
-            .with_context(|| {
-                format!(
-                    "resolved Modrinth project '{}' did not have a prefetched compatible version",
-                    selected.mod_id
-                )
-            })?;
-        versions.push(version.clone());
+        // Skip mods that have no compatible version on Modrinth for this
+        // target — they were resolved by local rules but simply don't have
+        // a release for this MC version + loader.
+        if let Some(version) = compatible_versions.get(&selected.mod_id) {
+            versions.push(version.clone());
+        }
     }
 
-    Ok(versions)
+    versions
 }
 
 async fn fetch_dependency_versions(
@@ -828,14 +916,22 @@ async fn materialize_loader_libraries(
     let mut paths = Vec::new();
 
     for library in &loader_metadata.libraries {
-        let Some(download) = library.download.as_ref() else {
-            continue;
-        };
         let relative_path = relative_loader_library_path(library)?;
-        let destination_path = library_root.join(relative_path);
+        let destination_path = library_root.join(&relative_path);
 
         if !destination_path.exists() {
-            download_file(http_client, &download.url, &destination_path).await?;
+            // Determine the download URL: prefer explicit download artifact,
+            // fall back to constructing from Maven base URL + coordinates.
+            let download_url = if let Some(download) = &library.download {
+                download.url.clone()
+            } else if let Some(base_url) = &library.url {
+                let base = base_url.trim_end_matches('/');
+                format!("{base}/{}", relative_path.to_string_lossy().replace('\\', "/"))
+            } else {
+                continue; // no way to obtain this library
+            };
+
+            download_file(http_client, &download_url, &destination_path).await?;
         }
 
         paths.push(destination_path);
@@ -905,7 +1001,8 @@ fn load_player_identity(launcher_paths: &LauncherPaths) -> Result<PlayerIdentity
     })
 }
 
-fn select_java_binary(
+async fn select_or_download_java(
+    app_handle: &tauri::AppHandle,
     launcher_paths: &LauncherPaths,
     settings: &EffectiveLaunchSettings,
     target: &ResolutionTarget,
@@ -917,9 +1014,9 @@ fn select_java_binary(
             .with_context(|| format!("failed to inspect Java override at {}", path.display()))?
             .with_context(|| format!("Java override '{}' is not runnable", path.display()))?;
         let required = required_java_version_for_minecraft(&target.minecraft_version)?;
-        if probe.version != required {
+        if probe.version < required {
             bail!(
-                "Java override '{}' reports version {}, but Minecraft {} requires Java {}",
+                "Java override '{}' reports version {}, but Minecraft {} requires Java {} or higher",
                 path.display(),
                 probe.version,
                 target.minecraft_version,
@@ -939,12 +1036,78 @@ fn select_java_binary(
     })?;
     persist_java_installations(&connection, &installations)?;
 
+    if let Some(installation) = select_java_for_minecraft(&installations, &target.minecraft_version)? {
+        return Ok(installation.path);
+    }
+
+    // No suitable Java found — auto-download via Adoptium.
+    let required = required_java_version_for_minecraft(&target.minecraft_version)?;
+    emit_log(
+        app_handle,
+        ProcessLogStream::Stdout,
+        format!("[Java] No Java {} found, downloading from Adoptium...", required),
+    )?;
+    emit_progress(
+        app_handle,
+        "resolving",
+        85,
+        "Downloading Java",
+        &format!("Fetching Java {} runtime from Adoptium.", required),
+    )?;
+
+    let adoptium = AdoptiumClient::new();
+    let os = host_adoptium_os();
+    let arch = normalize_adoptium_architecture(std::env::consts::ARCH);
+
+    let package = adoptium
+        .fetch_latest_jre_package(required, os, arch)
+        .await?
+        .with_context(|| format!("Adoptium has no JRE {} for {}/{}", required, os, arch))?;
+
+    let plan = plan_runtime_download(
+        launcher_paths.java_runtimes_dir(),
+        required,
+        package,
+        os,
+        arch,
+    );
+
+    // Download the archive.
+    adoptium.download_package(&plan.package, &plan.archive_path).await?;
+
+    // Extract the archive into the install directory.
+    emit_log(
+        app_handle,
+        ProcessLogStream::Stdout,
+        format!("[Java] Extracting to {}", plan.install_dir.display()),
+    )?;
+    let archive_path = plan.archive_path.clone();
+    let install_dir = plan.install_dir.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let file = std::fs::File::open(&archive_path)
+            .with_context(|| format!("failed to open Java archive {}", archive_path.display()))?;
+        let mut archive = zip::ZipArchive::new(file)
+            .with_context(|| format!("failed to read Java archive {}", archive_path.display()))?;
+        archive.extract(&install_dir)
+            .with_context(|| format!("failed to extract Java archive to {}", install_dir.display()))?;
+        // Clean up archive file.
+        let _ = std::fs::remove_file(&archive_path);
+        Ok(())
+    })
+    .await
+    .context("Java extraction task panicked")??;
+
+    // Re-scan and select.
+    let installations = discover_java_installations(launcher_paths.java_runtimes_dir())?;
+    persist_java_installations(&connection, &installations)?;
+
     select_java_for_minecraft(&installations, &target.minecraft_version)?
         .map(|installation| installation.path)
         .with_context(|| {
             format!(
-                "no suitable Java runtime was found for Minecraft {}. Set a Java Path Override in Settings.",
-                target.minecraft_version
+                "Java {} was downloaded but could not be found after extraction. Check {}",
+                required,
+                launcher_paths.java_runtimes_dir().display()
             )
         })
 }

@@ -1,4 +1,5 @@
-import { For, Show, createSignal } from "solid-js";
+import { For, Show, createSignal, createEffect } from "solid-js";
+import { invoke } from "@tauri-apps/api/core";
 import { MOD_LOADERS } from "../lib/types";
 import {
   selectedMcVersion, setSelectedMcVersion,
@@ -19,7 +20,43 @@ interface LaunchPanelProps {
 
 export function LaunchPanel(props: LaunchPanelProps) {
   const isLaunching = () => launchState() === "resolving" || launchState() === "running";
+  const isRunning = () => launchState() === "running";
   const [accountMenuOpen, setAccountMenuOpen] = createSignal(false);
+  const [autoScroll, setAutoScroll] = createSignal(true);
+  const [showErrors, setShowErrors] = createSignal(true);
+  const [showWarnings, setShowWarnings] = createSignal(true);
+  const [showInfo, setShowInfo] = createSignal(true);
+  const [showGame, setShowGame] = createSignal(true);
+  let logContainer: HTMLDivElement | undefined;
+
+  const logLevel = (line: string): "error" | "warning" | "info" | "game" => {
+    const lower = line.toLowerCase();
+    if (lower.includes("error") || lower.includes("✗") || lower.includes("exception") || lower.includes("fatal") || line.startsWith("[Launch]") && lower.includes("fail")) return "error";
+    if (lower.includes("warn")) return "warning";
+    if (line.startsWith("[Launcher]") || line.startsWith("[Resolver]") || line.startsWith("[Java]") || line.startsWith("[Cache]") || line.startsWith("[Launch]") || line.startsWith("[Cubic]")) return "info";
+    return "game";
+  };
+
+  const filteredLogs = () => launchLogs().filter(line => {
+    const level = logLevel(line);
+    if (level === "error") return showErrors();
+    if (level === "warning") return showWarnings();
+    if (level === "info") return showInfo();
+    return showGame();
+  });
+
+  createEffect(() => {
+    filteredLogs(); // track changes
+    if (autoScroll() && logContainer) {
+      logContainer.scrollTop = logContainer.scrollHeight;
+    }
+  });
+
+  const handleStop = async () => {
+    try {
+      await invoke("stop_minecraft_command");
+    } catch { /* already exited */ }
+  };
 
   return (
     <div class="shrink-0 border-t border-borderColor bg-bgPanel shadow-glow z-10">
@@ -32,30 +69,71 @@ export function LaunchPanel(props: LaunchPanelProps) {
               <MaterialIcon name="terminal" size="md" />
               Launch Log
             </div>
+            <div class="flex items-center gap-2">
+              <label class="flex items-center gap-1 cursor-pointer select-none">
+                <input type="checkbox" checked={autoScroll()} onChange={e => setAutoScroll(e.currentTarget.checked)} class="accent-accentColor w-3 h-3" />
+                <span class="text-xs text-textMuted">Auto-scroll</span>
+              </label>
+              <button
+                onClick={() => { if (logContainer) logContainer.scrollTop = logContainer.scrollHeight; }}
+                class="flex h-6 w-6 items-center justify-center rounded-md text-textMuted transition-colors hover:bg-bgDark hover:text-white"
+                title="Scroll to bottom"
+              >
+                <MaterialIcon name="vertical_align_bottom" size="sm" />
+              </button>
+              <button onClick={() => setLogViewerOpen(false)} class="flex h-6 w-6 items-center justify-center rounded-md text-textMuted transition-colors hover:bg-bgDark hover:text-white">
+                <XIcon class="h-4 w-4" />
+              </button>
+            </div>
+          </div>
+          {/* Filter bar */}
+          <div class="flex items-center gap-2 bg-bgDark/80 px-4 py-1.5 border-b border-borderColor/30">
+            <span class="text-[10px] text-textMuted mr-1">Filter:</span>
             <button
-              onClick={() => setLogViewerOpen(false)}
-              class="flex h-6 w-6 items-center justify-center rounded-md text-textMuted transition-colors hover:bg-bgHover hover:text-white"
+              onClick={() => setShowErrors(v => !v)}
+              class={`rounded px-2 py-0.5 text-[10px] font-medium transition-colors ${showErrors() ? "bg-red-500/20 text-red-400 ring-1 ring-red-500/30" : "text-textMuted/50 line-through"}`}
             >
-              <XIcon class="h-4 w-4" />
+              Errors
+            </button>
+            <button
+              onClick={() => setShowWarnings(v => !v)}
+              class={`rounded px-2 py-0.5 text-[10px] font-medium transition-colors ${showWarnings() ? "bg-amber-500/20 text-amber-400 ring-1 ring-amber-500/30" : "text-textMuted/50 line-through"}`}
+            >
+              Warnings
+            </button>
+            <button
+              onClick={() => setShowInfo(v => !v)}
+              class={`rounded px-2 py-0.5 text-[10px] font-medium transition-colors ${showInfo() ? "bg-primary/20 text-primary ring-1 ring-primary/30" : "text-textMuted/50 line-through"}`}
+            >
+              Info
+            </button>
+            <button
+              onClick={() => setShowGame(v => !v)}
+              class={`rounded px-2 py-0.5 text-[10px] font-medium transition-colors ${showGame() ? "bg-muted text-textMuted ring-1 ring-borderColor" : "text-textMuted/50 line-through"}`}
+            >
+              Game
             </button>
           </div>
-          <div class="h-48 overflow-y-auto bg-bgDark px-3 py-2 font-mono text-xs">
+          <div ref={logContainer} class="h-48 overflow-y-auto bg-bgDark px-3 py-2 font-mono text-xs">
             <Show
-              when={launchLogs().length > 0}
+              when={filteredLogs().length > 0}
               fallback={<p class="text-textMuted">Launch logs will appear here...</p>}
             >
-              <For each={launchLogs()}>
-                {(line, i) => (
-                  <div class={`flex gap-3 border-b border-borderColor/20 py-1 last:border-b-0 ${
-                    line.includes("✓") ? "text-success" :
-                    line.includes("✗") ? "text-destructive" :
-                    line.startsWith("[Cubic]") || line.startsWith("[Launcher]") || line.startsWith("[Resolver]") ? "text-primary" :
-                    "text-textMuted"
-                  }`}>
-                    <span class="shrink-0 select-none text-primary/50">{String(i() + 1).padStart(2, "0")}</span>
-                    <span class="break-all">{line || "\u00A0"}</span>
-                  </div>
-                )}
+              <For each={filteredLogs()}>
+                {(line, i) => {
+                  const level = logLevel(line);
+                  return (
+                    <div class={`flex gap-3 border-b border-borderColor/20 py-1 last:border-b-0 ${
+                      level === "error" ? "text-red-400" :
+                      level === "warning" ? "text-amber-400" :
+                      level === "info" ? "text-primary" :
+                      "text-textMuted"
+                    }`}>
+                      <span class="shrink-0 select-none text-primary/50">{String(i() + 1).padStart(2, "0")}</span>
+                      <span class="break-all">{line || "\u00A0"}</span>
+                    </div>
+                  );
+                }}
               </For>
             </Show>
           </div>
@@ -200,25 +278,38 @@ export function LaunchPanel(props: LaunchPanelProps) {
             <MaterialIcon name="terminal" size="md" />
           </button>
 
-          {/* Play button */}
-          <button
-            onClick={props.onLaunch}
-            disabled={isLaunching()}
-            class="px-10 py-3 bg-primary hover:bg-brandPurpleHover text-white font-bold text-lg rounded-lg shadow-lg flex items-center gap-3 transition-colors duration-75 disabled:opacity-70 disabled:cursor-not-allowed"
+          {/* Play / Stop button */}
+          <Show
+            when={isRunning()}
+            fallback={
+              <button
+                onClick={props.onLaunch}
+                disabled={launchState() === "resolving"}
+                class="px-10 py-3 bg-primary hover:bg-brandPurpleHover text-white font-bold text-lg rounded-lg shadow-lg flex items-center gap-3 transition-colors duration-75 disabled:opacity-70 disabled:cursor-not-allowed"
+              >
+                <Show
+                  when={launchState() === "resolving"}
+                  fallback={
+                    <>
+                      <MaterialIcon name="play_arrow" size="lg" />
+                      PLAY
+                    </>
+                  }
+                >
+                  <Loader2Icon class="h-6 w-6 animate-spin" />
+                  {launchProgress()}%
+                </Show>
+              </button>
+            }
           >
-            <Show
-              when={isLaunching()}
-              fallback={
-                <>
-                  <MaterialIcon name="play_arrow" size="lg" />
-                  PLAY
-                </>
-              }
+            <button
+              onClick={() => void handleStop()}
+              class="px-10 py-3 bg-red-600 hover:bg-red-700 text-white font-bold text-lg rounded-lg shadow-lg flex items-center gap-3 transition-colors duration-75"
             >
-              <Loader2Icon class="h-6 w-6 animate-spin" />
-              {launchState() === "running" ? "RUNNING" : `${launchProgress()}%`}
-            </Show>
-          </button>
+              <MaterialIcon name="stop" size="lg" />
+              STOP
+            </button>
+          </Show>
         </div>
       </div>
     </div>

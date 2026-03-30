@@ -81,7 +81,8 @@ pub fn run() {
             resolver::resolve_modlist_command,
             minecraft_downloader::fetch_minecraft_versions_command,
             minecraft_downloader::start_minecraft_predownload_command,
-            launch_preview::start_launch_command
+            launch_preview::start_launch_command,
+            launch_preview::stop_minecraft_command
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
