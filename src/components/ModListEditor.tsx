@@ -19,7 +19,7 @@ import { ActionBar } from "./ActionBar";
 import { ModRuleItem } from "./ModRuleItem";
 import {
   PackageIcon, ChevronDownIcon, ChevronRightIcon, FolderOpenIcon,
-  PencilIcon, ExternalLinkIcon, XIcon,
+  PencilIcon, ExternalLinkIcon, XIcon, MaterialIcon,
 } from "./icons";
 import { setInstancePresentationOpen, setExportModalOpen, instancePresentation } from "../store";
 import { useDragEngine, type DragItem } from "../lib/dragEngine";
@@ -505,8 +505,6 @@ export function ModListEditor(props: Props) {
   // ── Render ─────────────────────────────────────────────────────────────────
   return (
     <div class="flex flex-1 flex-col overflow-hidden">
-      <ActionBar onAddMod={props.onAddMod} onDeleteSelected={props.onDeleteSelected} />
-
       <Show
         when={activeModList()}
         fallback={
@@ -523,12 +521,14 @@ export function ModListEditor(props: Props) {
           </div>
         }
       >
+        <ActionBar onAddMod={props.onAddMod} onDeleteSelected={props.onDeleteSelected} />
+
         {/* Mod list header */}
         <div class="shrink-0 border-b border-border bg-card/50 px-4 py-3">
           <div class="flex items-start justify-between gap-4">
             <div class="min-w-0 flex-1">
               <h2 class="text-lg font-semibold text-foreground">
-                {instancePresentation().iconLabel || activeModList()!.name}
+                {activeModList()!.name}
               </h2>
               <p class="text-sm text-muted-foreground">{activeModList()!.description}</p>
               <div class="mt-1.5 flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
@@ -545,6 +545,29 @@ export function ModListEditor(props: Props) {
               >
                 <PencilIcon class="h-3.5 w-3.5" />
                 Settings
+              </button>
+              <button
+                onClick={() => {
+                  // Import: open file picker for rules.json, then reload
+                  void (async () => {
+                    try {
+                      const { open } = await import("@tauri-apps/plugin-dialog");
+                      const selected = await open({ title: "Import Mod List (rules.json)", filters: [{ name: "JSON", extensions: ["json"] }], multiple: false });
+                      if (!selected) return;
+                      const { invoke } = await import("@tauri-apps/api/core");
+                      // Read the file and copy it over the current modlist's rules.json
+                      const modlistName = selectedModListName();
+                      if (!modlistName) return;
+                      await invoke("import_modlist_command", { modlistName, sourcePath: selected as string });
+                      window.location.reload();
+                    } catch { /* cancelled or error */ }
+                  })();
+                }}
+                class="flex h-8 items-center gap-1.5 rounded-md px-2.5 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                title="Import rules from a JSON file"
+              >
+                <MaterialIcon name="download" size="sm" />
+                Import
               </button>
               <button
                 onClick={() => setExportModalOpen(true)}

@@ -9,7 +9,7 @@ import {
   settingsModalOpen, setSettingsModalOpen, settingsTab, setSettingsTab,
   globalSettings, setGlobalSettings, modlistOverrides, setModlistOverrides,
   /* Accounts */
-  accountsModalOpen, setAccountsModalOpen, accounts, setAccounts, activeAccountId, setActiveAccountId,
+  accountsModalOpen, setAccountsModalOpen, accounts, setAccounts, activeAccountId, setActiveAccountId, activeAccount,
   toggleActiveAccountConnection,
   /* Presentation */
   instancePresentationOpen, setInstancePresentationOpen,
@@ -500,7 +500,7 @@ export function InstancePresentationModal(props: { onSave: () => Promise<void>; 
                 type="text"
                 value={draft().iconAccent}
                 onInput={e => setDraft(cur => ({ ...cur, iconAccent: e.currentTarget.value }))}
-                placeholder="Author name"
+                placeholder={activeAccount()?.gamertag || "Author name"}
                 class="w-full rounded-md border border-input bg-input px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
               />
             </div>

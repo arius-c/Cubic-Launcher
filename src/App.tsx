@@ -1639,7 +1639,19 @@ export default function App() {
       </div>
 
       {/* Modals */}
-      <AddModDialog onAddModrinth={handleAddModrinth} onUploadLocal={handleUploadLocal} />
+      <AddModDialog onAddModrinth={handleAddModrinth} onUploadLocal={handleUploadLocal} onDropJar={async (path) => {
+        if (!selectedModListName()) return;
+        try {
+          await invoke("copy_local_jar_command", {
+            input: { sourcePath: path, ruleName: localJarRuleName().trim(), modlistName: selectedModListName() },
+          });
+          setLocalJarRuleName("");
+          setAddModModalOpen(false);
+          await loadEditorSnapshot(selectedModListName());
+        } catch (err) {
+          pushUiError({ title: "Failed to upload JAR", message: "The dropped file could not be added.", detail: String(err), severity: "error", scope: "launch" });
+        }
+      }} />
       <CreateModlistModal onCreate={handleCreateModlist} />
       <SettingsModal onSave={handleSaveSettings} />
       <AccountsModal onSwitchAccount={handleSwitchAccount} />

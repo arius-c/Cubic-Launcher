@@ -1,9 +1,12 @@
+import { createSignal } from "solid-js";
 import { pushUiError, setSettingsModalOpen } from "../store";
 import { MaterialIcon } from "./icons";
 
 const isTauri = () => "__TAURI_INTERNALS__" in window;
 
 export function Header() {
+  const [maximized, setMaximized] = createSignal(false);
+
   const handleWindowAction = async (action: "minimize" | "toggle-maximize" | "close") => {
     if (!isTauri()) return;
 
@@ -19,8 +22,10 @@ export function Header() {
       if (action === "toggle-maximize") {
         if (await currentWindow.isMaximized()) {
           await currentWindow.unmaximize();
+          setMaximized(false);
         } else {
           await currentWindow.maximize();
+          setMaximized(true);
         }
         return;
       }
@@ -32,7 +37,7 @@ export function Header() {
   };
 
   return (
-    <header class="h-14 border-b border-borderColor bg-bgPanel flex items-center justify-between px-4 shrink-0 z-10 w-full">
+    <header data-tauri-drag-region class="h-14 border-b border-borderColor bg-bgPanel flex items-center justify-between px-4 shrink-0 z-10 w-full">
       <div class="flex items-center gap-3">
         <div class="w-8 h-8 rounded-lg bg-primary flex items-center justify-center text-white font-bold text-lg">
           C
@@ -50,8 +55,8 @@ export function Header() {
         <button onClick={() => void handleWindowAction("minimize")} class="hover:text-white transition-colors duration-75" title="Minimize">
           <MaterialIcon name="remove" size="md" />
         </button>
-        <button onClick={() => void handleWindowAction("toggle-maximize")} class="hover:text-white transition-colors duration-75" title="Maximize">
-          <MaterialIcon name="check_box_outline_blank" size="md" />
+        <button onClick={() => void handleWindowAction("toggle-maximize")} class="hover:text-white transition-colors duration-75" title={maximized() ? "Restore" : "Maximize"}>
+          <MaterialIcon name={maximized() ? "filter_none" : "check_box_outline_blank"} size="md" />
         </button>
         <button onClick={() => void handleWindowAction("close")} class="hover:text-red-500 transition-colors duration-75" title="Close">
           <MaterialIcon name="close" size="md" />

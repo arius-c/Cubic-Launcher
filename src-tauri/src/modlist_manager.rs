@@ -143,6 +143,24 @@ pub struct CopyLocalJarInput {
 }
 
 #[tauri::command]
+pub fn import_modlist_command(
+    launcher_paths: State<'_, LauncherPaths>,
+    modlist_name: String,
+    source_path: String,
+) -> Result<(), String> {
+    let dest = launcher_paths
+        .modlists_dir()
+        .join(&modlist_name)
+        .join(crate::rules::RULES_FILENAME);
+    // Validate the source is valid rules.json
+    crate::rules::ModList::read_from_file(std::path::Path::new(&source_path))
+        .map_err(|e| format!("Invalid rules file: {e}"))?;
+    std::fs::copy(&source_path, &dest)
+        .map_err(|e| format!("Failed to copy: {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
 pub fn copy_local_jar_command(
     launcher_paths: State<'_, LauncherPaths>,
     input: CopyLocalJarInput,

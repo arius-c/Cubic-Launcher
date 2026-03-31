@@ -326,7 +326,7 @@ async fn run_launch_pipeline(
     prepare_instance_mods_directory(
         launcher_paths.mods_cache_dir(),
         &instance_mods_dir,
-        &build_cached_mod_jars(&selected_mods, &all_remote_versions, &target)?,
+        &build_cached_mod_jars(&selected_mods, &all_remote_versions, &target, &launcher_paths, &modlist_name)?,
     )?;
     prepare_instance_config_directory(
         launcher_paths.configs_cache_dir(),
@@ -903,11 +903,18 @@ fn build_cached_mod_jars(
     selected_mods: &[SelectedMod],
     versions: &[ModrinthVersion],
     target: &ResolutionTarget,
+    launcher_paths: &LauncherPaths,
+    modlist_name: &str,
 ) -> Result<Vec<CachedModJar>> {
     let mut jars = Vec::new();
     let mut seen = HashSet::new();
+    let mods_cache_dir = launcher_paths.mods_cache_dir();
+    let local_jars_dir = launcher_paths
+        .modlists_dir()
+        .join(modlist_name)
+        .join("local-jars");
 
-    // Local mods: JAR lives at local-jars/{mod_id}.jar
+    // Local mods: JAR lives at local-jars/{mod_id}.jar — copy to cache/mods/
     for selected in selected_mods {
         if !matches!(selected.source, ModSource::Local) {
             continue;
@@ -915,6 +922,14 @@ fn build_cached_mod_jars(
 
         let file_name = format!("{}.jar", selected.mod_id);
         if seen.insert(file_name.clone()) {
+            let source = local_jars_dir.join(&file_name);
+            let dest = mods_cache_dir.join(&file_name);
+            if source.exists() && !dest.exists() {
+                std::fs::create_dir_all(&mods_cache_dir).ok();
+                std::fs::copy(&source, &dest).with_context(|| {
+                    format!("failed to copy local JAR '{}' to mod cache", file_name)
+                })?;
+            }
             jars.push(CachedModJar {
                 jar_filename: file_name,
             });

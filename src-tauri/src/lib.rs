@@ -74,6 +74,7 @@ pub fn run() {
             modlist_manager::create_modlist_command,
             modlist_manager::delete_modlist_command,
             modlist_manager::copy_local_jar_command,
+            modlist_manager::import_modlist_command,
             modlist_assets::load_modlist_presentation_command,
             modlist_assets::save_modlist_presentation_command,
             modlist_assets::load_modlist_groups_command,
