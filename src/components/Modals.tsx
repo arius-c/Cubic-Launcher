@@ -1,4 +1,5 @@
 import { For, Show, createSignal, createEffect } from "solid-js";
+import { invoke } from "@tauri-apps/api/core";
 import type { ModRow } from "../lib/types";
 import { appendDebugTrace } from "../lib/debugTrace";
 import { useDragEngine, type DragItem } from "../lib/dragEngine";
@@ -8,7 +9,7 @@ import {
   settingsModalOpen, setSettingsModalOpen, settingsTab, setSettingsTab,
   globalSettings, setGlobalSettings, modlistOverrides, setModlistOverrides,
   /* Accounts */
-  accountsModalOpen, setAccountsModalOpen, accounts, activeAccountId,
+  accountsModalOpen, setAccountsModalOpen, accounts, setAccounts, activeAccountId, setActiveAccountId,
   toggleActiveAccountConnection,
   /* Presentation */
   instancePresentationOpen, setInstancePresentationOpen,
@@ -280,6 +281,8 @@ export function SettingsModal(props: { onSave: () => Promise<void> }) {
 
 // ── Accounts ──────────────────────────────────────────────────────────────────
 export function AccountsModal(props: { onSwitchAccount: (id: string) => Promise<void> }) {
+  const [loggingIn, setLoggingIn] = createSignal(false);
+  const [loginError, setLoginError] = createSignal<string | null>(null);
   return (
     <Show when={accountsModalOpen()}>
       <Modal onClose={() => setAccountsModalOpen(false)}>
@@ -293,45 +296,83 @@ export function AccountsModal(props: { onSwitchAccount: (id: string) => Promise<
               Your credentials are never seen by Cubic Launcher.
             </p>
             <button
-              class="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90"
-              onClick={() => {
-                /* The Microsoft OAuth flow opens the system browser.
-                   Backend command: begin_microsoft_login_command (to be wired).
-                   For now we display a note since the OAuth endpoint
-                   requires a registered client ID. */
-                alert("Microsoft OAuth login requires a registered Azure client ID.\nSee the backend microsoft_auth.rs module for the full PKCE implementation.");
+              class="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-50"
+              disabled={loggingIn()}
+              onClick={async () => {
+                setLoggingIn(true);
+                try {
+                  const gamertag: string = await invoke("microsoft_login_command");
+                  setAccountsModalOpen(false);
+                  // Reload accounts
+                  const snap: any = await invoke("load_shell_snapshot_command", { preferredModlistName: null });
+                  if (snap.active_account) {
+                    const a = snap.active_account;
+                    const gtag = a.xbox_gamertag?.trim() || a.microsoft_id;
+                    setAccounts(cur => {
+                      const rest = cur.filter((x: any) => x.id !== a.microsoft_id);
+                      return [{ id: a.microsoft_id, gamertag: gtag, email: a.microsoft_id, avatarUrl: a.avatar_url, status: "online" as const, lastMode: "microsoft" as const }, ...rest];
+                    });
+                    setActiveAccountId(a.microsoft_id);
+                  }
+                } catch (err) {
+                  setLoginError(String(err));
+                } finally {
+                  setLoggingIn(false);
+                }
               }}
             >
-              Login with Microsoft
+              {loggingIn() ? "Logging in…" : "Login with Microsoft"}
             </button>
+            <Show when={loginError()}>
+              <p class="mt-2 text-xs text-destructive break-all">{loginError()}</p>
+            </Show>
           </div>
           <p class="text-xs text-muted-foreground">Saved accounts — click to switch</p>
           <For each={accounts()}>
             {acc => (
-              <button
-                onClick={() => void props.onSwitchAccount(acc.id)}
-                class={`block w-full rounded-md border p-4 text-left transition-colors ${acc.id === activeAccountId() ? "border-primary/40 bg-primary/10" : "border-border hover:bg-muted/30"}`}
-              >
+              <div class={`rounded-md border p-4 transition-colors ${acc.id === activeAccountId() ? "border-primary/40 bg-primary/10" : "border-border hover:bg-muted/30"}`}>
                 <div class="flex items-start justify-between">
-                  <div class="flex items-start gap-3">
-                    <div class="flex h-10 w-10 items-center justify-center rounded-full bg-primary/20 text-sm font-semibold text-primary">
-                      {acc.gamertag.slice(0, 2).toUpperCase()}
+                  <button
+                    onClick={() => void props.onSwitchAccount(acc.id)}
+                    class="flex items-start gap-3 text-left flex-1 min-w-0"
+                  >
+                    <Show when={acc.avatarUrl} fallback={
+                      <div class="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-primary/20 text-sm font-semibold text-primary">
+                        {acc.gamertag.slice(0, 2).toUpperCase()}
+                      </div>
+                    }>
+                      <img src={acc.avatarUrl} alt="" class="h-10 w-10 shrink-0 rounded-md" loading="lazy" />
+                    </Show>
+                    <div class="min-w-0">
+                      <p class="font-medium text-foreground truncate">{acc.gamertag}</p>
+                      <p class="text-xs text-muted-foreground truncate">{acc.email}</p>
                     </div>
-                    <div>
-                      <p class="font-medium text-foreground">{acc.gamertag}</p>
-                      <p class="text-xs text-muted-foreground">{acc.email}</p>
-                    </div>
-                  </div>
-                  <div class="flex flex-col items-end gap-1">
+                  </button>
+                  <div class="flex flex-col items-end gap-1 shrink-0 ml-2">
                     <span class={`rounded-full px-2 py-0.5 text-[10px] ${acc.status === "online" ? "bg-success/15 text-success" : "bg-warning/15 text-warning"}`}>
                       {acc.status}
                     </span>
                     <Show when={acc.id === activeAccountId()}>
                       <span class="rounded-full bg-primary/15 px-2 py-0.5 text-[10px] text-primary">Active</span>
                     </Show>
+                    <button
+                      onClick={async (e) => {
+                        e.stopPropagation();
+                        try {
+                          await invoke("delete_account_command", { microsoftId: acc.id });
+                          setAccounts(cur => cur.filter(a => a.id !== acc.id));
+                          if (activeAccountId() === acc.id) setActiveAccountId("");
+                        } catch (err) {
+                          setLoginError(String(err));
+                        }
+                      }}
+                      class="rounded-full px-2 py-0.5 text-[10px] text-destructive hover:bg-destructive/15 transition-colors"
+                    >
+                      Remove
+                    </button>
                   </div>
                 </div>
-              </button>
+              </div>
             )}
           </For>
         </div>

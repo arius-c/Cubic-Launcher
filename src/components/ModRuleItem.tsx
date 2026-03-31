@@ -13,7 +13,7 @@ import {
   toggleSelected, toggleExpanded, functionalGroupTagClass, functionalGroupTagStyle,
   removeFunctionalGroupMember,
   tagFilter, functionalGroups, tagFilterForcedExpanded,
-  linksByModId, removeLink, removeIncompatibility,
+  linksByModId, removeLink, cycleLinkDirection, removeIncompatibility,
   setAdvancedPanelModId, selectedCount, resolvedModIds,
 } from "../store";
 import {
@@ -251,7 +251,13 @@ export function ModRuleItem(props: ModRuleItemProps) {
                             return (
                               <div class="flex items-center gap-1.5 px-3 py-1.5 text-xs hover:bg-muted/30">
                                 <span class="truncate text-foreground">{props.row.name}</span>
-                                <span class="text-cyan-400 shrink-0 font-bold">{arrow()}</span>
+                                <button
+                                  onClick={e => { e.stopPropagation(); cycleLinkDirection(props.row.id, link.partnerId); }}
+                                  class="text-cyan-400 shrink-0 font-bold hover:text-cyan-200 hover:bg-cyan-500/20 rounded px-1 transition-colors"
+                                  title="Click to change direction"
+                                >
+                                  {arrow()}
+                                </button>
                                 <span class="truncate text-foreground flex-1">{partnerName()}</span>
                                 <button
                                   onClick={e => { e.stopPropagation(); removeLink(props.row.id, link.partnerId); }}

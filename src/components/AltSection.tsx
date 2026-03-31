@@ -9,7 +9,7 @@ import { For, Show, batch, createMemo } from "solid-js";
 import type { ModRow, AestheticGroup } from "../lib/types";
 import {
   aestheticGroups, setAestheticGroups, modRowsState, setModRowsState,
-  functionalGroups, sortOrder, tagFilter, modIcons,
+  functionalGroups, sortOrder, tagFilter, search, modIcons, rowMatchesQuery,
   toggleGroupCollapsed, removeAestheticGroup,
   editingGroupId, groupNameDraft, setGroupNameDraft, startGroupRename, commitGroupRename,
 } from "../store";
@@ -56,7 +56,10 @@ export function AltSection(props: AltSectionProps) {
   // ── Derived state ──────────────────────────────────────────────────────────
 
   const altMatchesFilter = (alt: ModRow): boolean => {
+    const q = search().trim().toLowerCase();
     const tf = tagFilter();
+    // If there's a search query, only show alts that match it (recursively).
+    if (q && !rowMatchesQuery(alt, q)) return false;
     if (tf.size === 0) return true;
     const fg = functionalGroups();
     const check = (row: ModRow): boolean =>

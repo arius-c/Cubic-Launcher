@@ -103,6 +103,7 @@ export type AccountSummary = {
   id: string;
   gamertag: string;
   email: string;
+  avatarUrl?: string;
   status: "online" | "offline";
   lastMode: "microsoft" | "offline";
 };

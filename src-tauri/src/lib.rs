@@ -53,6 +53,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             app_shell::load_shell_snapshot_command,
             app_shell::switch_active_account_command,
+            app_shell::microsoft_login_command,
+            app_shell::delete_account_command,
             app_shell::save_global_settings_command,
             app_shell::save_modlist_overrides_command,
             debug_trace::append_debug_trace_command,

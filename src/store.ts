@@ -326,18 +326,26 @@ export const filteredGroupSections = createMemo(() => {
  *  the active tag filter — so the user sees which nested mods caused the parent to appear. */
 export const tagFilterForcedExpanded = createMemo(() => {
   const tf = tagFilter();
-  if (tf.size === 0) return new Set<string>();
+  const q = search().trim().toLowerCase();
+  if (tf.size === 0 && !q) return new Set<string>();
   const fGroups = functionalGroups();
 
-  const anyDescendantMatches = (row: ModRow): boolean =>
+  const anyDescendantMatchesTag = (row: ModRow): boolean =>
     (row.alternatives ?? []).some(alt =>
       fGroups.some(g => tf.has(g.id) && g.modIds.includes(alt.id)) ||
-      anyDescendantMatches(alt)
+      anyDescendantMatchesTag(alt)
+    );
+
+  // Check if any descendant matches the search query (but the row itself doesn't).
+  const anyDescendantMatchesSearch = (row: ModRow): boolean =>
+    (row.alternatives ?? []).some(alt =>
+      alt.name.toLowerCase().includes(q) || anyDescendantMatchesSearch(alt)
     );
 
   const forced = new Set<string>();
   const processRow = (row: ModRow) => {
-    if (anyDescendantMatches(row)) forced.add(row.id);
+    if (tf.size > 0 && anyDescendantMatchesTag(row)) forced.add(row.id);
+    if (q && !row.name.toLowerCase().includes(q) && anyDescendantMatchesSearch(row)) forced.add(row.id);
     for (const alt of (row.alternatives ?? [])) processRow(alt);
   };
   for (const row of modRowsState()) processRow(row);
@@ -388,7 +396,8 @@ export const selectedTopLevelId = createMemo(() => {
 export function wait(ms: number) { return new Promise<void>(res => setTimeout(res, ms)); }
 
 export function rowMatchesQuery(row: ModRow, q: string): boolean {
-  return row.name.toLowerCase().includes(q) || (row.alternatives ?? []).some(a => a.name.toLowerCase().includes(q));
+  if (row.name.toLowerCase().includes(q)) return true;
+  return (row.alternatives ?? []).some(a => rowMatchesQuery(a, q));
 }
 
 const TAG_BASE_CLASS = "inline-flex items-center gap-0.5 rounded-md border px-1.5 py-0.5 text-[10px]";
@@ -659,6 +668,28 @@ export function removeLink(fromId: string, toId: string) {
     (l.fromId === fromId && l.toId === toId) ||
     (l.fromId === toId && l.toId === fromId)
   )));
+}
+
+/** Cycle a link's direction: requires → mutual → required-by → requires */
+export function cycleLinkDirection(fromId: string, partnerId: string) {
+  setSavedLinks(cur => {
+    const hasAB = cur.some(l => l.fromId === fromId && l.toId === partnerId);
+    const hasBA = cur.some(l => l.fromId === partnerId && l.toId === fromId);
+    const without = cur.filter(l =>
+      !((l.fromId === fromId && l.toId === partnerId) || (l.fromId === partnerId && l.toId === fromId))
+    );
+
+    if (hasAB && !hasBA) {
+      // requires → mutual
+      return [...without, { fromId, toId: partnerId }, { fromId: partnerId, toId: fromId }];
+    } else if (hasAB && hasBA) {
+      // mutual → required-by
+      return [...without, { fromId: partnerId, toId: fromId }];
+    } else {
+      // required-by → requires
+      return [...without, { fromId, toId: partnerId }];
+    }
+  });
 }
 
 export function setPairConflictEnabled(baseId: string, otherId: string, enabled: boolean) {

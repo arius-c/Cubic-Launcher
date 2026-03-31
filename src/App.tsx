@@ -344,7 +344,7 @@ async function loadShellSnapshot(preferredName?: string | null) {
       const gtag = a.xbox_gamertag?.trim() || a.microsoft_id;
       setAccounts(cur => {
         const rest = cur.filter((x: any) => x.id !== a.microsoft_id);
-        return [{ id: a.microsoft_id, gamertag: gtag, email: a.microsoft_id, status: a.status, lastMode: a.last_mode }, ...rest];
+        return [{ id: a.microsoft_id, gamertag: gtag, email: a.microsoft_id, avatarUrl: a.avatar_url, status: a.status, lastMode: a.last_mode }, ...rest];
       });
       setActiveAccountId(a.microsoft_id);
     }

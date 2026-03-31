@@ -439,10 +439,10 @@ export function AdvancedModPanel(props: { onDelete?: (modId: string) => void }) 
 
                 {/* Add link form */}
                 <Show when={addingLink()}>
-                  <div class="rounded-md border border-primary/30 bg-primary/5 p-3 space-y-2">
-                    <div class="flex flex-wrap items-center gap-2">
-                      <span class="text-sm font-medium text-foreground">{row()!.name}</span>
-                      <div class="flex items-center gap-0.5">
+                  <div class="rounded-md border border-primary/30 bg-primary/5 p-3 space-y-2 overflow-hidden">
+                    <div class="flex items-center gap-2 min-w-0">
+                      <span class="text-sm font-medium text-foreground truncate shrink-0" style="max-width: 35%">{row()!.name}</span>
+                      <div class="flex items-center gap-0.5 shrink-0">
                         <button onClick={() => setNewLinkDir('a-to-b')} class={dirBtnClass(newLinkDir() === 'a-to-b')}>→</button>
                         <button onClick={() => setNewLinkDir('mutual')} class={dirBtnClass(newLinkDir() === 'mutual')}>↔</button>
                         <button onClick={() => setNewLinkDir('b-to-a')} class={dirBtnClass(newLinkDir() === 'b-to-a')}>←</button>
@@ -450,7 +450,7 @@ export function AdvancedModPanel(props: { onDelete?: (modId: string) => void }) 
                       <select
                         value={newLinkPartnerId()}
                         onChange={e => setNewLinkPartnerId(e.currentTarget.value)}
-                        class="flex-1 rounded border border-border bg-input px-2 py-1 text-xs text-foreground"
+                        class="flex-1 min-w-0 rounded border border-border bg-input px-2 py-1 text-xs text-foreground"
                       >
                         <option value="">Select mod…</option>
                         <For each={availableLinkPartners()}>
@@ -458,7 +458,7 @@ export function AdvancedModPanel(props: { onDelete?: (modId: string) => void }) 
                         </For>
                       </select>
                     </div>
-                    <div class="flex gap-2">
+                    <div class="flex justify-center gap-2">
                       <button onClick={commitLink} disabled={!newLinkPartnerId()} class="rounded-md bg-primary px-3 py-1 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50">Add</button>
                       <button onClick={() => { setAddingLink(false); setNewLinkPartnerId(''); }} class="rounded-md bg-secondary px-3 py-1 text-xs text-secondary-foreground hover:bg-secondary/80">Cancel</button>
                     </div>
@@ -551,9 +551,9 @@ export function AdvancedModPanel(props: { onDelete?: (modId: string) => void }) 
 
                 {/* Add incompatibility form */}
                 <Show when={addingIncompat()}>
-                  <div class="rounded-md border border-primary/30 bg-primary/5 p-3 space-y-2">
-                    <div class="flex items-center gap-2">
-                      <span class="text-sm font-medium text-foreground truncate min-w-0 flex-1 text-right">{row()!.name}</span>
+                  <div class="rounded-md border border-primary/30 bg-primary/5 p-3 space-y-2 overflow-hidden">
+                    <div class="flex items-center gap-2 min-w-0">
+                      <span class="text-sm font-medium text-foreground truncate shrink-0" style="max-width: 35%">{row()!.name}</span>
                       <button
                         onClick={() => setNewIncompatMeWins(w => !w)}
                         class="shrink-0 rounded px-1.5 py-0.5 text-xs font-bold text-primary hover:bg-primary/20 transition-colors"
@@ -564,7 +564,7 @@ export function AdvancedModPanel(props: { onDelete?: (modId: string) => void }) 
                       <select
                         value={newIncompatPartnerId()}
                         onChange={e => setNewIncompatPartnerId(e.currentTarget.value)}
-                        class="flex-1 min-w-0 rounded border border-border bg-input px-2 py-1 text-xs text-foreground"
+                        class="min-w-0 flex-1 rounded border border-border bg-input px-2 py-1 text-xs text-foreground"
                       >
                         <option value="">Select mod…</option>
                         <For each={availableIncompatPartners()}>
@@ -572,7 +572,7 @@ export function AdvancedModPanel(props: { onDelete?: (modId: string) => void }) 
                         </For>
                       </select>
                     </div>
-                    <div class="flex gap-2">
+                    <div class="flex justify-center gap-2">
                       <button onClick={commitIncompat} disabled={!newIncompatPartnerId()} class="rounded-md bg-primary px-3 py-1 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50">Add</button>
                       <button onClick={() => { setAddingIncompat(false); setNewIncompatPartnerId(''); }} class="rounded-md bg-secondary px-3 py-1 text-xs text-secondary-foreground hover:bg-secondary/80">Cancel</button>
                     </div>

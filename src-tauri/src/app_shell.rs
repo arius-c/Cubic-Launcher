@@ -7,9 +7,13 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
+use crate::account_manager::{AccountManager, ManagedAccountProfile, ManagedAccountTokens};
 use crate::launcher_paths::LauncherPaths;
-use crate::microsoft_auth::AccountsRepository;
+use crate::microsoft_auth::{
+    microsoft_client_id_from_env, run_microsoft_login, AccountsRepository,
+};
 use crate::rules::{ModList, RULES_FILENAME};
+use crate::token_storage::KeyringSecretStore;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ShellSnapshot {
@@ -33,6 +37,8 @@ pub struct ShellModListSummary {
 pub struct ShellActiveAccount {
     pub microsoft_id: String,
     pub xbox_gamertag: Option<String>,
+    pub minecraft_uuid: Option<String>,
+    pub avatar_url: Option<String>,
     pub status: String,
     pub last_mode: String,
 }
@@ -104,6 +110,71 @@ pub fn switch_active_account_command(
 
     AccountsRepository::new(&connection)
         .set_active_account(&microsoft_id)
+        .map_err(|error| error.to_string())
+}
+
+/// Starts the Microsoft OAuth login flow, opens the browser, waits for
+/// callback, exchanges tokens through Xbox Live → XSTS → Minecraft, and
+/// saves the account to the database.
+#[tauri::command]
+pub async fn microsoft_login_command(
+    launcher_paths: State<'_, LauncherPaths>,
+) -> Result<String, String> {
+    // Use the official Minecraft launcher client ID by default.
+    // Can be overridden via .env file with MICROSOFT_CLIENT_ID=your-id.
+    const DEFAULT_CLIENT_ID: &str = "00000000402b5328";
+    let env_path = launcher_paths.root_dir().join(".env");
+    let client_id = microsoft_client_id_from_env(&env_path)
+        .map_err(|e| e.to_string())?
+        .unwrap_or_else(|| DEFAULT_CLIENT_ID.to_string());
+
+    let db_path = launcher_paths.database_path().to_path_buf();
+
+    let login_result = run_microsoft_login(&client_id)
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+
+    // Save to database
+    let connection = Connection::open(&db_path).map_err(|e| e.to_string())?;
+    let manager = AccountManager::new(&connection, KeyringSecretStore::new());
+    manager
+        .save_account_login(
+            ManagedAccountProfile {
+                microsoft_id: login_result.microsoft_id.clone(),
+                xbox_gamertag: Some(login_result.minecraft_username.clone()),
+                minecraft_uuid: Some(login_result.minecraft_uuid.clone()),
+                profile_data: Some(
+                    serde_json::json!({
+                        "username": login_result.minecraft_username,
+                        "uuid": login_result.minecraft_uuid,
+                        "mc_access_token": login_result.minecraft_access_token,
+                        "ms_refresh_token": login_result.microsoft_refresh_token,
+                    })
+                    .to_string(),
+                ),
+            },
+            ManagedAccountTokens {
+                access_token: login_result.minecraft_access_token.clone(),
+                refresh_token: login_result.microsoft_refresh_token,
+            },
+            true, // make active
+        )
+        .map_err(|e| e.to_string())?;
+
+    Ok(login_result
+        .xbox_gamertag
+        .unwrap_or(login_result.microsoft_id))
+}
+
+#[tauri::command]
+pub fn delete_account_command(
+    launcher_paths: State<'_, LauncherPaths>,
+    microsoft_id: String,
+) -> Result<(), String> {
+    let connection =
+        Connection::open(launcher_paths.database_path()).map_err(|error| error.to_string())?;
+    AccountsRepository::new(&connection)
+        .delete_account(&microsoft_id)
         .map_err(|error| error.to_string())
 }
 
@@ -243,19 +314,35 @@ fn load_modlist_summaries(modlists_dir: &Path) -> Result<Vec<ShellModListSummary
 fn load_active_account_summary(connection: &Connection) -> Result<Option<ShellActiveAccount>> {
     let account = AccountsRepository::new(connection).load_active_account()?;
 
-    Ok(account.map(|account| ShellActiveAccount {
-        microsoft_id: account.microsoft_id,
-        xbox_gamertag: account.xbox_gamertag,
-        status: if account.access_token_enc.is_some() {
-            "online".to_string()
-        } else {
-            "offline".to_string()
-        },
-        last_mode: if account.access_token_enc.is_some() {
-            "microsoft".to_string()
-        } else {
-            "offline".to_string()
-        },
+    Ok(account.map(|account| {
+        // Try to get the Minecraft username from profile_data.
+        let mc_username = account.profile_data.as_deref().and_then(|pd| {
+            serde_json::from_str::<serde_json::Value>(pd)
+                .ok()
+                .and_then(|v| v.get("username").and_then(|u| u.as_str()).map(String::from))
+        });
+
+        let avatar_url = account.minecraft_uuid.as_ref().map(|uuid| {
+            let clean_uuid = uuid.replace('-', "");
+            format!("https://mc-heads.net/avatar/{clean_uuid}/32")
+        });
+
+        ShellActiveAccount {
+            microsoft_id: account.microsoft_id,
+            xbox_gamertag: mc_username.or(account.xbox_gamertag),
+            minecraft_uuid: account.minecraft_uuid,
+            avatar_url,
+            status: if account.access_token_enc.is_some() {
+                "online".to_string()
+            } else {
+                "offline".to_string()
+            },
+            last_mode: if account.access_token_enc.is_some() {
+                "microsoft".to_string()
+            } else {
+                "offline".to_string()
+            },
+        }
     }))
 }
 

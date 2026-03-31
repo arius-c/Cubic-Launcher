@@ -344,11 +344,34 @@ async fn run_launch_pipeline(
 
     if target.mod_loader == ModLoader::Vanilla {
         loader_metadata.main_class = mc_data.main_class.clone();
-        loader_metadata.game_arguments = mc_data.game_arguments.clone();
         loader_metadata.jvm_arguments = mc_data.jvm_arguments.clone();
+        loader_metadata.game_arguments = mc_data.game_arguments.clone();
+    } else {
+        // For modded loaders (Fabric, Forge, etc.): prepend essential MC game
+        // arguments (auth, version, directories) but skip quickPlay entries
+        // which require specific values and cause conflicts.
+        let mut mc_args: Vec<String> = Vec::new();
+        let mut skip_next = false;
+        for arg in &mc_data.game_arguments {
+            if skip_next {
+                skip_next = false;
+                continue;
+            }
+            if arg.starts_with("--quickPlay") || arg.starts_with("--demo") {
+                skip_next = true; // skip the flag and its value
+                continue;
+            }
+            mc_args.push(arg.clone());
+        }
+        mc_args.extend(loader_metadata.game_arguments.drain(..));
+        loader_metadata.game_arguments = mc_args;
     }
 
-    let player_identity = load_player_identity(&launcher_paths)?;
+    emit_progress(&app_handle, "resolving", 90, "Authenticating", "Refreshing Minecraft session...")?;
+    let player_identity = load_player_identity(&launcher_paths).await?;
+    emit_log(&app_handle, ProcessLogStream::Stdout,
+        format!("[Auth] username={}, uuid={}, user_type={}, token_len={}",
+            player_identity.username, player_identity.uuid, player_identity.user_type, player_identity.access_token.len()))?;
     let placeholders = LaunchPlaceholders::new(
         &player_identity,
         &modlist_name,
@@ -973,28 +996,117 @@ fn maven_artifact_relative_path(coordinates: &str) -> Result<PathBuf> {
         .join(file_name))
 }
 
-fn load_player_identity(launcher_paths: &LauncherPaths) -> Result<PlayerIdentity> {
+async fn load_player_identity(launcher_paths: &LauncherPaths) -> Result<PlayerIdentity> {
     let connection = Connection::open(launcher_paths.database_path()).with_context(|| {
         format!(
             "failed to open launcher database at {}",
             launcher_paths.database_path().display()
         )
     })?;
-    let offline_account = OfflineAccountService::new(&connection, KeyringSecretStore::new())
-        .active_offline_account()?;
 
-    let username = offline_account
-        .as_ref()
-        .map(|account| account.username.clone())
-        .unwrap_or_else(|| "CubicPlayer".to_string());
-    let uuid = offline_account
-        .as_ref()
-        .map(|account| account.offline_uuid.clone())
-        .unwrap_or_else(|| deterministic_offline_uuid(&username).to_string());
+    // Read the raw active account (no decryption needed — we use profile_data).
+    // Extract all data from DB BEFORE any async work (Connection is not Send).
+    let raw_account = {
+        use crate::microsoft_auth::AccountsRepository as RawRepo;
+        RawRepo::new(&connection).load_active_account().ok().flatten()
+    };
+    let db_path = launcher_paths.database_path().to_path_buf();
+    drop(connection); // Release connection before async work.
 
+    if let Some(raw) = raw_account {
+        let profile = raw.profile_data.as_deref().and_then(|pd| {
+            serde_json::from_str::<serde_json::Value>(pd).ok()
+        });
+
+        let username = profile.as_ref()
+            .and_then(|v| v.get("username").and_then(|u| u.as_str()).map(String::from))
+            .or(raw.xbox_gamertag.clone())
+            .unwrap_or_else(|| "CubicPlayer".to_string());
+
+        let uuid = format_uuid_with_dashes(
+            &raw.minecraft_uuid.unwrap_or_else(|| deterministic_offline_uuid(&username).to_string())
+        );
+
+        let microsoft_id = raw.microsoft_id.clone();
+
+        // Try to refresh the Minecraft access token using the stored MS refresh token.
+        let ms_refresh = profile.as_ref()
+            .and_then(|v| v.get("ms_refresh_token").and_then(|t| t.as_str()).map(String::from));
+
+        if let Some(refresh_token) = ms_refresh {
+            if !refresh_token.is_empty() {
+                eprintln!("[Auth] Has refresh token (len={}), attempting refresh...", refresh_token.len());
+
+                const DEFAULT_CLIENT_ID: &str = "00000000402b5328";
+                let env_path = launcher_paths.root_dir().join(".env");
+                let client_id = crate::microsoft_auth::microsoft_client_id_from_env(&env_path)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| DEFAULT_CLIENT_ID.to_string());
+
+                let config = crate::microsoft_auth::MicrosoftOAuthConfig {
+                    client_id,
+                    redirect_uri: crate::microsoft_auth::DESKTOP_REDIRECT_URI.to_string(),
+                    scopes: vec!["XboxLive.signin".into(), "offline_access".into()],
+                };
+                let oauth_client = crate::microsoft_auth::MicrosoftOAuthClient::new();
+
+                match oauth_client.refresh_access_token(&config, &refresh_token).await {
+                    Ok(ms_tokens) => {
+                        eprintln!("[Auth] MS token refresh OK, authenticating with Xbox/MC...");
+                        let chain = crate::microsoft_auth::MinecraftAuthChain::new();
+                        match chain.authenticate(
+                            &ms_tokens.access_token,
+                            ms_tokens.refresh_token.as_deref(),
+                            ms_tokens.user_id.as_deref(),
+                        ).await {
+                            Ok(login) => {
+                                eprintln!("[Auth] Full auth chain OK: username={}", login.minecraft_username);
+                        // Update stored tokens in profile_data.
+                        let new_profile = serde_json::json!({
+                            "username": login.minecraft_username,
+                            "uuid": login.minecraft_uuid,
+                            "mc_access_token": login.minecraft_access_token,
+                            "ms_refresh_token": ms_tokens.refresh_token.as_deref()
+                                .unwrap_or(&refresh_token),
+                        });
+                        if let Ok(conn) = Connection::open(&db_path) {
+                            use crate::microsoft_auth::AccountsRepository as RawRepo;
+                            let _ = RawRepo::new(&conn)
+                                .update_profile_data(&microsoft_id, &new_profile.to_string());
+                        }
+
+                        return Ok(PlayerIdentity {
+                            username: login.minecraft_username,
+                            uuid: format_uuid_with_dashes(&login.minecraft_uuid),
+                            access_token: login.minecraft_access_token,
+                            user_type: "msa".to_string(),
+                            version_type: "Cubic".to_string(),
+                        });
+                    }
+                    Err(e) => eprintln!("[Auth] MC auth chain failed: {e:#}"),
+                }
+                }
+                    Err(e) => eprintln!("[Auth] MS token refresh failed: {e:#}"),
+                }
+            }
+        }
+
+        eprintln!("[Auth] Falling back to offline mode");
+        // No refresh token or refresh failed — offline with correct name.
+        return Ok(PlayerIdentity {
+            username,
+            uuid,
+            access_token: "0".to_string(),
+            user_type: "offline".to_string(),
+            version_type: "Cubic".to_string(),
+        });
+    }
+
+    // No active account at all — fully offline.
     Ok(PlayerIdentity {
-        username,
-        uuid,
+        username: "CubicPlayer".to_string(),
+        uuid: deterministic_offline_uuid("CubicPlayer").to_string(),
         access_token: "0".to_string(),
         user_type: "offline".to_string(),
         version_type: "Cubic".to_string(),
@@ -1110,6 +1222,15 @@ async fn select_or_download_java(
                 launcher_paths.java_runtimes_dir().display()
             )
         })
+}
+
+fn format_uuid_with_dashes(uuid: &str) -> String {
+    let clean = uuid.replace('-', "");
+    if clean.len() == 32 {
+        format!("{}-{}-{}-{}-{}", &clean[0..8], &clean[8..12], &clean[12..16], &clean[16..20], &clean[20..32])
+    } else {
+        uuid.to_string()
+    }
 }
 
 fn substitute_loader_placeholders(
