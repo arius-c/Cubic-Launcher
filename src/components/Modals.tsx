@@ -46,7 +46,7 @@ import {
   /* Export */
   exportModalOpen, setExportModalOpen, exportOptions, setExportOptions,
 } from "../store";
-import { XIcon, AlertTriangleIcon } from "./icons";
+import { XIcon, AlertTriangleIcon, ChevronRightIcon, ChevronDownIcon, MaterialIcon } from "./icons";
 
 // ── Sortable alternative row (for drag-and-drop in the alternatives panel) ────
 function DraggableAltRow(props: {
@@ -1355,17 +1355,173 @@ export function ErrorCenter() {
 }
 
 // ── Export Modal ──────────────────────────────────────────────────────────────
+
+type FileNode = { name: string; path: string; isDir: boolean; children: FileNode[] };
+
+function FileTreeNode(props: { node: FileNode; modlistName: string; selected: Set<string>; onToggle: (path: string) => void; depth?: number }) {
+  const [expanded, setExpanded] = createSignal(false);
+  const [children, setChildren] = createSignal<FileNode[]>([]);
+  const [loaded, setLoaded] = createSignal(false);
+  const isSelected = () => props.selected.has(props.node.path);
+  const d = () => props.depth ?? 0;
+
+  const toggleExpand = async (e: MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!loaded() && props.node.isDir) {
+      try {
+        const nodes: FileNode[] = await invoke("list_instance_files_command", {
+          modlistName: props.modlistName,
+          relativePath: props.node.path,
+        });
+        setChildren(nodes);
+      } catch { setChildren([]); }
+      setLoaded(true);
+    }
+    setExpanded(v => !v);
+  };
+
+  return (
+    <div style={{ "padding-left": `${d() * 16}px` }}>
+      <div class="flex items-center gap-1.5 py-0.5 text-xs hover:bg-muted/30 rounded px-1">
+        <Show when={props.node.isDir} fallback={<span class="w-3 shrink-0" />}>
+          <button class="shrink-0 text-muted-foreground" onClick={toggleExpand}>
+            <Show when={expanded()} fallback={<ChevronRightIcon class="h-3 w-3" />}><ChevronDownIcon class="h-3 w-3" /></Show>
+          </button>
+        </Show>
+        <input
+          type="checkbox"
+          checked={isSelected()}
+          onChange={() => props.onToggle(props.node.path)}
+          class="h-3 w-3 rounded text-primary cursor-pointer"
+        />
+        <MaterialIcon name={props.node.isDir ? "folder" : "description"} size="sm" class={props.node.isDir ? "text-primary" : "text-muted-foreground"} />
+        <span class="text-foreground truncate">{props.node.name}</span>
+      </div>
+      <Show when={expanded()}>
+        <For each={children()}>
+          {child => <FileTreeNode node={child} modlistName={props.modlistName} selected={props.selected} onToggle={props.onToggle} depth={d() + 1} />}
+        </For>
+        <Show when={loaded() && children().length === 0}>
+          <div style={{ "padding-left": `${(d() + 1) * 16}px` }} class="text-[10px] text-muted-foreground py-0.5 px-1">Empty</div>
+        </Show>
+      </Show>
+    </div>
+  );
+}
+
 export function ExportModal(props: { onExport: () => Promise<void> }) {
   const [saving, setSaving] = createSignal(false);
+  const [contentOpen, setContentOpen] = createSignal(false);
+  const [rpOpen, setRpOpen] = createSignal(false);
+  const [dpOpen, setDpOpen] = createSignal(false);
+  const [shOpen, setShOpen] = createSignal(false);
+  const [otherChecked, setOtherChecked] = createSignal(false);
+  const [instanceTree, setInstanceTree] = createSignal<FileNode[]>([]);
+  const [treeLoading, setTreeLoading] = createSignal(false);
+  const [selectedPaths, setSelectedPaths] = createSignal<Set<string>>(new Set());
+
+  // Load instance roots when "Other files" is checked
+  createEffect(() => {
+    if (otherChecked() && selectedModListName()) {
+      setTreeLoading(true);
+      invoke("list_instance_files_command", { modlistName: selectedModListName(), relativePath: "" })
+        .then((tree: any) => setInstanceTree(tree as FileNode[]))
+        .catch(() => setInstanceTree([]))
+        .finally(() => setTreeLoading(false));
+    }
+  });
+
+  const togglePath = (path: string) => {
+    const next = new Set(selectedPaths());
+    if (next.has(path)) next.delete(path); else next.add(path);
+    setSelectedPaths(next);
+    setExportOptions(o => ({ ...o, selectedOtherPaths: [...next] }));
+  };
+
+  const allContentChecked = () => exportOptions().resourcePacks && exportOptions().dataPacks && exportOptions().shaders;
+  const someContentChecked = () => exportOptions().resourcePacks || exportOptions().dataPacks || exportOptions().shaders;
+
+  const toggleAllContent = (checked: boolean) => {
+    setExportOptions(o => ({ ...o, resourcePacks: checked, dataPacks: checked, shaders: checked }));
+  };
 
   const handleExport = async () => {
     if (saving()) return;
     setSaving(true);
-    try {
-      await props.onExport();
-    } finally {
-      setSaving(false);
-    }
+    try { await props.onExport(); } finally { setSaving(false); }
+  };
+
+  // Lazily-loaded content pack sub-section
+  const ContentSubSection = (subProps: {
+    label: string;
+    dirName: string;
+    checked: boolean;
+    onCheck: (v: boolean) => void;
+    open: boolean;
+    onToggleOpen: () => void;
+  }) => {
+    const [files, setFiles] = createSignal<{ name: string; path: string }[]>([]);
+    const [filesLoaded, setFilesLoaded] = createSignal(false);
+
+    // Load files from all instances for this content type when expanded
+    createEffect(() => {
+      if (subProps.open && !filesLoaded() && selectedModListName()) {
+        const modlist = selectedModListName();
+        // Load content dir from each instance
+        void (async () => {
+          const roots: FileNode[] = await invoke("list_instance_files_command", { modlistName: modlist, relativePath: "" }).catch(() => [] as FileNode[]) as FileNode[];
+          const allFiles: { name: string; path: string }[] = [];
+          for (const instance of roots) {
+            if (!instance.isDir) continue;
+            try {
+              const children: FileNode[] = await invoke("list_instance_files_command", { modlistName: modlist, relativePath: `${instance.path}/${subProps.dirName}` }) as FileNode[];
+              for (const f of children) {
+                allFiles.push({ name: `${instance.name}/${f.name}`, path: f.path });
+              }
+            } catch { /* dir may not exist */ }
+          }
+          setFiles(allFiles);
+          setFilesLoaded(true);
+        })();
+      }
+    });
+
+    return (
+      <div>
+        <div class="flex items-center gap-2">
+          <label class="flex items-center gap-3 text-sm flex-1">
+            <input type="checkbox" checked={subProps.checked} onChange={e => subProps.onCheck(e.currentTarget.checked)} class="h-3.5 w-3.5 rounded text-primary" />
+            <span class="text-muted-foreground">{subProps.label}</span>
+          </label>
+          <button onClick={subProps.onToggleOpen} class="text-muted-foreground hover:text-foreground transition-colors p-0.5">
+            <Show when={subProps.open} fallback={<ChevronRightIcon class="h-3 w-3" />}><ChevronDownIcon class="h-3 w-3" /></Show>
+          </button>
+        </div>
+        <Show when={subProps.open}>
+          <div class="ml-6 mt-1 space-y-0.5 max-h-32 overflow-y-auto">
+            <Show when={files().length > 0} fallback={
+              <p class="text-[10px] text-muted-foreground py-1">{filesLoaded() ? "None found" : "Loading..."}</p>
+            }>
+              <For each={files()}>
+                {file => (
+                  <label class="flex items-center gap-2 text-xs py-0.5 cursor-pointer hover:bg-muted/30 rounded px-1">
+                    <input
+                      type="checkbox"
+                      checked={selectedPaths().has(file.path)}
+                      onChange={() => togglePath(file.path)}
+                      class="h-3 w-3 rounded text-primary"
+                    />
+                    <MaterialIcon name="description" size="sm" class="text-muted-foreground" />
+                    <span class="text-muted-foreground truncate">{file.name}</span>
+                  </label>
+                )}
+              </For>
+            </Show>
+          </div>
+        </Show>
+      </div>
+    );
   };
 
   return (
@@ -1373,12 +1529,97 @@ export function ExportModal(props: { onExport: () => Promise<void> }) {
       <Modal onClose={() => setExportModalOpen(false)}>
         <ModalHeader title="Export Mod List" description="Choose what to include in the .zip archive" onClose={() => setExportModalOpen(false)} />
         <div class="p-6 space-y-3">
-          {([ ["rulesJson","Mod-list definition (rules.json)"], ["modJars","Mod JAR files from cache"], ["configFiles","Config files from cache"], ["resourcePacks","Resource packs"], ["otherFiles","Other files"] ] as const).map(([key, label]) => (
+          {/* Rules JSON */}
+          <label class="flex items-center gap-3 text-sm">
+            <input type="checkbox" checked={exportOptions().rulesJson} onChange={e => setExportOptions(o => ({ ...o, rulesJson: e.currentTarget.checked }))} class="h-4 w-4 rounded text-primary" />
+            <span class="text-foreground">Mod-list definition (rules.json)</span>
+          </label>
+
+          {/* Mod JARs */}
+          <label class="flex items-center gap-3 text-sm">
+            <input type="checkbox" checked={exportOptions().modJars} onChange={e => setExportOptions(o => ({ ...o, modJars: e.currentTarget.checked }))} class="h-4 w-4 rounded text-primary" />
+            <span class="text-foreground">Mod JAR files from cache</span>
+          </label>
+
+          {/* Config files */}
+          <label class="flex items-center gap-3 text-sm">
+            <input type="checkbox" checked={exportOptions().configFiles} onChange={e => setExportOptions(o => ({ ...o, configFiles: e.currentTarget.checked }))} class="h-4 w-4 rounded text-primary" />
+            <span class="text-foreground">Config files</span>
+          </label>
+
+          {/* Content packs — collapsible with per-file selection */}
+          <div>
+            <div class="flex items-center gap-2">
+              <label class="flex items-center gap-3 text-sm flex-1">
+                <input
+                  type="checkbox"
+                  checked={allContentChecked()}
+                  ref={el => { createEffect(() => { el.indeterminate = someContentChecked() && !allContentChecked(); }); }}
+                  onChange={e => toggleAllContent(e.currentTarget.checked)}
+                  class="h-4 w-4 rounded text-primary"
+                />
+                <span class="text-foreground">Content packs</span>
+              </label>
+              <button onClick={() => setContentOpen(v => !v)} class="text-muted-foreground hover:text-foreground transition-colors p-0.5">
+                <Show when={contentOpen()} fallback={<ChevronRightIcon class="h-3.5 w-3.5" />}><ChevronDownIcon class="h-3.5 w-3.5" /></Show>
+              </button>
+            </div>
+            <Show when={contentOpen()}>
+              <div class="ml-7 mt-1 space-y-1.5">
+                <ContentSubSection
+                  label="Resource Packs"
+                  dirName="resourcepacks"
+                  checked={exportOptions().resourcePacks}
+                  onCheck={v => setExportOptions(o => ({ ...o, resourcePacks: v }))}
+                  open={rpOpen()}
+                  onToggleOpen={() => setRpOpen(v => !v)}
+                />
+                <ContentSubSection
+                  label="Data Packs"
+                  dirName="datapacks"
+                  checked={exportOptions().dataPacks}
+                  onCheck={v => setExportOptions(o => ({ ...o, dataPacks: v }))}
+                  open={dpOpen()}
+                  onToggleOpen={() => setDpOpen(v => !v)}
+                />
+                <ContentSubSection
+                  label="Shaders"
+                  dirName="shaderpacks"
+                  checked={exportOptions().shaders}
+                  onCheck={v => setExportOptions(o => ({ ...o, shaders: v }))}
+                  open={shOpen()}
+                  onToggleOpen={() => setShOpen(v => !v)}
+                />
+              </div>
+            </Show>
+          </div>
+
+          {/* Other files — with instance tree */}
+          <div>
             <label class="flex items-center gap-3 text-sm">
-              <input type="checkbox" checked={(exportOptions() as any)[key]} onChange={e => setExportOptions(o => ({ ...o, [key]: e.currentTarget.checked }))} class="h-4 w-4 rounded text-primary" />
-              <span class="text-foreground">{label}</span>
+              <input type="checkbox" checked={otherChecked()} onChange={e => { setOtherChecked(e.currentTarget.checked); setExportOptions(o => ({ ...o, otherFiles: e.currentTarget.checked })); }} class="h-4 w-4 rounded text-primary" />
+              <span class="text-foreground">Other files from instances</span>
             </label>
-          ))}
+            <Show when={otherChecked()}>
+              <div class="ml-7 mt-2 max-h-48 overflow-y-auto rounded-md border border-border bg-background p-2">
+                <Show when={treeLoading()}>
+                  <p class="text-xs text-muted-foreground py-2 text-center">Loading instance files...</p>
+                </Show>
+                <Show when={!treeLoading() && instanceTree().length > 0}>
+                  <For each={instanceTree()}>
+                    {node => <FileTreeNode node={node} modlistName={selectedModListName()} selected={selectedPaths()} onToggle={togglePath} depth={0} />}
+                  </For>
+                </Show>
+                <Show when={!treeLoading() && instanceTree().length === 0}>
+                  <p class="text-xs text-muted-foreground py-2 text-center">No instance files found. Launch the game at least once to create an instance.</p>
+                </Show>
+                <Show when={selectedPaths().size > 0}>
+                  <p class="mt-2 text-[10px] text-muted-foreground border-t border-border pt-1">{selectedPaths().size} path{selectedPaths().size !== 1 ? "s" : ""} selected</p>
+                </Show>
+              </div>
+            </Show>
+          </div>
+
           <p class="pt-2 text-xs text-muted-foreground">
             {exportOptions().rulesJson && !exportOptions().modJars
               ? "Rules-only export is tiny — the recipient's Cubic Launcher will download dependencies automatically."

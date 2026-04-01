@@ -1,16 +1,19 @@
 import { For, Show, createSignal, createEffect, onMount, onCleanup } from "solid-js";
+import { invoke } from "@tauri-apps/api/core";
 import {
   addModModalOpen, setAddModModalOpen,
   addModSearch, setAddModSearch,
   addModMode, setAddModMode,
   localJarRuleName, setLocalJarRuleName,
   MOCK_MODRINTH, modRowsState,
+  activeContentTab, selectedModListName,
 } from "../store";
-import { SearchIcon, XIcon, UploadIcon, PackageIcon, CheckIcon, Loader2Icon } from "./icons";
+import { SearchIcon, XIcon, UploadIcon, PackageIcon, CheckIcon, Loader2Icon, MaterialIcon } from "./icons";
 import type { ModrinthResult } from "../lib/types";
 
 interface AddModDialogProps {
   onAddModrinth: (id: string, name: string) => Promise<void>;
+  onAddContent?: (contentType: string, id: string, name: string) => Promise<void>;
   onUploadLocal: () => Promise<void>;
   onDropJar?: (path: string) => Promise<void>;
 }
@@ -57,9 +60,9 @@ const SORT_OPTIONS = [
   { value: "newest", label: "Newest" },
 ];
 
-async function searchModrinth(query: string, filters: SearchFilters, offset = 0): Promise<{ results: ModrinthResult[]; totalHits: number }> {
+async function searchModrinth(query: string, filters: SearchFilters, offset = 0, projType = "mod"): Promise<{ results: ModrinthResult[]; totalHits: number }> {
   try {
-    const facetGroups: string[][] = [["project_type:mod"]];
+    const facetGroups: string[][] = [[`project_type:${projType}`]];
     if (filters.categories.length > 0) facetGroups.push(filters.categories.map(c => `categories:${c}`));
     if (filters.loaders.length > 0) facetGroups.push(filters.loaders.map(l => `categories:${l}`));
     if (filters.versions.length > 0) facetGroups.push(filters.versions.map(v => `versions:${v}`));
@@ -103,8 +106,20 @@ async function searchModrinth(query: string, filters: SearchFilters, offset = 0)
 
 // ── Local JAR drop zone ───────────────────────────────────────────────────────
 
-function LocalJarTab(props: { onUploadLocal: () => Promise<void>; onDropJar?: (path: string) => Promise<void> }) {
+function LocalJarTab(props: { contentType: string; onUploadLocal: () => Promise<void>; onDropJar?: (path: string) => Promise<void> }) {
   const [dragging, setDragging] = createSignal(false);
+
+  const isMod = () => props.contentType === "mod";
+  const fileExt = () => isMod() ? ".jar" : ".zip";
+  const fileLabel = () => isMod() ? "JAR" : "ZIP";
+  const typeLabel = () => {
+    switch (props.contentType) {
+      case "resourcepack": return "Resource Pack";
+      case "datapack": return "Data Pack";
+      case "shader": return "Shader";
+      default: return "JAR";
+    }
+  };
 
   onMount(async () => {
     try {
@@ -118,9 +133,9 @@ function LocalJarTab(props: { onUploadLocal: () => Promise<void>; onDropJar?: (p
         } else if (event.payload.type === "drop") {
           setDragging(false);
           const paths: string[] = event.payload.paths ?? [];
-          const jarPath = paths.find(p => p.endsWith(".jar"));
-          if (jarPath && props.onDropJar) {
-            await props.onDropJar(jarPath);
+          const matchedPath = paths.find(p => p.endsWith(fileExt()));
+          if (matchedPath && props.onDropJar) {
+            await props.onDropJar(matchedPath);
           }
         }
       });
@@ -137,10 +152,10 @@ function LocalJarTab(props: { onUploadLocal: () => Promise<void>; onDropJar?: (p
       >
         <UploadIcon class={`mb-4 h-12 w-12 transition-colors ${dragging() ? "text-primary" : "text-muted-foreground/50"}`} />
         <h4 class="mb-1 font-medium text-foreground">
-          {dragging() ? "Drop JAR file here" : "Upload JAR File"}
+          {dragging() ? `Drop ${fileLabel()} file here` : `Upload ${typeLabel()} File`}
         </h4>
         <p class="mb-4 max-w-xs text-center text-sm text-muted-foreground">
-          Drag & drop a <code>.jar</code> file here, or click Browse Files below.
+          Drag & drop a <code>{fileExt()}</code> file here, or click Browse Files below.
         </p>
         <div class="flex w-full max-w-xs flex-col gap-3">
           <input
@@ -157,9 +172,11 @@ function LocalJarTab(props: { onUploadLocal: () => Promise<void>; onDropJar?: (p
             Browse Files
           </button>
         </div>
-        <p class="mt-4 max-w-xs text-center text-xs text-warning">
-          Local mods carry a dependency warning — you must manually verify and add required library mods.
-        </p>
+        <Show when={isMod()}>
+          <p class="mt-4 max-w-xs text-center text-xs text-warning">
+            Local mods carry a dependency warning — you must manually verify and add required library mods.
+          </p>
+        </Show>
       </div>
     </div>
   );
@@ -179,7 +196,33 @@ export function AddModDialog(props: AddModDialogProps) {
   const [selVersions, setSelVersions] = createSignal<Set<string>>(new Set());
   const [selEnvs, setSelEnvs] = createSignal<Set<string>>(new Set());
   const [sortBy, setSortBy] = createSignal("relevance");
+  const [contentType, setContentType] = createSignal<"mod" | "resourcepack" | "datapack" | "shader">("mod");
   const [showMoreCats, setShowMoreCats] = createSignal(false);
+  const [existingContentIds, setExistingContentIds] = createSignal<Set<string>>(new Set());
+
+  // Sync content type with active tab when dialog opens
+  createEffect(() => {
+    if (addModModalOpen()) {
+      const tab = activeContentTab();
+      setContentType(tab === "mods" ? "mod" : tab);
+    }
+  });
+
+  // Load existing content entry IDs when content type or dialog changes
+  createEffect(() => {
+    const ct = contentType();
+    const open = addModModalOpen();
+    if (!open || ct === "mod") { setExistingContentIds(new Set()); return; }
+    const modlist = selectedModListName();
+    if (!modlist) return;
+    void (async () => {
+      try {
+        const snap: any = await invoke("load_content_list_command", { input: { modlistName: modlist, contentType: ct } });
+        const ids = new Set<string>((snap.entries ?? []).map((e: any) => e.id));
+        setExistingContentIds(ids);
+      } catch { setExistingContentIds(new Set()); }
+    })();
+  });
 
   const PAGE_SIZE = 20;
   const totalPages = () => Math.max(1, Math.ceil(totalHits() / PAGE_SIZE));
@@ -196,13 +239,15 @@ export function AddModDialog(props: AddModDialogProps) {
     sortBy: sortBy(),
   });
 
+  const projectType = () => contentType() === "datapack" ? "datapack" : contentType() === "resourcepack" ? "resourcepack" : contentType() === "shader" ? "shader" : "mod";
+
   const hasFilters = () => selCategories().size > 0 || selLoaders().size > 0 || selVersions().size > 0 || selEnvs().size > 0;
 
   const runSearch = async (pg?: number) => {
     const p = pg ?? page();
     setSearching(true);
     try {
-      const { results, totalHits: total } = await searchModrinth(addModSearch(), filters(), p * PAGE_SIZE);
+      const { results, totalHits: total } = await searchModrinth(addModSearch(), filters(), p * PAGE_SIZE, projectType());
       setSearchResults(results);
       setTotalHits(total);
     } catch { /* */ }
@@ -214,10 +259,11 @@ export function AddModDialog(props: AddModDialogProps) {
   createEffect(() => {
     const q = addModSearch();
     const f = filters(); // track filter changes
+    const ct = contentType(); // track content type change
     clearTimeout(debounceTimer);
     if (addModMode() !== "modrinth") return;
 
-    setPage(0); // reset to page 0 on query/filter change
+    setPage(0); // reset to page 0 on query/filter/type change
     debounceTimer = setTimeout(() => void runSearch(0), 350);
   });
 
@@ -233,9 +279,16 @@ export function AddModDialog(props: AddModDialogProps) {
 
   const handleAdd = async (id: string, name: string) => {
     setAddingIds(s => new Set([...s, id]));
-    await props.onAddModrinth(id, name);
+    if (contentType() === "mod") {
+      await props.onAddModrinth(id, name);
+    } else if (props.onAddContent) {
+      await props.onAddContent(contentType(), id, name);
+    }
     setAddingIds(s => { const n = new Set(s); n.delete(id); return n; });
     setAddedIds(s => new Set([...s, id]));
+    if (contentType() !== "mod") {
+      setExistingContentIds(s => new Set([...s, id]));
+    }
   };
 
   const close = () => {
@@ -255,12 +308,9 @@ export function AddModDialog(props: AddModDialogProps) {
         <div class="flex max-h-[90vh] w-full max-w-4xl flex-col overflow-hidden rounded-lg border border-border bg-card shadow-xl">
 
           {/* Header */}
-          <div class="flex items-center justify-between border-b border-border px-6 py-4">
+          <div class="flex items-center justify-between border-b border-border px-6 py-3">
             <div>
-              <h2 class="text-lg font-semibold text-foreground">Add Mod</h2>
-              <p class="text-sm text-muted-foreground">
-                Search Modrinth or upload a local JAR file.
-              </p>
+              <h2 class="text-lg font-semibold text-foreground">Add Content</h2>
             </div>
             <button
               onClick={close}
@@ -270,30 +320,55 @@ export function AddModDialog(props: AddModDialogProps) {
             </button>
           </div>
 
-          {/* Tabs */}
-          <div class="flex border-b border-border">
-            <button
-              onClick={() => { setAddModMode("modrinth"); }}
-              class={`flex items-center gap-2 px-6 py-3 text-sm font-medium transition-colors ${
-                addModMode() === "modrinth"
-                  ? "border-b-2 border-primary text-primary"
-                  : "text-muted-foreground hover:text-foreground"
-              }`}
-            >
-              <SearchIcon class="h-4 w-4" />
-              Search Modrinth
-            </button>
-            <button
-              onClick={() => setAddModMode("local")}
-              class={`flex items-center gap-2 px-6 py-3 text-sm font-medium transition-colors ${
-                addModMode() === "local"
-                  ? "border-b-2 border-primary text-primary"
-                  : "text-muted-foreground hover:text-foreground"
-              }`}
-            >
-              <UploadIcon class="h-4 w-4" />
-              Upload Local
-            </button>
+          {/* Content type + mode tabs */}
+          <div class="flex items-center border-b border-border">
+            {/* Content type pills */}
+            <div class="flex items-center gap-1 px-4">
+              <For each={[
+                { id: "mod" as const, label: "Mods", icon: "extension" },
+                { id: "resourcepack" as const, label: "Resource Packs", icon: "palette" },
+                { id: "datapack" as const, label: "Data Packs", icon: "database" },
+                { id: "shader" as const, label: "Shaders", icon: "auto_awesome" },
+              ]}>
+                {tab => (
+                  <button
+                    onClick={() => setContentType(tab.id)}
+                    class={`flex items-center gap-1 px-3 py-2.5 text-xs font-medium rounded-t transition-colors ${
+                      contentType() === tab.id
+                        ? "bg-primary/10 text-primary border-b-2 border-primary"
+                        : "text-muted-foreground hover:text-foreground"
+                    }`}
+                  >
+                    <MaterialIcon name={tab.icon} size="sm" />
+                    {tab.label}
+                  </button>
+                )}
+              </For>
+            </div>
+            <div class="ml-auto flex items-center border-l border-border">
+              <button
+                onClick={() => { setAddModMode("modrinth"); }}
+                class={`flex items-center gap-1.5 px-4 py-2.5 text-xs font-medium transition-colors ${
+                  addModMode() === "modrinth"
+                    ? "text-primary"
+                    : "text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                <SearchIcon class="h-3.5 w-3.5" />
+                Search
+              </button>
+              <button
+                onClick={() => setAddModMode("local")}
+                class={`flex items-center gap-1.5 px-4 py-2.5 text-xs font-medium transition-colors ${
+                  addModMode() === "local"
+                    ? "text-primary"
+                    : "text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                <UploadIcon class="h-3.5 w-3.5" />
+                Upload
+              </button>
+            </div>
           </div>
 
           {/* Body */}
@@ -301,7 +376,7 @@ export function AddModDialog(props: AddModDialogProps) {
             <Show
               when={addModMode() === "modrinth"}
               fallback={
-                <div class="flex-1 overflow-y-auto p-6"><LocalJarTab onUploadLocal={props.onUploadLocal} onDropJar={props.onDropJar} /></div>
+                <div class="flex-1 overflow-y-auto p-6"><LocalJarTab contentType={contentType()} onUploadLocal={props.onUploadLocal} onDropJar={props.onDropJar} /></div>
               }
             >
               {/* ── Modrinth search tab ── */}
@@ -393,7 +468,7 @@ export function AddModDialog(props: AddModDialogProps) {
                     </Show>
                     <input
                       type="text"
-                      placeholder="Search mods..."
+                      placeholder={contentType() === "mod" ? "Search mods..." : contentType() === "resourcepack" ? "Search resource packs..." : contentType() === "datapack" ? "Search data packs..." : "Search shaders..."}
                       value={addModSearch()}
                       onInput={e => setAddModSearch(e.currentTarget.value)}
                       class="h-10 w-full rounded-xl border border-input bg-input pl-10 pr-10 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/50 focus:border-primary transition-all"
@@ -403,7 +478,7 @@ export function AddModDialog(props: AddModDialogProps) {
 
                   <Show when={!addModSearch() && !searching() && !hasFilters()}>
                     <p class="mb-3 text-xs text-muted-foreground">
-                      Popular mods on Modrinth
+                      {contentType() === "mod" ? "Popular mods" : contentType() === "resourcepack" ? "Popular resource packs" : contentType() === "datapack" ? "Popular data packs" : "Popular shaders"} on Modrinth
                     </p>
                   </Show>
 
@@ -422,7 +497,7 @@ export function AddModDialog(props: AddModDialogProps) {
                         collect(modRowsState());
                         return ids;
                       };
-                      const isAdded  = () => addedIds().has(mod.id) || existingModIds().has(mod.id);
+                      const isAdded  = () => addedIds().has(mod.id) || existingModIds().has(mod.id) || existingContentIds().has(mod.id);
                       const isAdding = () => addingIds().has(mod.id);
 
                       return (
@@ -469,7 +544,7 @@ export function AddModDialog(props: AddModDialogProps) {
                               <button
                                 class="flex h-8 items-center rounded-lg px-3 text-xs font-medium bg-primary text-primary-foreground hover:bg-primary/90 opacity-0 group-hover:opacity-100 transition-opacity"
                               >
-                                Install
+                                Add
                               </button>
                             </Show>
                           </div>

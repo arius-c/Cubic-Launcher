@@ -1568,7 +1568,10 @@ export default function App() {
           modJars: options.modJars,
           configFiles: options.configFiles,
           resourcePacks: options.resourcePacks,
+          dataPacks: options.dataPacks,
+          shaders: options.shaders,
           otherFiles: options.otherFiles,
+          selectedOtherPaths: options.selectedOtherPaths,
         },
       });
       setExportModalOpen(false);
@@ -1639,7 +1642,16 @@ export default function App() {
       </div>
 
       {/* Modals */}
-      <AddModDialog onAddModrinth={handleAddModrinth} onUploadLocal={handleUploadLocal} onDropJar={async (path) => {
+      <AddModDialog onAddModrinth={handleAddModrinth} onAddContent={async (contentType, id, _name) => {
+        if (!selectedModListName()) return;
+        try {
+          await invoke("add_content_command", { input: { modlistName: selectedModListName(), contentType, id, source: "modrinth" } });
+          const { bumpContentVersion } = await import("./components/ModListEditor");
+          bumpContentVersion();
+        } catch (err) {
+          pushUiError({ title: "Failed to add content", message: `Could not add '${id}'.`, detail: String(err), severity: "error", scope: "launch" });
+        }
+      }} onUploadLocal={handleUploadLocal} onDropJar={async (path) => {
         if (!selectedModListName()) return;
         try {
           await invoke("copy_local_jar_command", {

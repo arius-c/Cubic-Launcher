@@ -91,7 +91,7 @@ pub fn clear_instance_mods_directory(instance_mods_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn create_file_link(source_path: &Path, target_path: &Path) -> Result<()> {
+pub fn create_file_link(source_path: &Path, target_path: &Path) -> Result<()> {
     if target_path.exists() {
         fs::remove_file(target_path).with_context(|| {
             format!("failed to remove existing target {}", target_path.display())

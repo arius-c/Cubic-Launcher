@@ -11,6 +11,7 @@ pub struct LauncherPaths {
     cache_dir: PathBuf,
     mods_cache_dir: PathBuf,
     configs_cache_dir: PathBuf,
+    content_packs_cache_dir: PathBuf,
     modlists_dir: PathBuf,
     java_runtimes_dir: PathBuf,
     database_path: PathBuf,
@@ -22,6 +23,7 @@ impl LauncherPaths {
         let cache_dir = root_dir.join("cache");
         let mods_cache_dir = cache_dir.join("mods");
         let configs_cache_dir = cache_dir.join("configs");
+        let content_packs_cache_dir = cache_dir.join("content-packs");
         let modlists_dir = root_dir.join("mod-lists");
         let java_runtimes_dir = root_dir.join("java-runtimes");
         let database_path = root_dir.join(DATABASE_FILENAME);
@@ -31,6 +33,7 @@ impl LauncherPaths {
             cache_dir,
             mods_cache_dir,
             configs_cache_dir,
+            content_packs_cache_dir,
             modlists_dir,
             java_runtimes_dir,
             database_path,
@@ -55,6 +58,10 @@ impl LauncherPaths {
 
     pub fn configs_cache_dir(&self) -> &std::path::Path {
         &self.configs_cache_dir
+    }
+
+    pub fn content_packs_cache_dir(&self) -> &std::path::Path {
+        &self.content_packs_cache_dir
     }
 
     pub fn java_runtimes_dir(&self) -> &std::path::Path {
@@ -83,6 +90,7 @@ impl LauncherPaths {
             &self.cache_dir,
             &self.mods_cache_dir,
             &self.configs_cache_dir,
+            &self.content_packs_cache_dir,
             &self.modlists_dir,
             &self.java_runtimes_dir,
         ] {

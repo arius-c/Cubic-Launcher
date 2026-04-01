@@ -71,6 +71,32 @@ impl ModrinthClient {
         Ok(select_latest_compatible_version(&versions, target))
     }
 
+    /// Fetch versions for a content pack (resource pack, data pack, shader).
+    /// Only filters by game version, not by loader.
+    pub async fn fetch_content_pack_versions(
+        &self,
+        project_id: &str,
+        minecraft_version: &str,
+    ) -> Result<Vec<ModrinthVersion>> {
+        if project_id.trim().is_empty() {
+            bail!("project_id cannot be empty");
+        }
+        let sanitized = self.base_url.trim_end_matches('/');
+        let mut url = Url::parse(&format!("{sanitized}/project/{project_id}/version"))
+            .with_context(|| format!("invalid Modrinth base URL '{}'", self.base_url))?;
+        let game_versions_json = serde_json::to_string(&vec![minecraft_version])?;
+        url.query_pairs_mut()
+            .append_pair("game_versions", &game_versions_json);
+        let response = self.http_client.get(url).send().await
+            .with_context(|| format!("failed to query Modrinth versions for content pack '{project_id}'"))?
+            .error_for_status()
+            .with_context(|| format!("Modrinth returned an error for content pack '{project_id}'"))?;
+        let versions = response.json::<Vec<ModrinthVersion>>().await
+            .with_context(|| format!("failed to deserialize Modrinth versions for content pack '{project_id}'"))?;
+        // Filter to only versions matching the MC version
+        Ok(versions.into_iter().filter(|v| v.game_versions.iter().any(|gv| gv == minecraft_version)).collect())
+    }
+
     pub async fn fetch_version(&self, version_id: &str) -> Result<Option<ModrinthVersion>> {
         if version_id.trim().is_empty() {
             bail!("version_id cannot be empty");

@@ -10,7 +10,7 @@ use tauri::State;
 use zip::write::FileOptions;
 
 use crate::launcher_paths::LauncherPaths;
-use crate::rules::{ModlistPresentation, RULES_FILENAME};
+use crate::rules::{ModList, ModlistPresentation, Rule, RULES_FILENAME};
 
 const MODLIST_PRESENTATION_FILENAME: &str = "modlist-presentation.json";
 const MODLIST_GROUP_LAYOUT_FILENAME: &str = "modlist-editor-groups.json";
@@ -75,7 +75,14 @@ pub struct ExportModlistInput {
     pub mod_jars: bool,
     pub config_files: bool,
     pub resource_packs: bool,
+    #[serde(default)]
+    pub data_packs: bool,
+    #[serde(default)]
+    pub shaders: bool,
     pub other_files: bool,
+    /// If non-empty, only these relative paths from instance dirs are included for "other_files".
+    #[serde(default)]
+    pub selected_other_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -135,6 +142,67 @@ pub fn export_modlist_command(
     input: ExportModlistInput,
 ) -> Result<(), String> {
     export_modlist_from_root(launcher_paths.root_dir(), &input).map_err(|error| error.to_string())
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstanceFileNode {
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<InstanceFileNode>,
+}
+
+/// Lists direct children of a directory inside the instances folder.
+/// Called with an empty `relative_path` to get instance roots,
+/// or with e.g. `"26.1-fabric/config"` to expand that directory.
+#[tauri::command]
+pub fn list_instance_files_command(
+    launcher_paths: State<'_, LauncherPaths>,
+    modlist_name: String,
+    #[allow(unused_variables)]
+    relative_path: Option<String>,
+) -> Result<Vec<InstanceFileNode>, String> {
+    let instances_dir = launcher_paths.modlists_dir().join(&modlist_name).join("instances");
+    if !instances_dir.exists() { return Ok(vec![]); }
+
+    let target = match &relative_path {
+        Some(rel) if !rel.is_empty() => instances_dir.join(rel),
+        _ => instances_dir.clone(),
+    };
+    if !target.exists() { return Ok(vec![]); }
+
+    // Determine depth for filtering (0 = listing instance roots, 1 = inside an instance)
+    let depth = match &relative_path {
+        Some(rel) if !rel.is_empty() => rel.matches('/').count() as u32 + 1,
+        _ => 0,
+    };
+
+    let entries = match fs::read_dir(&target) {
+        Ok(rd) => rd,
+        Err(_) => return Ok(vec![]),
+    };
+    let mut sorted: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+    sorted.sort_by_key(|e| e.file_name());
+
+    let mut nodes = Vec::new();
+    for entry in sorted {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') { continue; }
+        // Skip launcher-managed dirs at instance root level
+        if depth == 1 && matches!(name.as_str(),
+            "mods" | "libraries" | "natives" | "assets" | "logs" | "data" |
+            "downloads"
+        ) { continue; }
+        let path = entry.path();
+        let relative = path.strip_prefix(&instances_dir).unwrap_or(&path);
+        let rel_str = relative.to_string_lossy().replace('\\', "/");
+        let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+        // Children are NOT loaded here — frontend requests them on expand
+        nodes.push(InstanceFileNode { name, path: rel_str, is_dir, children: vec![] });
+    }
+    Ok(nodes)
 }
 
 #[tauri::command]
@@ -326,63 +394,105 @@ pub fn export_modlist_from_root(root_dir: &Path, input: &ExportModlistInput) -> 
     }
 
     if input.config_files {
-        add_directory_contents(
-            &mut archive,
-            &mut added_paths,
-            launcher_paths.configs_cache_dir(),
-            &format!("{archive_root}/cache/configs"),
-        )?;
+        // Collect config files referenced in rules.json custom_configs
+        let rules_path = modlist_dir.join(RULES_FILENAME);
+        if rules_path.exists() {
+            if let Ok(modlist) = ModList::read_from_file(&rules_path) {
+                fn collect_config_files(rule: &Rule, out: &mut Vec<(String, String)>) {
+                    for cc in &rule.custom_configs {
+                        for file_path in &cc.files {
+                            // Use target_path + filename as archive path
+                            let file_name = Path::new(file_path)
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("unknown");
+                            let archive_rel = if cc.target_path.is_empty() {
+                                format!("config/{file_name}")
+                            } else {
+                                let base = cc.target_path.trim_end_matches('/');
+                                format!("{base}/{file_name}")
+                            };
+                            out.push((file_path.clone(), archive_rel));
+                        }
+                    }
+                    for alt in &rule.alternatives {
+                        collect_config_files(alt, out);
+                    }
+                }
+                let mut config_entries: Vec<(String, String)> = Vec::new();
+                for rule in &modlist.rules {
+                    collect_config_files(rule, &mut config_entries);
+                }
+                for (source, rel_path) in &config_entries {
+                    add_file_if_exists(
+                        &mut archive,
+                        &mut added_paths,
+                        Path::new(source),
+                        &format!("{archive_root}/{rel_path}"),
+                    )?;
+                }
+            }
+        }
     }
 
-    if input.resource_packs {
+    // Content packs from instance directories
+    for (flag, dir_name) in [
+        (input.resource_packs, "resourcepacks"),
+        (input.data_packs, "datapacks"),
+        (input.shaders, "shaderpacks"),
+    ] {
+        if !flag { continue; }
         for path in collect_files_recursive(&modlist_dir)? {
-            if !path_contains_component(&path, "resourcepacks") {
-                continue;
-            }
-
-            let relative = path
-                .strip_prefix(&modlist_dir)
+            if !path_contains_component(&path, dir_name) { continue; }
+            let relative = path.strip_prefix(&modlist_dir)
                 .with_context(|| format!("failed to make {} relative", path.display()))?;
             add_file_to_zip(
-                &mut archive,
-                &mut added_paths,
-                &path,
+                &mut archive, &mut added_paths, &path,
                 &format!("{archive_root}/{}", path_to_archive_string(relative)),
             )?;
         }
     }
 
     if input.other_files {
-        for path in collect_files_recursive(&modlist_dir)? {
-            let relative = path
-                .strip_prefix(&modlist_dir)
-                .with_context(|| format!("failed to make {} relative", path.display()))?;
-            let relative_string = path_to_archive_string(relative);
-            if relative_string == RULES_FILENAME || relative_string == MODLIST_PRESENTATION_FILENAME
-            {
-                continue;
+        let instances_dir = modlist_dir.join("instances");
+        if instances_dir.exists() {
+            if input.selected_other_paths.is_empty() {
+                // Legacy: export everything except well-known dirs
+                for path in collect_files_recursive(&modlist_dir)? {
+                    let relative = path.strip_prefix(&modlist_dir)
+                        .with_context(|| format!("failed to make {} relative", path.display()))?;
+                    let relative_string = path_to_archive_string(relative);
+                    if relative_string == RULES_FILENAME || relative_string == MODLIST_PRESENTATION_FILENAME { continue; }
+                    if path_contains_any_component(&path, &[
+                        "mods", "config", "resourcepacks", "datapacks", "shaderpacks",
+                        "libraries", "assets", "natives", "minecraft",
+                    ]) { continue; }
+                    add_file_to_zip(
+                        &mut archive, &mut added_paths, &path,
+                        &format!("{archive_root}/{relative_string}"),
+                    )?;
+                }
+            } else {
+                // User selected specific paths from the instance tree
+                for sel_path in &input.selected_other_paths {
+                    let full_path = instances_dir.join(sel_path);
+                    if full_path.is_file() {
+                        add_file_if_exists(
+                            &mut archive, &mut added_paths, &full_path,
+                            &format!("{archive_root}/instances/{}", sel_path.replace('\\', "/")),
+                        )?;
+                    } else if full_path.is_dir() {
+                        for path in collect_files_recursive(&full_path)? {
+                            let relative = path.strip_prefix(&instances_dir)
+                                .with_context(|| format!("failed to make {} relative", path.display()))?;
+                            add_file_to_zip(
+                                &mut archive, &mut added_paths, &path,
+                                &format!("{archive_root}/instances/{}", path_to_archive_string(relative)),
+                            )?;
+                        }
+                    }
+                }
             }
-            if path_contains_any_component(
-                &path,
-                &[
-                    "mods",
-                    "config",
-                    "resourcepacks",
-                    "libraries",
-                    "assets",
-                    "natives",
-                    "minecraft",
-                ],
-            ) {
-                continue;
-            }
-
-            add_file_to_zip(
-                &mut archive,
-                &mut added_paths,
-                &path,
-                &format!("{archive_root}/{relative_string}"),
-            )?;
         }
     }
 

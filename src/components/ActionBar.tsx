@@ -131,15 +131,15 @@ export function ActionBar(props: ActionBarProps) {
 
   const NormalBar = () => (
     <div class="px-6 py-2 bg-bgPanel border-b border-borderColor shrink-0 flex items-center justify-between gap-3">
-      {/* Left: Add Mod + Sort + Tags dropdown + Links + Clear */}
+      {/* Left: Add Content + Sort + Tags dropdown + Links + Clear */}
       <div class="flex items-center gap-2 flex-wrap">
-        {/* Add Mod */}
+        {/* Add Mods */}
         <button
           onClick={props.onAddMod}
           class="px-4 py-1.5 rounded-lg bg-primary hover:bg-brandPurpleHover text-white text-sm font-medium flex items-center gap-2 transition-colors duration-75"
         >
           <MaterialIcon name="add" size="md" />
-          Add Mod
+          Add Mods
         </button>
 
         {/* Tags dropdown */}

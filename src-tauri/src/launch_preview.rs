@@ -34,7 +34,8 @@ use crate::resolver::{
     resolve_modlist, ModLoader, ResolutionResult, ResolutionTarget,
     FailureReason, RuleOutcome,
 };
-use crate::rules::{ModList, ModSource, Rule, RULES_FILENAME};
+use crate::content_packs::{load_content_list, ContentEntry};
+use crate::rules::{ModList, ModSource, Rule, VersionRuleKind, RULES_FILENAME};
 use crate::token_storage::KeyringSecretStore;
 
 use std::sync::Mutex;
@@ -334,6 +335,17 @@ async fn run_launch_pipeline(
         &Vec::<CachedConfigPlacement>::new(),
     )?;
 
+    // Download and install content packs (resource packs, data packs, shaders)
+    resolve_and_install_content_packs(
+        &app_handle,
+        &launcher_paths,
+        &http_client,
+        &modrinth_client,
+        &modlist_name,
+        &target,
+        &instance_root,
+    ).await?;
+
     let mut loader_metadata = LoaderMetadataClient::new()
         .fetch_loader_metadata(&target.minecraft_version, target.mod_loader)
         .await?;
@@ -395,7 +407,27 @@ async fn run_launch_pipeline(
         java_binary_path: java_binary_path.clone(),
         working_directory: instance_root.clone(),
         classpath_entries: {
-            let mut entries = mc_data.library_paths.clone();
+            // Loader libraries take precedence over MC libraries when they
+            // provide the same artifact (e.g. ASM). We deduplicate by jar
+            // stem prefix: "asm-9.9.jar" and "asm-9.6.jar" share stem "asm",
+            // so the loader version wins.
+            let loader_artifacts: std::collections::HashSet<String> = loader_library_paths.iter()
+                .filter_map(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| extract_artifact_name(n))
+                })
+                .collect();
+            let mut entries: Vec<PathBuf> = mc_data.library_paths.iter()
+                .filter(|p| {
+                    let dominated = p.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| loader_artifacts.contains(&extract_artifact_name(n)))
+                        .unwrap_or(false);
+                    !dominated
+                })
+                .cloned()
+                .collect();
             entries.extend(loader_library_paths);
             entries.push(mc_data.client_jar_path.clone());
             entries
@@ -526,6 +558,20 @@ struct DownloadArtifact {
     filename: String,
     url: String,
     destination_path: PathBuf,
+}
+
+/// Extracts the artifact name from a jar filename by stripping the version suffix.
+/// e.g. "asm-9.6.jar" → "asm", "fabric-loader-0.16.jar" → "fabric-loader"
+fn extract_artifact_name(filename: &str) -> String {
+    let stem = filename.strip_suffix(".jar").unwrap_or(filename);
+    // Find the last '-' followed by a digit — everything before it is the artifact name
+    if let Some(pos) = stem.rfind(|c: char| c == '-').and_then(|i| {
+        if stem[i + 1..].starts_with(|c: char| c.is_ascii_digit()) { Some(i) } else { None }
+    }) {
+        stem[..pos].to_string()
+    } else {
+        stem.to_string()
+    }
 }
 
 fn parse_mod_loader(value: &str) -> Result<ModLoader> {
@@ -897,6 +943,170 @@ fn build_instance_root(
             target.minecraft_version,
             target.mod_loader.as_modrinth_loader()
         ))
+}
+
+// ── Content packs (resource packs, data packs, shaders) ─────────────────────
+
+/// Checks whether a content entry is active for the current MC version + loader.
+fn is_content_entry_active(entry: &ContentEntry, mc_version: &str, loader: &str) -> bool {
+    for rule in &entry.version_rules {
+        let version_match = rule.mc_versions.is_empty() || rule.mc_versions.iter().any(|v| v == mc_version);
+        let loader_match = rule.loader == "any" || rule.loader.eq_ignore_ascii_case(loader);
+        match rule.kind {
+            VersionRuleKind::Exclude => { if version_match && loader_match { return false; } }
+            VersionRuleKind::Only   => { if !(version_match && loader_match) { return false; } }
+        }
+    }
+    true
+}
+
+/// Resolve, download and install content packs into the instance.
+async fn resolve_and_install_content_packs(
+    app_handle: &tauri::AppHandle,
+    launcher_paths: &LauncherPaths,
+    http_client: &reqwest::Client,
+    modrinth_client: &ModrinthClient,
+    modlist_name: &str,
+    target: &ResolutionTarget,
+    instance_root: &Path,
+) -> Result<()> {
+    let modlist_dir = launcher_paths.modlists_dir().join(modlist_name);
+    let cache_dir = launcher_paths.content_packs_cache_dir();
+    std::fs::create_dir_all(cache_dir)
+        .with_context(|| format!("failed to create content packs cache at {}", cache_dir.display()))?;
+
+    let mc_version = &target.minecraft_version;
+    let loader_str = target.mod_loader.as_modrinth_loader();
+
+    for (content_type, instance_subdir) in [
+        ("resourcepack", "resourcepacks"),
+        ("shader", "shaderpacks"),
+    ] {
+        let list = load_content_list(&modlist_dir, content_type).unwrap_or_else(|_| {
+            crate::content_packs::ContentList {
+                content_type: content_type.to_string(),
+                entries: vec![],
+                groups: vec![],
+            }
+        });
+
+        // Filter active entries
+        let active_entries: Vec<&ContentEntry> = list.entries.iter()
+            .filter(|e| is_content_entry_active(e, mc_version, loader_str))
+            .collect();
+
+        if active_entries.is_empty() { continue; }
+
+        let instance_dir = instance_root.join(instance_subdir);
+        std::fs::create_dir_all(&instance_dir)
+            .with_context(|| format!("failed to create {}", instance_dir.display()))?;
+        // Clear existing content in instance dir
+        crate::instance_mods::clear_instance_mods_directory(&instance_dir)?;
+
+        for entry in &active_entries {
+            if entry.source == "modrinth" {
+                // Fetch latest compatible version from Modrinth
+                match modrinth_client.fetch_content_pack_versions(&entry.id, mc_version).await {
+                    Ok(versions) => {
+                        // Pick the latest by date
+                        let best = versions.into_iter()
+                            .max_by(|a, b| a.date_published.cmp(&b.date_published));
+                        if let Some(version) = best {
+                            if let Some(file) = version.primary_file() {
+                                let cached_path = cache_dir.join(&file.filename);
+                                let was_cached = cached_path.exists();
+                                if !was_cached {
+                                    emit_log(app_handle, ProcessLogStream::Stdout,
+                                        format!("[Content] Downloading {} ({})", entry.id, file.filename))?;
+                                    download_file(http_client, &file.url, &cached_path).await
+                                        .with_context(|| format!("failed to download content pack '{}'", entry.id))?;
+                                }
+                                let target_path = instance_dir.join(&file.filename);
+                                crate::instance_mods::create_file_link(&cached_path, &target_path)
+                                    .with_context(|| format!("failed to link content pack '{}' into instance", entry.id))?;
+                                if was_cached {
+                                    emit_log(app_handle, ProcessLogStream::Stdout,
+                                        format!("[Content] {} → {} (cached)", entry.id, instance_subdir))?;
+                                } else {
+                                    emit_log(app_handle, ProcessLogStream::Stdout,
+                                        format!("[Content] Downloaded {} → {}", entry.id, instance_subdir))?;
+                                }
+                            }
+                        } else {
+                            emit_log(app_handle, ProcessLogStream::Stdout,
+                                format!("[Content] No compatible version found for '{}' on {}", entry.id, mc_version))?;
+                        }
+                    }
+                    Err(e) => {
+                        emit_log(app_handle, ProcessLogStream::Stdout,
+                            format!("[Content] Failed to fetch versions for '{}': {}", entry.id, e))?;
+                    }
+                }
+            }
+            // Local content packs: would need to be handled if local upload is implemented
+        }
+    }
+
+    // Data packs go into saves/*/datapacks — more complex because they're world-specific.
+    // For now, place them in a top-level datapacks/ folder that some mods (e.g. Open Loader) support.
+    {
+        let list = load_content_list(&modlist_dir, "datapack").unwrap_or_else(|_| {
+            crate::content_packs::ContentList {
+                content_type: "datapack".to_string(),
+                entries: vec![],
+                groups: vec![],
+            }
+        });
+        let active_entries: Vec<&ContentEntry> = list.entries.iter()
+            .filter(|e| is_content_entry_active(e, mc_version, loader_str))
+            .collect();
+
+        if !active_entries.is_empty() {
+            let instance_dir = instance_root.join("datapacks");
+            std::fs::create_dir_all(&instance_dir)
+                .with_context(|| format!("failed to create {}", instance_dir.display()))?;
+            crate::instance_mods::clear_instance_mods_directory(&instance_dir)?;
+
+            for entry in &active_entries {
+                if entry.source == "modrinth" {
+                    match modrinth_client.fetch_content_pack_versions(&entry.id, mc_version).await {
+                        Ok(versions) => {
+                            let best = versions.into_iter()
+                                .max_by(|a, b| a.date_published.cmp(&b.date_published));
+                            if let Some(version) = best {
+                                if let Some(file) = version.primary_file() {
+                                    let cached_path = cache_dir.join(&file.filename);
+                                    let was_cached = cached_path.exists();
+                                    if !was_cached {
+                                        emit_log(app_handle, ProcessLogStream::Stdout,
+                                            format!("[Content] Downloading {} ({})", entry.id, file.filename))?;
+                                        download_file(http_client, &file.url, &cached_path).await
+                                            .with_context(|| format!("failed to download data pack '{}'", entry.id))?;
+                                    }
+                                    let target_path = instance_dir.join(&file.filename);
+                                    crate::instance_mods::create_file_link(&cached_path, &target_path)
+                                        .with_context(|| format!("failed to link data pack '{}' into instance", entry.id))?;
+                                    if was_cached {
+                                        emit_log(app_handle, ProcessLogStream::Stdout,
+                                            format!("[Content] {} → datapacks (cached)", entry.id))?;
+                                    } else {
+                                        emit_log(app_handle, ProcessLogStream::Stdout,
+                                            format!("[Content] Downloaded {} → datapacks", entry.id))?;
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            emit_log(app_handle, ProcessLogStream::Stdout,
+                                format!("[Content] Failed to fetch versions for '{}': {}", entry.id, e))?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn build_cached_mod_jars(

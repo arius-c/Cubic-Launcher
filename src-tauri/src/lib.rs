@@ -1,6 +1,7 @@
 use tauri::Manager;
 
 pub mod account_manager;
+pub mod content_packs;
 pub mod adoptium;
 pub mod app_shell;
 pub mod config_attribution;
@@ -80,10 +81,17 @@ pub fn run() {
             modlist_assets::load_modlist_groups_command,
             modlist_assets::save_modlist_groups_command,
             modlist_assets::export_modlist_command,
+            modlist_assets::list_instance_files_command,
             modlist_assets::read_image_as_data_url_command,
             resolver::resolve_modlist_command,
             minecraft_downloader::fetch_minecraft_versions_command,
             minecraft_downloader::start_minecraft_predownload_command,
+            content_packs::load_content_list_command,
+            content_packs::add_content_command,
+            content_packs::remove_content_command,
+            content_packs::reorder_content_command,
+            content_packs::save_content_groups_command,
+            content_packs::save_content_version_rules_command,
             launch_preview::start_launch_command,
             launch_preview::stop_minecraft_command
         ])
