@@ -8,6 +8,8 @@ export type ModRow = {
   /** First mod ID in the rule (used as stable link target identifier). */
   primaryModId?: string;
   kind: "modrinth" | "local";
+  /** Whether this rule is enabled (disabled mods are ignored by the resolver). */
+  enabled: boolean;
   area: string;
   note: string;
   tags: string[];

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use reqwest::Url;
@@ -7,6 +8,14 @@ use serde::Deserialize;
 use crate::resolver::{ModLoader, ResolutionTarget};
 
 const MODRINTH_API_BASE_URL: &str = "https://api.modrinth.com/v2";
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn build_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .unwrap_or_default()
+}
 
 #[derive(Debug, Clone)]
 pub struct ModrinthClient {
@@ -17,14 +26,14 @@ pub struct ModrinthClient {
 impl ModrinthClient {
     pub fn new() -> Self {
         Self {
-            http_client: reqwest::Client::new(),
+            http_client: build_http_client(),
             base_url: MODRINTH_API_BASE_URL.to_string(),
         }
     }
 
     pub fn with_base_url(base_url: impl Into<String>) -> Self {
         Self {
-            http_client: reqwest::Client::new(),
+            http_client: build_http_client(),
             base_url: base_url.into(),
         }
     }

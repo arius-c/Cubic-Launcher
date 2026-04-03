@@ -35,6 +35,7 @@ export function useDragEngine(config: DragEngineConfig) {
   // Cached layout snapshots — taken once at dragStart
   const [cachedContainerRect, setCachedContainerRect] = createSignal<DOMRect | null>(null);
   const [cachedHeights,       setCachedHeights]       = createSignal<Map<string, number>>(new Map());
+  const [cachedTops,          setCachedTops]           = createSignal<Map<string, number>>(new Map());
   const [cachedMidYs,         setCachedMidYs]         = createSignal<Map<string, number>>(new Map());
 
   const anyDragging = () => draggingId() != null;
@@ -49,11 +50,15 @@ export function useDragEngine(config: DragEngineConfig) {
     setCachedContainerRect(rect);
 
     const heights = new Map<string, number>();
+    const tops = new Map<string, number>();
     container.querySelectorAll<HTMLElement>("[data-draggable-id]").forEach(el => {
       const id = el.getAttribute("data-draggable-id")!;
-      heights.set(id, el.getBoundingClientRect().height);
+      const r = el.getBoundingClientRect();
+      heights.set(id, r.height);
+      tops.set(id, r.top);
     });
     setCachedHeights(heights);
+    setCachedTops(tops);
 
     const midYs = new Map<string, number>();
     container.querySelectorAll<HTMLElement>("[data-draggable-mid-id]").forEach(el => {
@@ -72,32 +77,27 @@ export function useDragEngine(config: DragEngineConfig) {
 
     const items   = config.getItems();
     const heights = cachedHeights();
+    const tops    = cachedTops();
     const dragId  = draggingId()!;
-    let y = cr.top;
 
     for (const item of items) {
       const id = dragItemId(item);
-      const h  = heights.get(id) ?? 40; // minimal fallback, should never be needed
+      if (id === dragId) continue;
 
-      // Skip the item being dragged
-      if (id === dragId) { y += h; continue; }
+      const y = tops.get(id);
+      const h = heights.get(id) ?? 40;
+      if (y === undefined) continue;
 
       if (cursorY < y + h) {
         const isBottom = cursorY >= y + h / 2;
-        if (item.kind === "group") {
-          return isBottom ? `after:${id}` : `before:${id}`;
-        }
         return isBottom ? `after:${id}` : `before:${id}`;
       }
-
-      y += h;
     }
 
     // Past the end — treat as after last item
     if (items.length > 0) {
       const lastId = dragItemId(items[items.length - 1]);
       if (lastId !== dragId) return `after:${lastId}`;
-      // If last item IS the dragged item, use the one before it
       if (items.length >= 2) {
         return `after:${dragItemId(items[items.length - 2])}`;
       }
@@ -183,6 +183,7 @@ export function useDragEngine(config: DragEngineConfig) {
       setDragPointer(null);
       setCachedContainerRect(null);
       setCachedHeights(new Map());
+      setCachedTops(new Map());
       setCachedMidYs(new Map());
     });
     document.body.style.userSelect = "";
@@ -222,6 +223,7 @@ export function useDragEngine(config: DragEngineConfig) {
     previewItems,
     // Expose cached measurements for advanced detection in components
     cachedHeights,
+    cachedTops,
     cachedMidYs,
     cachedContainerRect,
     // Allow components to override detection (for groups with inner rows, alt groups, etc.)

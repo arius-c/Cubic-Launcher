@@ -23,6 +23,7 @@ pub struct EditorRow {
     pub mod_id: String,
     pub name: String,
     pub source: String,
+    pub enabled: bool,
     pub exclude_if: Vec<String>,
     pub requires: Vec<String>,
     pub version_rules: Vec<EditorVersionRule>,
@@ -295,7 +296,32 @@ pub fn save_advanced_batch_command(
     save_advanced_batch_from_root(launcher_paths.root_dir(), &input).map_err(|e| e.to_string())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToggleRuleEnabledInput {
+    pub modlist_name: String,
+    pub mod_id: String,
+    pub enabled: bool,
+}
+
+#[tauri::command]
+pub fn toggle_rule_enabled_command(
+    launcher_paths: State<'_, LauncherPaths>,
+    input: ToggleRuleEnabledInput,
+) -> Result<(), String> {
+    toggle_rule_enabled_from_root(launcher_paths.root_dir(), &input).map_err(|e| e.to_string())
+}
+
 // ── Worker functions ─────────────────────────────────────────────────────────
+
+fn toggle_rule_enabled_from_root(root_dir: &Path, input: &ToggleRuleEnabledInput) -> Result<()> {
+    let mut modlist = load_modlist(root_dir, &input.modlist_name)?;
+    let rule = modlist
+        .find_rule_mut(&input.mod_id)
+        .with_context(|| format!("rule '{}' not found", input.mod_id))?;
+    rule.enabled = input.enabled;
+    save_modlist(root_dir, &input.modlist_name, &modlist)
+}
 
 fn load_modlist(root_dir: &Path, modlist_name: &str) -> Result<ModList> {
     let launcher_paths = LauncherPaths::new(root_dir.to_path_buf());
@@ -374,6 +400,7 @@ pub fn add_mod_rule_from_root(root_dir: &Path, input: &AddModRuleInput) -> Resul
     modlist.rules.push(Rule {
         mod_id: input.mod_id.clone(),
         source,
+        enabled: true,
         exclude_if: vec![],
         requires: vec![],
         version_rules: vec![],
@@ -507,11 +534,22 @@ pub fn save_alternative_order_from_root(
 pub fn add_alternative_from_root(root_dir: &Path, input: &AddAlternativeInput) -> Result<()> {
     let mut modlist = load_modlist(root_dir, &input.modlist_name)?;
 
-    if modlist.contains_mod_id(&input.mod_id) {
-        bail!("a rule with mod_id '{}' already exists", input.mod_id);
-    }
-
-    let source = parse_mod_source(&input.source)?;
+    // If the mod already exists, extract it (preserving all its data) instead of rejecting.
+    let rule_to_add = if modlist.contains_mod_id(&input.mod_id) {
+        extract_rule_anywhere(&mut modlist, &input.mod_id)?
+    } else {
+        let source = parse_mod_source(&input.source)?;
+        Rule {
+            mod_id: input.mod_id.clone(),
+            source,
+            enabled: true,
+            exclude_if: vec![],
+            requires: vec![],
+            version_rules: vec![],
+            custom_configs: vec![],
+            alternatives: vec![],
+        }
+    };
 
     // Find top-level rule
     let parent = modlist
@@ -525,15 +563,7 @@ pub fn add_alternative_from_root(root_dir: &Path, input: &AddAlternativeInput) -
             )
         })?;
 
-    parent.alternatives.push(Rule {
-        mod_id: input.mod_id.clone(),
-        source,
-        exclude_if: vec![],
-        requires: vec![],
-        version_rules: vec![],
-        custom_configs: vec![],
-        alternatives: vec![],
-    });
+    parent.alternatives.push(rule_to_add);
 
     save_modlist(root_dir, &input.modlist_name, &modlist)
 }
@@ -544,25 +574,28 @@ pub fn add_nested_alternative_from_root(
 ) -> Result<()> {
     let mut modlist = load_modlist(root_dir, &input.modlist_name)?;
 
-    if modlist.contains_mod_id(&input.mod_id) {
-        bail!("a rule with mod_id '{}' already exists", input.mod_id);
-    }
-
-    let source = parse_mod_source(&input.source)?;
+    // If the mod already exists, extract it (preserving all its data) instead of rejecting.
+    let rule_to_add = if modlist.contains_mod_id(&input.mod_id) {
+        extract_rule_anywhere(&mut modlist, &input.mod_id)?
+    } else {
+        let source = parse_mod_source(&input.source)?;
+        Rule {
+            mod_id: input.mod_id.clone(),
+            source,
+            enabled: true,
+            exclude_if: vec![],
+            requires: vec![],
+            version_rules: vec![],
+            custom_configs: vec![],
+            alternatives: vec![],
+        }
+    };
 
     let parent = modlist
         .find_rule_mut(&input.parent_mod_id)
         .with_context(|| format!("rule '{}' not found", input.parent_mod_id))?;
 
-    parent.alternatives.push(Rule {
-        mod_id: input.mod_id.clone(),
-        source,
-        exclude_if: vec![],
-        requires: vec![],
-        version_rules: vec![],
-        custom_configs: vec![],
-        alternatives: vec![],
-    });
+    parent.alternatives.push(rule_to_add);
 
     save_modlist(root_dir, &input.modlist_name, &modlist)
 }
@@ -583,6 +616,34 @@ pub fn remove_alternative_from_root(root_dir: &Path, input: &RemoveAlternativeIn
     }
 
     save_modlist(root_dir, &input.modlist_name, &modlist)
+}
+
+/// Remove a rule from anywhere in the tree (top-level or nested alternative) and return it.
+/// Preserves all rule data (exclude_if, requires, version_rules, etc.).
+fn extract_rule_anywhere(modlist: &mut ModList, mod_id: &str) -> Result<Rule> {
+    // Check top-level first
+    if let Some(pos) = modlist.rules.iter().position(|r| r.mod_id == mod_id) {
+        return Ok(modlist.rules.remove(pos));
+    }
+    // Search in alternatives recursively
+    for rule in &mut modlist.rules {
+        if let Some(extracted) = extract_from_alternatives(rule, mod_id) {
+            return Ok(extracted);
+        }
+    }
+    bail!("rule '{}' not found anywhere in the modlist", mod_id)
+}
+
+fn extract_from_alternatives(rule: &mut Rule, mod_id: &str) -> Option<Rule> {
+    if let Some(pos) = rule.alternatives.iter().position(|a| a.mod_id == mod_id) {
+        return Some(rule.alternatives.remove(pos));
+    }
+    for alt in &mut rule.alternatives {
+        if let Some(extracted) = extract_from_alternatives(alt, mod_id) {
+            return Some(extracted);
+        }
+    }
+    None
 }
 
 /// Remove the alternative with `alt_mod_id` from the rule with `parent_mod_id` and return it.
@@ -768,6 +829,7 @@ fn build_editor_row(rule: &Rule) -> EditorRow {
             ModSource::Modrinth => "modrinth".into(),
             ModSource::Local => "local".into(),
         },
+        enabled: rule.enabled,
         exclude_if: rule.exclude_if.clone(),
         requires: rule.requires.clone(),
         version_rules: rule
@@ -863,6 +925,7 @@ mod tests {
         Rule {
             mod_id: mod_id.into(),
             source: ModSource::Modrinth,
+            enabled: true,
             exclude_if: vec![],
             requires: vec![],
             version_rules: vec![],
@@ -881,6 +944,7 @@ mod tests {
                 Rule {
                     mod_id: "sodium".into(),
                     source: ModSource::Modrinth,
+                    enabled: true,
                     exclude_if: vec![],
                     requires: vec![],
                     version_rules: vec![],
@@ -890,6 +954,7 @@ mod tests {
                 Rule {
                     mod_id: "embeddium".into(),
                     source: ModSource::Modrinth,
+                    enabled: true,
                     exclude_if: vec!["sodium".into()],
                     requires: vec![],
                     version_rules: vec![],
@@ -965,6 +1030,7 @@ mod tests {
                 Rule {
                     mod_id: "sodium".into(),
                     source: ModSource::Modrinth,
+                    enabled: true,
                     exclude_if: vec![],
                     requires: vec![],
                     version_rules: vec![],
@@ -1003,6 +1069,7 @@ mod tests {
                 Rule {
                     mod_id: "embeddium".into(),
                     source: ModSource::Modrinth,
+                    enabled: true,
                     exclude_if: vec!["sodium".into()],
                     requires: vec![],
                     version_rules: vec![],

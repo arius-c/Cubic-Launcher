@@ -1,12 +1,54 @@
 use std::collections::HashSet;
+use std::path::Path;
 
 use anyhow::{bail, Result};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use tauri::State;
 
 use crate::launcher_paths::LauncherPaths;
 use crate::modrinth::ModrinthClient;
 use crate::rules::{ModList, ModSource, Rule, VersionRule, VersionRuleKind, RULES_FILENAME};
+
+/// Look up cached Modrinth availability from the database.
+fn db_availability_get(
+    db_path: &Path,
+    mod_ids: &[String],
+    mc_version: &str,
+    loader: &str,
+) -> Vec<(String, bool)> {
+    let Ok(conn) = Connection::open(db_path) else { return vec![] };
+    let mut results = Vec::new();
+    for mod_id in mod_ids {
+        let row: Option<bool> = conn
+            .query_row(
+                "SELECT available FROM modrinth_availability WHERE project_id = ?1 AND mc_version = ?2 AND mod_loader = ?3",
+                params![mod_id, mc_version, loader],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap_or(None);
+        if let Some(available) = row {
+            results.push((mod_id.clone(), available));
+        }
+    }
+    results
+}
+
+/// Persist Modrinth availability results to the database.
+fn db_availability_set(db_path: &Path, entries: &[(String, String, String, bool)]) {
+    let Ok(conn) = Connection::open(db_path) else { return };
+    let Ok(tx) = conn.unchecked_transaction() else { return };
+    for (mod_id, mc_version, loader, available) in entries {
+        let _ = tx.execute(
+            r#"INSERT INTO modrinth_availability (project_id, mc_version, mod_loader, available)
+               VALUES (?1, ?2, ?3, ?4)
+               ON CONFLICT(project_id, mc_version, mod_loader) DO UPDATE SET available = excluded.available"#,
+            params![mod_id, mc_version, loader, available],
+        );
+    }
+    let _ = tx.commit();
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolutionTarget {
@@ -144,6 +186,11 @@ fn try_resolve(
     active_mods: &HashSet<String>,
     target: &ResolutionTarget,
 ) -> RuleOutcome {
+    // 0. Disabled mods are treated as if they don't exist — skip to alternatives.
+    if !rule.enabled {
+        return try_alternatives(rule, active_mods, target, FailureReason::ExcludedByActiveMod);
+    }
+
     // 1. Check exclude_if
     if rule.exclude_if.iter().any(|id| active_mods.contains(id)) {
         return try_alternatives(rule, active_mods, target, FailureReason::ExcludedByActiveMod);
@@ -260,20 +307,7 @@ pub async fn resolve_modlist_command(
 
     let result = resolve_modlist(&modlist, &target).map_err(|e| e.to_string())?;
 
-    // For rules whose primary didn't resolve, check ALL alternatives (not just
-    // the first winner) so the UI can show every viable fallback as green.
     let mut ids = result.active_mods;
-    for (i, rule) in modlist.rules.iter().enumerate() {
-        let primary_resolved = matches!(
-            &result.resolved_rules[i].outcome,
-            RuleOutcome::Resolved { resolved_id } if resolved_id == &rule.mod_id
-        );
-        // Only expand alternatives when the primary itself was excluded.
-        if primary_resolved {
-            continue;
-        }
-        check_all_alts_recursive(rule, &mut ids, &target);
-    }
 
     // ── Modrinth availability check ─────────────────────────────────────────
     // For each resolved mod sourced from Modrinth, verify that a compatible
@@ -289,27 +323,55 @@ pub async fn resolve_modlist_command(
         .collect();
 
     if !modrinth_ids.is_empty() {
-        let client = ModrinthClient::new();
-        let mut tasks = tokio::task::JoinSet::new();
+        let db_path = launcher_paths.database_path();
+        let loader_str = mod_loader.clone();
 
-        for mod_id in modrinth_ids {
-            let client = client.clone();
-            let target = target.clone();
-            tasks.spawn(async move {
-                let available = client
-                    .fetch_project_versions(&mod_id, &target)
-                    .await
-                    .map(|v| !v.is_empty())
-                    .unwrap_or(true); // on network error, keep the mod
-                (mod_id, available)
-            });
+        // Check database cache first
+        let cached = db_availability_get(&db_path, &modrinth_ids, &target.minecraft_version, &loader_str);
+        let cached_ids: HashSet<String> = cached.iter().map(|(id, _)| id.clone()).collect();
+        for (mod_id, available) in &cached {
+            if !available {
+                ids.remove(mod_id);
+            }
         }
 
-        while let Some(join_result) = tasks.join_next().await {
-            if let Ok((mod_id, available)) = join_result {
-                if !available {
-                    ids.remove(&mod_id);
+        // Only call Modrinth API for mods not in the database
+        let uncached_ids: Vec<String> = modrinth_ids
+            .into_iter()
+            .filter(|id| !cached_ids.contains(id))
+            .collect();
+
+        if !uncached_ids.is_empty() {
+            let client = ModrinthClient::new();
+            let mut tasks = tokio::task::JoinSet::new();
+
+            for mod_id in uncached_ids {
+                let client = client.clone();
+                let target = target.clone();
+                tasks.spawn(async move {
+                    let result = client
+                        .fetch_project_versions(&mod_id, &target)
+                        .await;
+                    match result {
+                        Ok(v) => Some((mod_id, !v.is_empty())),
+                        Err(_) => None, // on network error, skip — don't cache failures
+                    }
+                });
+            }
+
+            let mut to_persist = Vec::new();
+            while let Some(join_result) = tasks.join_next().await {
+                if let Ok(Some((mod_id, available))) = join_result {
+                    if !available {
+                        ids.remove(&mod_id);
+                    }
+                    to_persist.push((mod_id, target.minecraft_version.clone(), loader_str.clone(), available));
                 }
+            }
+
+            // Persist API results to database for future lookups
+            if !to_persist.is_empty() {
+                db_availability_set(&db_path, &to_persist);
             }
         }
     }
@@ -332,29 +394,115 @@ pub async fn resolve_modlist_command(
         }
     }
 
+    // ── Alt viability for UI ────────────────────────────────────────────────
+    // After all checks (Modrinth availability, cascade), show which
+    // alternatives are viable for rules whose primary is no longer in `ids`.
+    // This runs last so it sees the final state of which mods survived.
+    for rule in &modlist.rules {
+        if !ids.contains(&rule.mod_id) {
+            check_viable_alts(rule, &mut ids, &target);
+        }
+    }
+
     Ok(ids.into_iter().collect())
 }
 
+/// Pre-populates the modrinth_availability table for all Modrinth-sourced mods
+/// in a modlist that don't already have a cached result for the given version+loader.
+/// Runs in the background so it doesn't block the UI.
+#[tauri::command]
+pub async fn backfill_availability_command(
+    launcher_paths: State<'_, LauncherPaths>,
+    modlist_name: String,
+    mc_version: String,
+    mod_loader: String,
+) -> Result<(), String> {
+    let rules_path = launcher_paths
+        .modlists_dir()
+        .join(&modlist_name)
+        .join(RULES_FILENAME);
+
+    let modlist = ModList::read_from_file(&rules_path).map_err(|e| e.to_string())?;
+
+    let mut all_modrinth_ids: Vec<String> = Vec::new();
+    fn collect_modrinth_ids(rules: &[Rule], out: &mut Vec<String>) {
+        for rule in rules {
+            if rule.source == ModSource::Modrinth {
+                out.push(rule.mod_id.clone());
+            }
+            collect_modrinth_ids(&rule.alternatives, out);
+        }
+    }
+    collect_modrinth_ids(&modlist.rules, &mut all_modrinth_ids);
+
+    if all_modrinth_ids.is_empty() {
+        return Ok(());
+    }
+
+    let db_path = launcher_paths.database_path();
+    let cached = db_availability_get(&db_path, &all_modrinth_ids, &mc_version, &mod_loader);
+    let cached_ids: HashSet<String> = cached.iter().map(|(id, _)| id.clone()).collect();
+
+    let uncached_ids: Vec<String> = all_modrinth_ids
+        .into_iter()
+        .filter(|id| !cached_ids.contains(id))
+        .collect();
+
+    if uncached_ids.is_empty() {
+        return Ok(());
+    }
+
+    let loader = parse_mod_loader(&mod_loader).map_err(|e| e.to_string())?;
+    let target = ResolutionTarget {
+        minecraft_version: mc_version.clone(),
+        mod_loader: loader,
+    };
+
+    let client = ModrinthClient::new();
+    let mut tasks = tokio::task::JoinSet::new();
+
+    for mod_id in uncached_ids {
+        let client = client.clone();
+        let target = target.clone();
+        tasks.spawn(async move {
+            let result = client.fetch_project_versions(&mod_id, &target).await;
+            match result {
+                Ok(v) => Some((mod_id, !v.is_empty())),
+                Err(_) => None,
+            }
+        });
+    }
+
+    let mut to_persist = Vec::new();
+    while let Some(join_result) = tasks.join_next().await {
+        if let Ok(Some((mod_id, available))) = join_result {
+            to_persist.push((mod_id, mc_version.clone(), mod_loader.clone(), available));
+        }
+    }
+
+    if !to_persist.is_empty() {
+        db_availability_set(&db_path, &to_persist);
+    }
+
+    Ok(())
+}
+
 /// Recursively check every alternative in the tree and add viable ones to `ids`.
-/// Only marks an alt green if the alt *itself* passes all checks.
 /// Only recurses into an alt's children when the alt itself is NOT viable
 /// (its sub-alternatives are only relevant as fallbacks when it fails).
-fn check_all_alts_recursive(
+fn check_viable_alts(
     rule: &Rule,
     ids: &mut HashSet<String>,
     target: &ResolutionTarget,
 ) {
     for alt in &rule.alternatives {
-        // Already resolved by the main resolver — it's viable, skip its children.
         if ids.contains(&alt.mod_id) {
             continue;
         }
         if alt_itself_viable(alt, ids, target) {
             ids.insert(alt.mod_id.clone());
-            // Alt is viable — its sub-alternatives are irrelevant.
         } else {
-            // Alt failed — check its sub-alternatives as fallbacks.
-            check_all_alts_recursive(alt, ids, target);
+            check_viable_alts(alt, ids, target);
         }
     }
 }
@@ -366,6 +514,9 @@ fn alt_itself_viable(
     active_mods: &HashSet<String>,
     target: &ResolutionTarget,
 ) -> bool {
+    if !rule.enabled {
+        return false;
+    }
     if rule.exclude_if.iter().any(|id| active_mods.contains(id)) {
         return false;
     }
@@ -392,6 +543,7 @@ mod tests {
         Rule {
             mod_id: mod_id.into(),
             source: ModSource::Modrinth,
+            enabled: true,
             exclude_if: vec![],
             requires: vec![],
             version_rules: vec![],

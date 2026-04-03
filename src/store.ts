@@ -426,7 +426,8 @@ export function functionalGroupTagStyle(tone: string): string {
 
 /** Returns the hue for any tone (legacy name or numeric string). */
 export function toneToHue(tone: string): number {
-  return LEGACY_TONE_HUES[tone] ?? (parseInt(tone, 10) || 270);
+  const parsed = parseInt(tone, 10);
+  return LEGACY_TONE_HUES[tone] ?? (isNaN(parsed) ? 270 : parsed);
 }
 
 /** Returns the dot preview color for a given hue. */
@@ -726,6 +727,9 @@ export function dismissError(id: string) {
 export function openAlternativesPanel(rowId: string) {
   setAlternativesPanelParentId(rowId);
 }
+
+// Toggle-enabled handler — set by App.tsx, called by ModRuleItem.
+export const [onToggleEnabled, setOnToggleEnabled] = createSignal<((rowId: string, enabled: boolean) => void) | null>(null);
 
 export function openRenameRule(id: string, name: string) {
   setRenameRuleTargetId(id); setRenameRuleDraft(name); setRenameRuleModalOpen(true);

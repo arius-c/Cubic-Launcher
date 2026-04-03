@@ -14,7 +14,7 @@ import {
   topLevelItems, modListCards, selectedModListName, search, modRowsState, setModRowsState,
   aestheticGroups, setAestheticGroups, activeAccount, modIcons,
   editingGroupId, groupNameDraft, setGroupNameDraft,
-  toggleGroupCollapsed, startGroupRename, commitGroupRename, removeAestheticGroup,
+  toggleGroupCollapsed, startGroupRename, commitGroupRename, removeAestheticGroup, onToggleEnabled,
   activeContentTab, setActiveContentTab, setAddModModalOpen,
   selectedMcVersion, selectedModLoader,
 } from "../store";
@@ -39,6 +39,8 @@ function GroupHeader(props: {
   blockCount: number;
   collapsed: boolean;
   onStartDrag: (e: PointerEvent) => void;
+  enabled: boolean;
+  onToggleEnabled: () => void;
 }) {
   const editing = () => editingGroupId() === props.groupId;
   return (
@@ -79,6 +81,13 @@ function GroupHeader(props: {
         />
       </Show>
       <span class="shrink-0 text-xs text-muted-foreground">{props.blockCount} mods</span>
+      <button
+        onClick={props.onToggleEnabled}
+        class={`flex h-4 w-7 items-center rounded-full px-[3px] transition-colors ${props.enabled ? "bg-green-500/80" : "bg-muted"}`}
+        title={props.enabled ? "Group enabled — click to disable all mods" : "Group disabled — click to enable all mods"}
+      >
+        <div class={`h-2.5 w-2.5 rounded-full bg-white shadow transition-transform ${props.enabled ? "translate-x-[12px]" : "translate-x-0"}`} />
+      </button>
       <button
         onClick={() => removeAestheticGroup(props.groupId)}
         class="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
@@ -389,19 +398,21 @@ function ContentTabView(props: { type: string; modlistName: string; onAddContent
 
   // ── Enhanced drop detection (same logic as mods) ───────────────────────
   const detectContentDropTarget = (cursorY: number): string | null => {
-    const cr = engine.cachedContainerRect();
-    if (!cr) return null;
     const items = contentTLItems();
     const heights = engine.cachedHeights();
+    const tops = engine.cachedTops();
     const dragId = engine.draggingId()!;
     const isGroupDrag = isDraggingGroup();
     const dragTlId = isGroupDrag ? `group:${dragId}` : dragId;
-    let y = cr.top;
 
     for (const item of items) {
       const id = ctlId(item);
+      if (id === dragTlId) continue;
+
+      const y = tops.get(id);
       const h = heights.get(id) ?? 40;
-      if (id === dragTlId) { y += h; continue; }
+      if (y === undefined) continue;
+
       if (cursorY < y + h) {
         if (item.kind === "group") {
           const gId = item.id;
@@ -430,7 +441,6 @@ function ContentTabView(props: { type: string; modlistName: string; onAddContent
         const eId = item.entry.id;
         return cursorY >= y + h / 2 ? `row-after:${eId}` : eId;
       }
-      y += h;
     }
     return null;
   };
@@ -879,7 +889,7 @@ function ContentTabView(props: { type: string; modlistName: string; onAddContent
       </Show>
 
       {/* Content list */}
-      <div class="flex-1 p-4" style={{ overflow: engine.anyDragging() ? "visible" : "auto" }}>
+      <div class="flex-1 p-4" style={{ overflow: engine.anyDragging() ? "hidden" : "auto" }}>
         <Show when={entries().length > 0} fallback={
           <div class="flex flex-col items-center justify-center py-16 text-center">
             <div class="mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-muted">
@@ -1136,23 +1146,20 @@ export function ModListEditor(props: Props) {
   // We replicate the original detection using the engine's cached data:
 
   const detectEnhancedDropTarget = (cursorY: number): string | null => {
-    const cr = engine.cachedContainerRect();
-    if (!cr) return null;
-
     const items   = topLevelItems();
     const heights = engine.cachedHeights();
+    const tops    = engine.cachedTops();
     const dragId  = engine.draggingId()!;
     const isGroupDrag = isDraggingGroup();
-    // For group drag, the draggingId is the raw group id (no "group:" prefix from engine)
-    // but in topLevelItems, groups have tlId = "group:{id}"
     const dragTlId = isGroupDrag ? `group:${dragId}` : dragId;
-    let y = cr.top;
 
     for (const item of items) {
       const id = tlId(item);
-      const h  = heights.get(id) ?? 40;
+      if (id === dragTlId) continue;
 
-      if (id === dragTlId) { y += h; continue; }
+      const y = tops.get(id);
+      const h = heights.get(id) ?? 40;
+      if (y === undefined) continue;
 
       if (cursorY < y + h) {
         if (item.kind === "group") {
@@ -1189,8 +1196,6 @@ export function ModListEditor(props: Props) {
         const rowId = item.row.id;
         return cursorY >= y + h / 2 ? `row-after:${rowId}` : rowId;
       }
-
-      y += h;
     }
     return null;
   };
@@ -1574,7 +1579,7 @@ export function ModListEditor(props: Props) {
           <ActionBar onAddMod={props.onAddMod} onDeleteSelected={props.onDeleteSelected} />
 
           {/* Scrollable mod list */}
-          <div class="flex-1 p-4" style={{ overflow: engine.anyDragging() ? "visible" : "auto" }}>
+          <div class="flex-1 p-4" style={{ overflow: engine.anyDragging() ? "hidden" : "auto" }}>
             <Show when={hasContent()} fallback={<EmptyState onAddMod={props.onAddMod} />}>
               <>
                 {/* Drag ghost */}
@@ -1678,6 +1683,13 @@ export function ModListEditor(props: Props) {
                                 blockCount={group.blocks.length}
                                 collapsed={group.collapsed}
                                 onStartDrag={(e) => handleStartDrag(group.id, "group", e)}
+                                enabled={group.blocks.every(r => r.enabled)}
+                                onToggleEnabled={() => {
+                                  const handler = onToggleEnabled();
+                                  if (!handler) return;
+                                  const allEnabled = group.blocks.every(r => r.enabled);
+                                  for (const r of group.blocks) handler(r.id, !allEnabled);
+                                }}
                               />
                             </div>
 

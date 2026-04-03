@@ -14,7 +14,7 @@ import {
   removeFunctionalGroupMember,
   tagFilter, functionalGroups, tagFilterForcedExpanded,
   linksByModId, removeLink, cycleLinkDirection, removeIncompatibility,
-  setAdvancedPanelModId, selectedCount, resolvedModIds,
+  setAdvancedPanelModId, selectedCount, resolvedModIds, onToggleEnabled,
 } from "../store";
 import {
   ChevronRightIcon, AlertTriangleIcon, PackageIcon, XIcon, MaterialIcon,
@@ -142,6 +142,7 @@ export function ModRuleItem(props: ModRuleItemProps) {
         <div class="min-w-0 flex-1">
           <div class="flex flex-wrap items-center gap-1.5">
             <span class={`truncate font-medium ${
+              !props.row.enabled ? "text-muted-foreground line-through opacity-50" :
               isResolved() === true ? "text-green-400" : isResolved() === false ? "text-red-400" : "text-foreground"
             }`}>{props.row.name}</span>
 
@@ -306,7 +307,17 @@ export function ModRuleItem(props: ModRuleItemProps) {
 
           <Show when={containingGroup()}>
             <button
-              onClick={() => removeRowsFromAestheticGroups([props.row.id])}
+              onClick={e => {
+                let el: HTMLElement | null = e.target as HTMLElement;
+                while (el && el !== document.body) {
+                  const ov = getComputedStyle(el).overflowY;
+                  if (ov === "auto" || ov === "scroll") break;
+                  el = el.parentElement;
+                }
+                const scrollTop = el?.scrollTop ?? 0;
+                removeRowsFromAestheticGroups([props.row.id]);
+                requestAnimationFrame(() => { if (el) el.scrollTop = scrollTop; });
+              }}
               onPointerDown={stopDragPropagation}
               onMouseDown={stopDragPropagation}
               class="flex h-7 items-center gap-1 rounded-md px-2 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
@@ -327,6 +338,17 @@ export function ModRuleItem(props: ModRuleItemProps) {
           >
             <MaterialIcon name="settings" size="sm" />
             Advanced
+          </button>
+
+          {/* Enable/disable toggle */}
+          <button
+            onClick={e => { e.stopPropagation(); const handler = onToggleEnabled(); if (handler) handler(props.row.id, !props.row.enabled); }}
+            onPointerDown={stopDragPropagation}
+            onMouseDown={stopDragPropagation}
+            class={`flex h-4 w-7 items-center rounded-full px-[3px] transition-colors ${props.row.enabled ? "bg-green-500/80" : "bg-muted"}`}
+            title={props.row.enabled ? "Enabled — click to disable" : "Disabled — click to enable"}
+          >
+            <div class={`h-2.5 w-2.5 rounded-full bg-white shadow transition-transform ${props.row.enabled ? "translate-x-[12px]" : "translate-x-0"}`} />
           </button>
         </div>
       </div>

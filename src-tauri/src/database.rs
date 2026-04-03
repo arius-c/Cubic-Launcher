@@ -67,6 +67,14 @@ CREATE TABLE IF NOT EXISTS modlist_settings (
     value        TEXT NOT NULL,
     PRIMARY KEY (modlist_name, key)
 );
+
+CREATE TABLE IF NOT EXISTS modrinth_availability (
+    project_id  TEXT NOT NULL,
+    mc_version  TEXT NOT NULL,
+    mod_loader  TEXT NOT NULL,
+    available   BOOLEAN NOT NULL,
+    PRIMARY KEY (project_id, mc_version, mod_loader)
+);
 "#;
 
 pub fn initialize_database(database_path: &Path) -> Result<()> {
@@ -131,6 +139,7 @@ mod tests {
             "config_attribution",
             "global_settings",
             "modlist_settings",
+            "modrinth_availability",
         ] {
             assert!(
                 table_names

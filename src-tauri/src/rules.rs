@@ -38,10 +38,15 @@ pub struct CustomConfig {
     pub files: Vec<String>,
 }
 
+fn default_true() -> bool { true }
+fn is_true(v: &bool) -> bool { *v }
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rule {
     pub mod_id: String,
     pub source: ModSource,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub enabled: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exclude_if: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

@@ -25,7 +25,7 @@ import {
   instancePresentation, setInstancePresentation,
   exportOptions, setExportModalOpen, setInstancePresentationOpen,
   alternativesPanelParent, setAlternativesPanelParentId,
-  setAdvancedPanelModId, rowMap,
+  setAdvancedPanelModId, rowMap, setOnToggleEnabled,
   launchState, selectedModList, setAppLoading, setModIcons, modIcons,
   minecraftVersions, setMinecraftVersions, setMcWithSnapshots,
   LAUNCH_STAGES, wait,
@@ -95,6 +95,7 @@ function smartSetModRows(current: ModRow[], next: ModRow[]): ModRow[] {
     if (
       cur.name       === nextRow.name &&
       cur.kind       === nextRow.kind &&
+      cur.enabled    === nextRow.enabled &&
       cur.area       === nextRow.area &&
       cur.modrinth_id=== nextRow.modrinth_id &&
       cur.note       === nextRow.note &&
@@ -277,19 +278,24 @@ const isTauri = () => typeof window !== 'undefined' && '__TAURI_INTERNALS__' in 
 
 // ── Resolution helper ────────────────────────────────────────────────────────
 
+let resolutionSeq = 0;
+
 async function runResolution(modlistName?: string, mcVersion?: string, modLoader?: string) {
   const name = modlistName ?? selectedModListName();
   const ver  = mcVersion  ?? selectedMcVersion();
   const ldr  = modLoader  ?? selectedModLoader();
   if (!isTauri() || !name) return;
+  const seq = ++resolutionSeq;
   try {
     const activeIds: string[] = await invoke("resolve_modlist_command", {
       modlistName: name,
       mcVersion: ver,
       modLoader: ldr,
     });
+    if (seq !== resolutionSeq) return; // stale result, discard
     setResolvedModIds(new Set(activeIds));
   } catch (e) {
+    if (seq !== resolutionSeq) return; // stale error, discard
     logger.warn("App", "resolution failed", { error: e });
     setResolvedModIds(null);
   }
@@ -405,6 +411,7 @@ function mapEditorRow(row: any, ruleIndex: number, path: string): ModRow {
     modrinth_id: row.source === "modrinth" ? (row.modId as string) : undefined,
     primaryModId: row.modId as string,
     kind: row.source as "modrinth" | "local",
+    enabled: row.enabled !== false,
     area: "Rule",
     note: alternatives.length > 0 ? `Primary option with ${alternatives.length + 1} mods.` : "Primary option with 1 mod.",
     tags: [],
@@ -428,36 +435,13 @@ async function loadEditorSnapshot(modlistName: string, resetGroups = false) {
     // destroy and recreate every component on every reload.
     setModRowsState(cur => smartSetModRows(cur, mappedRows));
 
-    // Load top-level aesthetic groups (structural containers) from rules.json.
-    const snapGroups: AestheticGroup[] = (snap.groups ?? []).map((g: any) => ({
-      id: g.id as string,
-      name: g.name as string,
-      collapsed: Boolean(g.collapsed),
-      blockIds: (g.blockIds ?? []) as string[],
-      scopeRowId: null as string | null,
-    }));
+    // Immediately re-apply cached Modrinth display names so rows don't briefly
+    // (or permanently) show raw slugs after a reload.
+    patchModNames();
 
-    // Reconstruct alt-scoped aesthetic groups from each row's altGroups field.
-    const altScopedGroups: AestheticGroup[] = [];
-    const extractAltGroups = (rows: any[]) => {
-      for (const row of rows) {
-        if (row.altGroups?.length) {
-          for (const ag of row.altGroups) {
-            altScopedGroups.push({
-              id: ag.id as string,
-              name: ag.name as string,
-              collapsed: Boolean(ag.collapsed),
-              blockIds: (ag.blockIds ?? []) as string[],
-              scopeRowId: row.id as string,
-            });
-          }
-        }
-        if (row.alternatives?.length) extractAltGroups(row.alternatives);
-      }
-    };
-    extractAltGroups(mappedRows);
-
-    setAestheticGroups([...snapGroups, ...altScopedGroups]);
+    // NOTE: Aesthetic groups are loaded exclusively by loadModlistGroups (from
+    // the groups file).  Setting them here would race with the save effect and
+    // persist an empty array before loadModlistGroups can read the real data.
 
     // Reconstruct savedLinks from each row's links field (primary mod IDs → row IDs).
     // Build a primaryModId → rowId map covering all rows at every depth.
@@ -515,8 +499,13 @@ async function loadEditorSnapshot(modlistName: string, resetGroups = false) {
     setVersionRules(extractedVR);
     setCustomConfigs(extractedCC);
 
-    // Re-resolve so green/red indicators update after any edit.
-    void runResolution(modlistName);
+    // Pre-populate Modrinth availability cache in the background, then resolve.
+    // The backfill ensures the DB has results for all mods before resolution reads them.
+    void invoke("backfill_availability_command", {
+      modlistName,
+      mcVersion: selectedMcVersion(),
+      modLoader: selectedModLoader(),
+    }).catch(() => {}).then(() => runResolution(modlistName));
 
     return snap;
   } catch (err) {
@@ -587,13 +576,23 @@ async function loadModlistGroups(modlistName: string, rows: ModRow[]) {
   try {
     const layout: any = await invoke("load_modlist_groups_command", { modlistName });
     const availableIds = new Set<string>();
+    // Build modId → rowId map for translating persisted mod IDs back to current row IDs.
+    const modIdToRowId = new Map<string, string>();
     const collect = (items: ModRow[]) => {
       for (const row of items) {
         availableIds.add(row.id);
+        if (row.primaryModId) modIdToRowId.set(row.primaryModId, row.id);
         if (row.alternatives?.length) collect(row.alternatives);
       }
     };
     collect(rows);
+
+    // Resolve a persisted ID (could be a mod_id or an old-format row ID) to a current row ID.
+    const resolveId = (id: string): string | null => {
+      if (availableIds.has(id)) return id;               // already a valid row ID
+      const mapped = modIdToRowId.get(id);                // try as mod_id
+      return mapped && availableIds.has(mapped) ? mapped : null;
+    };
 
     // Read tag definitions with their mod_ids directly from the layout file.
     const tagDefs = layout.tags ?? layout.functionalGroups ?? [];
@@ -601,7 +600,7 @@ async function loadModlistGroups(modlistName: string, rows: ModRow[]) {
       id: group.id,
       name: group.name,
       tone: group.tone,
-      modIds: (group.modIds ?? group.mod_ids ?? []).filter((id: string) => availableIds.has(id)),
+      modIds: (group.modIds ?? group.mod_ids ?? []).map((id: string) => resolveId(id)).filter((id: string | null): id is string => id !== null),
     }));
     setFunctionalGroups(nextFunctionalGroups.filter((g: FunctionalGroup) => g.modIds.length > 0));
 
@@ -611,12 +610,12 @@ async function loadModlistGroups(modlistName: string, rows: ModRow[]) {
       id: g.id as string,
       name: g.name as string,
       collapsed: g.collapsed as boolean,
-      blockIds: (g.blockIds ?? []).filter((id: string) => availableIds.has(id)),
-      scopeRowId: (g.scopeRowId as string | null) ?? null,
+      blockIds: (g.blockIds ?? []).map((id: string) => resolveId(id)).filter((id: string | null): id is string => id !== null),
+      scopeRowId: (() => { const s = g.scopeRowId as string | null; return s ? (resolveId(s) ?? null) : null; })(),
     })));
 
     // Restore expanded alt panels from persisted state.
-    const persistedExpanded: string[] = (layout.collapsedAlts ?? []).filter((id: string) => availableIds.has(id));
+    const persistedExpanded: string[] = (layout.collapsedAlts ?? []).map((id: string) => resolveId(id)).filter((id: string | null): id is string => id !== null);
     setExpandedRows(persistedExpanded);
 
     return layout;
@@ -711,12 +710,16 @@ export default function App() {
   const [linksReady, setLinksReady] = createSignal(false);
   const [lastSavedLinks, setLastSavedLinks] = createSignal("");
 
+  // Helper: convert a row ID to a stable mod ID for persistence.
+  const rowIdToModId = (id: string): string => rowMap().get(id)?.primaryModId ?? id;
+
   // Helper: build the full groups command payload (reused by all three group save effects).
+  // Persists mod IDs (stable) instead of position-based row IDs so groups survive rule reordering.
   const buildGroupsPayload = (modlistName: string) => ({
     modlistName,
-    tags: functionalGroups().map(g => ({ id: g.id, name: g.name, tone: g.tone, modIds: g.modIds })),
-    aestheticGroups: aestheticGroups().map(g => ({ id: g.id, name: g.name, collapsed: g.collapsed, blockIds: g.blockIds, scopeRowId: g.scopeRowId ?? null })),
-    collapsedAlts: [...expandedRows()],
+    tags: functionalGroups().map(g => ({ id: g.id, name: g.name, tone: g.tone, modIds: g.modIds.map(rowIdToModId) })),
+    aestheticGroups: aestheticGroups().map(g => ({ id: g.id, name: g.name, collapsed: g.collapsed, blockIds: g.blockIds.map(rowIdToModId), scopeRowId: g.scopeRowId ? rowIdToModId(g.scopeRowId) : null })),
+    collapsedAlts: [...expandedRows()].map(rowIdToModId),
   });
 
   // Save functional group (tag) definitions + membership to modlist-editor-groups.json.
@@ -1066,11 +1069,9 @@ export default function App() {
     const parentModId = rowMap().get(parentId)?.primaryModId ?? parentId;
     const altSource = rowMap().get(altRowId)?.kind ?? "modrinth";
     try {
-      // Remove the mod from its current position first (top-level or nested),
-      // then add it as an alternative. The backend rejects duplicates.
-      await invoke("delete_rules_command", {
-        input: { modlistName: selectedModListName(), modIds: [altModId] },
-      });
+      // Move the mod to be an alternative of the parent. The backend extracts
+      // the rule from its current position (preserving all data) and re-inserts
+      // it as an alternative, so no separate delete is needed.
       if (isNested) {
         await invoke("add_nested_alternative_command", {
           input: { modlistName: selectedModListName(), parentModId, modId: altModId, source: altSource },
@@ -1081,6 +1082,7 @@ export default function App() {
         });
       }
       await loadEditorSnapshot(selectedModListName());
+      await loadModlistGroups(selectedModListName(), modRowsState());
       if (parentNamePath) {
         const nextParentId = findRowIdByNamePath(modRowsState(), parentNamePath);
         if (nextParentId) setAlternativesPanelParentId(nextParentId);
@@ -1127,14 +1129,12 @@ export default function App() {
       return;
     }
     if (!selectedModListName()) { logger.warn("App", "handleRemoveAlternative skipped — no modlist"); return; }
-    const activePanelPath = alternativesPanelParent()
-      ? findRowNamePath(modRowsState(), alternativesPanelParent()!.id)
-      : null;
+    // Save the panel parent's stable mod_id so we can restore it after reload.
+    const panelParentModId = alternativesPanelParent()?.primaryModId ?? null;
     appendDebugTrace("alts.remove.frontend", {
       modlistName: selectedModListName(),
       altRowId,
-      activePanelId: alternativesPanelParent()?.id ?? null,
-      activePanelPath,
+      activePanelModId: panelParentModId,
     });
     try {
       const altModId = rowMap().get(altRowId)?.primaryModId ?? altRowId;
@@ -1151,15 +1151,17 @@ export default function App() {
         input: { modlistName: selectedModListName(), parentModId, altModId },
       });
       await loadEditorSnapshot(selectedModListName());
-      if (activePanelPath) {
-        const nextParentId = findRowIdByNamePath(modRowsState(), activePanelPath);
-        if (nextParentId) setAlternativesPanelParentId(nextParentId);
+      await loadModlistGroups(selectedModListName(), modRowsState());
+      // Restore the alternatives panel using the stable mod_id.
+      if (panelParentModId) {
+        const nextParent = [...rowMap().values()].find(r => r.primaryModId === panelParentModId);
+        if (nextParent) setAlternativesPanelParentId(nextParent.id);
         else setAlternativesPanelParentId(null);
         appendDebugTrace("alts.remove.frontend", {
           status: "reloaded",
           altRowId,
-          nextParentId: nextParentId ?? null,
-          activePanelPath,
+          nextParentId: nextParent?.id ?? null,
+          panelParentModId,
         });
       }
     } catch (err) {
@@ -1244,6 +1246,7 @@ export default function App() {
       name: displayName,
       modrinth_id: modId,
       kind: "modrinth",
+      enabled: true,
       area: "Rule",
       note: "Primary option with 1 mod.",
       tags: [],
@@ -1467,6 +1470,30 @@ export default function App() {
       pushUiError({ title: "Could not save incompatibilities", message: "The incompatibility rules could not be persisted.", detail: String(err), severity: "error", scope: "launch" });
     }
   };
+
+  const handleToggleEnabled = async (rowId: string, enabled: boolean) => {
+    const modId = rowMap().get(rowId)?.primaryModId ?? rowId;
+    if (!isTauri() || !selectedModListName()) return;
+    // Optimistic update
+    setModRowsState(cur => cur.map(function toggle(r: ModRow): ModRow {
+      const updated = r.id === rowId ? { ...r, enabled } : r;
+      if (updated.alternatives?.length) {
+        return { ...updated, alternatives: updated.alternatives.map(toggle) };
+      }
+      return updated;
+    }));
+    try {
+      await invoke("toggle_rule_enabled_command", {
+        input: { modlistName: selectedModListName(), modId, enabled },
+      });
+      void runResolution();
+    } catch (err) {
+      pushUiError({ title: "Toggle failed", message: `Could not ${enabled ? "enable" : "disable"} the mod.`, detail: String(err), severity: "error", scope: "launch" });
+      await loadEditorSnapshot(selectedModListName());
+    }
+  };
+
+  setOnToggleEnabled(() => handleToggleEnabled);
 
   const handleSavePresentation = async () => {
     if (!selectedModListName()) return;

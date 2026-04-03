@@ -147,25 +147,22 @@ export function AltSection(props: AltSectionProps) {
 
   // ── Enhanced drop target detection ──────────────────────────────────────
   const detectAltDropTarget = (cursorY: number): string | null => {
-    const cr = engine.cachedContainerRect();
-    if (!cr) return null;
-
     const items      = altTopLevelItems();
     const heights    = engine.cachedHeights();
+    const tops       = engine.cachedTops();
     const isGDrag    = isGroupDrag();
     const draggingItemId = engine.draggingId()!;
     const membership = altGroupMembership();
     const initMidYs  = engine.cachedMidYs();
 
-    let y = cr.top;
-
     for (const item of items) {
       const id = altTlId(item);
-      const h  = heights.get(id) ?? 40;
-
-      // Skip the item being dragged
       const dragTlId = isGDrag ? `alt-group:${draggingItemId}` : draggingItemId;
-      if (id === dragTlId) { y += h; continue; }
+      if (id === dragTlId) continue;
+
+      const y = tops.get(id);
+      const h = heights.get(id) ?? 40;
+      if (y === undefined) continue;
 
       if (cursorY < y + h) {
         if (item.kind === "alt-group") {
@@ -205,8 +202,6 @@ export function AltSection(props: AltSectionProps) {
           return cursorY >= midY ? `alt-after:${altId}` : altId;
         }
       }
-
-      y += h;
     }
     return null;
   };

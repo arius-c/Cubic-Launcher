@@ -708,6 +708,9 @@ fn alt_viable_for_launch(
     target: &ResolutionTarget,
 ) -> bool {
     use crate::rules::VersionRuleKind;
+    if !rule.enabled {
+        return false;
+    }
     if rule.exclude_if.iter().any(|id| active_mods.contains(id)) {
         return false;
     }
