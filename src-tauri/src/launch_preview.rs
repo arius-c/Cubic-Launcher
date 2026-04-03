@@ -167,8 +167,11 @@ pub fn stop_minecraft_command() -> Result<(), String> {
     if let Some(pid) = pid {
         #[cfg(target_os = "windows")]
         {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
             let _ = std::process::Command::new("taskkill")
-                .args(["/F", "/PID", &pid.to_string()])
+                .args(["/F", "/T", "/PID", &pid.to_string()])
+                .creation_flags(CREATE_NO_WINDOW)
                 .output();
         }
         #[cfg(not(target_os = "windows"))]
@@ -224,6 +227,35 @@ async fn run_launch_pipeline(
     let http_client = reqwest::Client::new();
 
     let resolution = resolve_modlist(&modlist, &target)?;
+
+    // Verify Modrinth availability for resolved mods. If a resolved mod has no
+    // compatible version on Modrinth, temporarily disable it and re-resolve so
+    // alternatives get a chance.
+    let resolution = {
+        let mut selected = collect_selected_mods(&modlist, &resolution, &target);
+        let versions = prefetch_compatible_versions_for_selected(&selected, &modrinth_client, &target).await?;
+        let mut unavailable: Vec<String> = Vec::new();
+        for s in &selected {
+            if matches!(s.source, ModSource::Modrinth) && !versions.contains_key(&s.mod_id) {
+                unavailable.push(s.mod_id.clone());
+            }
+        }
+        if unavailable.is_empty() {
+            resolution
+        } else {
+            // Temporarily disable unavailable mods and re-resolve.
+            let mut patched = modlist.clone();
+            for uid in &unavailable {
+                if let Some(rule) = patched.find_rule_mut(uid) {
+                    rule.enabled = false;
+                }
+            }
+            let re_resolved = resolve_modlist(&patched, &target)?;
+            // Restore enabled flags (they're only changed on the clone).
+            selected = collect_selected_mods(&modlist, &re_resolved, &target);
+            re_resolved
+        }
+    };
     log_resolution(&app_handle, &resolution)?;
 
     let selected_mods = collect_selected_mods(&modlist, &resolution, &target);
@@ -663,39 +695,27 @@ fn describe_failure_reason(reason: FailureReason) -> &'static str {
     }
 }
 
-/// Collect mods for launch.  When a primary resolves, only it is included.
-/// When a primary fails, all of its DIRECT alternatives that individually
-/// pass (exclude_if, requires, version_rules) are included.
+/// Collect mods for launch.  When a rule resolves (primary or alternative),
+/// include whichever mod was selected by the resolver.
 fn collect_selected_mods(
     modlist: &ModList,
     resolution: &ResolutionResult,
-    target: &ResolutionTarget,
+    _target: &ResolutionTarget,
 ) -> Vec<SelectedMod> {
     let mut selected = Vec::new();
-    let active: HashSet<String> = resolution.active_mods.clone();
 
     for (i, resolved) in resolution.resolved_rules.iter().enumerate() {
         let Some(top_rule) = modlist.rules.get(i) else { continue };
 
-        match &resolved.outcome {
-            RuleOutcome::Resolved { resolved_id } if *resolved_id == top_rule.mod_id => {
-                // Primary resolved — include only it.
-                selected.push(SelectedMod {
-                    mod_id: top_rule.mod_id.clone(),
-                    source: top_rule.source.clone(),
-                });
-            }
-            _ => {
-                // Primary failed — include every DIRECT viable alternative.
-                for alt in &top_rule.alternatives {
-                    if alt_viable_for_launch(alt, &active, target) {
-                        selected.push(SelectedMod {
-                            mod_id: alt.mod_id.clone(),
-                            source: alt.source.clone(),
-                        });
-                    }
-                }
-            }
+        if let RuleOutcome::Resolved { resolved_id } = &resolved.outcome {
+            // Find the actual rule (primary or any nested alternative) to get its source.
+            let rule = modlist
+                .find_rule(resolved_id)
+                .unwrap_or(top_rule);
+            selected.push(SelectedMod {
+                mod_id: resolved_id.clone(),
+                source: rule.source.clone(),
+            });
         }
     }
 

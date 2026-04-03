@@ -46,7 +46,17 @@ function GroupHeader(props: {
   return (
     <div class="flex flex-1 items-center gap-2 min-w-0">
       <button
-        onClick={() => toggleGroupCollapsed(props.groupId)}
+        onClick={e => {
+          let el: HTMLElement | null = e.currentTarget as HTMLElement;
+          while (el && el !== document.body) {
+            const ov = getComputedStyle(el).overflowY;
+            if (ov === "auto" || ov === "scroll") break;
+            el = el.parentElement;
+          }
+          const scrollTop = el?.scrollTop ?? 0;
+          toggleGroupCollapsed(props.groupId);
+          requestAnimationFrame(() => { if (el) el.scrollTop = scrollTop; });
+        }}
         class="flex items-center text-sm font-medium text-muted-foreground transition-colors hover:text-foreground"
         title={props.collapsed ? "Expand group" : "Collapse group"}
       >
@@ -404,14 +414,16 @@ function ContentTabView(props: { type: string; modlistName: string; onAddContent
     const dragId = engine.draggingId()!;
     const isGroupDrag = isDraggingGroup();
     const dragTlId = isGroupDrag ? `group:${dragId}` : dragId;
+    const sd = engine.scrollDelta();
 
     for (const item of items) {
       const id = ctlId(item);
       if (id === dragTlId) continue;
 
-      const y = tops.get(id);
+      const rawY = tops.get(id);
       const h = heights.get(id) ?? 40;
-      if (y === undefined) continue;
+      if (rawY === undefined) continue;
+      const y = rawY - sd;
 
       if (cursorY < y + h) {
         if (item.kind === "group") {
@@ -419,19 +431,20 @@ function ContentTabView(props: { type: string; modlistName: string; onAddContent
           const relY = cursorY - y;
           if (isGroupDrag) return cursorY >= y + h / 2 ? `tl-group-after:${gId}` : `tl-group:${gId}`;
           const draggedIsGroupMember = groupByEntryId().get(dragId) === gId;
-          if (!draggedIsGroupMember && relY < h * 0.25) return `tl-group:${gId}`;
-          if (!draggedIsGroupMember && relY > h * 0.75) return `tl-group-after:${gId}`;
+          const edgePx = Math.min(20, h * 0.15);
+          if (!draggedIsGroupMember && relY < edgePx) return `tl-group:${gId}`;
+          if (!draggedIsGroupMember && relY > h - edgePx) return `tl-group-after:${gId}`;
           // Middle zone — group-drop
           const midYs = engine.cachedMidYs();
           const candidates = item.entries.filter(e => e.id !== dragTlId);
           if (candidates.length === 0) return `group-drop:${gId}`;
           let nearest = candidates[0];
           for (const c of candidates.slice(1)) {
-            const cMid = midYs.get(c.id) ?? Infinity;
-            const nMid = midYs.get(nearest.id) ?? Infinity;
+            const cMid = (midYs.get(c.id) ?? Infinity) - sd;
+            const nMid = (midYs.get(nearest.id) ?? Infinity) - sd;
             if (Math.abs(cursorY - cMid) < Math.abs(cursorY - nMid)) nearest = c;
           }
-          const nearestMid = midYs.get(nearest.id) ?? (y + h / 2);
+          const nearestMid = (midYs.get(nearest.id) ?? (rawY + h / 2)) - sd;
           return cursorY >= nearestMid ? `row-after:${nearest.id}` : nearest.id;
         }
         if (isGroupDrag) {
@@ -889,7 +902,7 @@ function ContentTabView(props: { type: string; modlistName: string; onAddContent
       </Show>
 
       {/* Content list */}
-      <div class="flex-1 p-4" style={{ overflow: engine.anyDragging() ? "hidden" : "auto" }}>
+      <div class="flex-1 p-4" style={{ overflow: "auto" }}>
         <Show when={entries().length > 0} fallback={
           <div class="flex flex-col items-center justify-center py-16 text-center">
             <div class="mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-muted">
@@ -1083,6 +1096,7 @@ function ContentTabView(props: { type: string; modlistName: string; onAddContent
 
 export function ModListEditor(props: Props) {
   let listContainerRef: HTMLDivElement | undefined;
+  let scrollContainerRef: HTMLDivElement | undefined;
 
   const activeModList   = () => modListCards().find(m => m.name === selectedModListName());
   const hasContent      = () => modRowsState().length > 0;
@@ -1097,6 +1111,36 @@ export function ModListEditor(props: Props) {
     ),
     onCommit: (fromId, dropId, fromKind) => commitDrop(fromId, dropId, fromKind),
   });
+
+  // ── Auto-scroll during drag ──────────────────────────────────────────────
+  {
+    const EDGE_PX = 50;
+    const SPEED = 6;
+    let autoScrollFrame = 0;
+    const tick = () => {
+      const ptr = engine.dragPointer();
+      const el = scrollContainerRef;
+      if (!ptr || !el || !engine.anyDragging()) { autoScrollFrame = 0; return; }
+      const rect = el.getBoundingClientRect();
+      const distTop = ptr.y - rect.top;
+      const distBot = rect.bottom - ptr.y;
+      if (distTop < EDGE_PX) {
+        el.scrollTop -= SPEED * (1 - distTop / EDGE_PX);
+      } else if (distBot < EDGE_PX) {
+        el.scrollTop += SPEED * (1 - distBot / EDGE_PX);
+      }
+      autoScrollFrame = requestAnimationFrame(tick);
+    };
+    createEffect(() => {
+      if (engine.anyDragging()) {
+        autoScrollFrame = requestAnimationFrame(tick);
+      } else if (autoScrollFrame) {
+        cancelAnimationFrame(autoScrollFrame);
+        autoScrollFrame = 0;
+      }
+    });
+    onCleanup(() => { if (autoScrollFrame) cancelAnimationFrame(autoScrollFrame); });
+  }
 
   const isDraggingGroup = () => engine.draggingKind() === "group";
 
@@ -1152,14 +1196,16 @@ export function ModListEditor(props: Props) {
     const dragId  = engine.draggingId()!;
     const isGroupDrag = isDraggingGroup();
     const dragTlId = isGroupDrag ? `group:${dragId}` : dragId;
+    const sd = engine.scrollDelta();
 
     for (const item of items) {
       const id = tlId(item);
       if (id === dragTlId) continue;
 
-      const y = tops.get(id);
+      const rawY = tops.get(id);
       const h = heights.get(id) ?? 40;
-      if (y === undefined) continue;
+      if (rawY === undefined) continue;
+      const y = rawY - sd;
 
       if (cursorY < y + h) {
         if (item.kind === "group") {
@@ -1170,8 +1216,9 @@ export function ModListEditor(props: Props) {
             return cursorY >= y + h / 2 ? `tl-group-after:${gId}` : `tl-group:${gId}`;
           }
           const draggedIsGroupMember = groupByRowId().get(dragId) === gId;
-          if (!draggedIsGroupMember && relY < h * 0.25) return `tl-group:${gId}`;
-          if (!draggedIsGroupMember && relY > h * 0.75) return `tl-group-after:${gId}`;
+          const edgePx = Math.min(20, h * 0.15);
+          if (!draggedIsGroupMember && relY < edgePx) return `tl-group:${gId}`;
+          if (!draggedIsGroupMember && relY > h - edgePx) return `tl-group-after:${gId}`;
 
           // Middle zone: find exact target row inside the group using cached midYs
           const midYs = engine.cachedMidYs();
@@ -1179,11 +1226,11 @@ export function ModListEditor(props: Props) {
           if (candidates.length === 0) return `group-drop:${gId}`;
           let nearest = candidates[0];
           for (const c of candidates.slice(1)) {
-            const cMid = midYs.get(c.id) ?? Infinity;
-            const nMid = midYs.get(nearest.id) ?? Infinity;
+            const cMid = (midYs.get(c.id) ?? Infinity) - sd;
+            const nMid = (midYs.get(nearest.id) ?? Infinity) - sd;
             if (Math.abs(cursorY - cMid) < Math.abs(cursorY - nMid)) nearest = c;
           }
-          const nearestMid = midYs.get(nearest.id) ?? (y + h / 2);
+          const nearestMid = (midYs.get(nearest.id) ?? (rawY + h / 2)) - sd;
           return cursorY >= nearestMid ? `row-after:${nearest.id}` : nearest.id;
         }
 
@@ -1579,7 +1626,7 @@ export function ModListEditor(props: Props) {
           <ActionBar onAddMod={props.onAddMod} onDeleteSelected={props.onDeleteSelected} />
 
           {/* Scrollable mod list */}
-          <div class="flex-1 p-4" style={{ overflow: engine.anyDragging() ? "hidden" : "auto" }}>
+          <div class="flex-1 p-4" ref={scrollContainerRef} style={{ overflow: "auto" }}>
             <Show when={hasContent()} fallback={<EmptyState onAddMod={props.onAddMod} />}>
               <>
                 {/* Drag ghost */}

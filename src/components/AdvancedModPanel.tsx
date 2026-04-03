@@ -448,16 +448,20 @@ export function AdvancedModPanel(props: { onDelete?: (modId: string) => void }) 
                         <button onClick={() => setNewLinkDir('mutual')} class={dirBtnClass(newLinkDir() === 'mutual')}>↔</button>
                         <button onClick={() => setNewLinkDir('b-to-a')} class={dirBtnClass(newLinkDir() === 'b-to-a')}>←</button>
                       </div>
-                      <select
-                        value={newLinkPartnerId()}
-                        onChange={e => setNewLinkPartnerId(e.currentTarget.value)}
-                        class="flex-1 min-w-0 rounded border border-border bg-input px-2 py-1 text-xs text-foreground"
-                      >
-                        <option value="">Select mod…</option>
-                        <For each={availableLinkPartners()}>
-                          {p => <option value={p.id}>{p.name}</option>}
-                        </For>
-                      </select>
+                      {(() => {
+                        const [linkSearch, setLinkSearch] = createSignal("");
+                        const filtered = () => { const q = linkSearch().trim().toLowerCase(); return q ? availableLinkPartners().filter(p => p.name.toLowerCase().includes(q)) : availableLinkPartners(); };
+                        return (
+                          <div class="flex-1 min-w-0 relative">
+                            <input type="text" placeholder="Search mod…" value={linkSearch()} onInput={e => { setLinkSearch(e.currentTarget.value); setNewLinkPartnerId(''); }} class="w-full rounded border border-border bg-input px-2 py-1 text-xs text-foreground placeholder:text-muted-foreground outline-none" />
+                            <Show when={linkSearch().trim() && filtered().length > 0}>
+                              <div class="absolute left-0 right-0 top-full mt-1 z-20 max-h-32 overflow-y-auto rounded border border-border bg-card shadow-lg">
+                                <For each={filtered()}>{p => <button onClick={() => { setNewLinkPartnerId(p.id); setLinkSearch(p.name); }} class="flex w-full items-center gap-1.5 px-2 py-1 text-xs text-foreground hover:bg-muted/50 text-left"><ModIcon modrinthId={rowMap().get(p.id)?.modrinth_id} name={p.name} />{p.name}</button>}</For>
+                              </div>
+                            </Show>
+                          </div>
+                        );
+                      })()}
                     </div>
                     <div class="flex justify-center gap-2">
                       <button onClick={commitLink} disabled={!newLinkPartnerId()} class="rounded-md bg-primary px-3 py-1 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50">Add</button>
@@ -562,16 +566,20 @@ export function AdvancedModPanel(props: { onDelete?: (modId: string) => void }) 
                       >
                         {newIncompatMeWins() ? ">" : "<"}
                       </button>
-                      <select
-                        value={newIncompatPartnerId()}
-                        onChange={e => setNewIncompatPartnerId(e.currentTarget.value)}
-                        class="min-w-0 flex-1 rounded border border-border bg-input px-2 py-1 text-xs text-foreground"
-                      >
-                        <option value="">Select mod…</option>
-                        <For each={availableIncompatPartners()}>
-                          {p => <option value={p.id}>{p.name}</option>}
-                        </For>
-                      </select>
+                      {(() => {
+                        const [incompatSearch, setIncompatSearch] = createSignal("");
+                        const filtered = () => { const q = incompatSearch().trim().toLowerCase(); return q ? availableIncompatPartners().filter(p => p.name.toLowerCase().includes(q)) : availableIncompatPartners(); };
+                        return (
+                          <div class="min-w-0 flex-1 relative">
+                            <input type="text" placeholder="Search mod…" value={incompatSearch()} onInput={e => { setIncompatSearch(e.currentTarget.value); setNewIncompatPartnerId(''); }} class="w-full rounded border border-border bg-input px-2 py-1 text-xs text-foreground placeholder:text-muted-foreground outline-none" />
+                            <Show when={incompatSearch().trim() && filtered().length > 0}>
+                              <div class="absolute left-0 right-0 top-full mt-1 z-20 max-h-32 overflow-y-auto rounded border border-border bg-card shadow-lg">
+                                <For each={filtered()}>{p => <button onClick={() => { setNewIncompatPartnerId(p.id); setIncompatSearch(p.name); }} class="flex w-full items-center gap-1.5 px-2 py-1 text-xs text-foreground hover:bg-muted/50 text-left"><ModIcon modrinthId={rowMap().get(p.id)?.modrinth_id} name={p.name} />{p.name}</button>}</For>
+                              </div>
+                            </Show>
+                          </div>
+                        );
+                      })()}
                     </div>
                     <div class="flex justify-center gap-2">
                       <button onClick={commitIncompat} disabled={!newIncompatPartnerId()} class="rounded-md bg-primary px-3 py-1 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50">Add</button>

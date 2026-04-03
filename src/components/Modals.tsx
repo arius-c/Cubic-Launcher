@@ -758,7 +758,7 @@ export function LinksOverviewModal() {
             <For each={pairs()}>
               {({ a, b }) => (
                 <div class="flex items-center gap-3 rounded-md border border-border bg-background p-3">
-                  <span class="min-w-0 flex-1 truncate text-sm font-medium text-foreground text-right">{nameOf(a)}</span>
+                  <span class="min-w-0 flex-1 truncate text-sm font-medium text-foreground text-right flex items-center gap-1 justify-end"><ModIcon modrinthId={rowMap().get(a)?.modrinth_id} name={nameOf(a)} />{nameOf(a)}</span>
                   <div class="flex shrink-0 items-center gap-1">
                     <button
                       onClick={() => toggleDir(a, b, 'a-to-b')}
@@ -782,7 +782,7 @@ export function LinksOverviewModal() {
                       &larr;
                     </button>
                   </div>
-                  <span class="min-w-0 flex-1 truncate text-sm font-medium text-foreground">{nameOf(b)}</span>
+                  <span class="min-w-0 flex-1 truncate text-sm font-medium text-foreground flex items-center gap-1"><ModIcon modrinthId={rowMap().get(b)?.modrinth_id} name={nameOf(b)} />{nameOf(b)}</span>
                   <button
                     onClick={() => setDirection(a, b, 'none')}
                     class="shrink-0 flex h-6 w-6 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive"
@@ -833,6 +833,7 @@ interface IncompatibilitiesModalProps {
 
 export function IncompatibilitiesModal(props: IncompatibilitiesModalProps) {
   const [saving, setSaving] = createSignal(false);
+  const [incompatSearch, setIncompatSearch] = createSignal("");
 
   const handleSave = async () => {
     if (saving() || priorityParadoxDetected()) return;
@@ -886,6 +887,15 @@ export function IncompatibilitiesModal(props: IncompatibilitiesModalProps) {
     <Show when={incompatibilityModalOpen()}>
       <Modal onClose={() => setIncompatibilityModalOpen(false)}>
         <ModalHeader title="Incompatibility Rules" description={`Define which mods conflict with "${focusedIncompatibilityMod()?.name ?? "selected"}"`} onClose={() => setIncompatibilityModalOpen(false)} />
+        <div class="px-6 pt-4">
+          <input
+            type="text"
+            placeholder="Search mods…"
+            value={incompatSearch()}
+            onInput={e => setIncompatSearch(e.currentTarget.value)}
+            class="w-full rounded-md border border-border bg-input px-3 py-1.5 text-sm text-foreground placeholder:text-muted-foreground outline-none focus:ring-1 focus:ring-primary"
+          />
+        </div>
         <div class="flex-1 overflow-y-auto p-6 space-y-3">
           <Show when={priorityParadoxDetected()}>
             <div class="flex items-center gap-2 rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">
@@ -893,7 +903,7 @@ export function IncompatibilitiesModal(props: IncompatibilitiesModalProps) {
               Attention, you have created a priority paradox! Remove the conflicting rule to continue.
             </div>
           </Show>
-          <For each={[...rowMap().values()].filter(r => !incompatibilityExcluded().has(r.id))}>
+          <For each={[...rowMap().values()].filter(r => !incompatibilityExcluded().has(r.id) && (!incompatSearch().trim() || r.name.toLowerCase().includes(incompatSearch().trim().toLowerCase())))}>
             {other => {
               const pair = () => draftIncompatibilities().find(r =>
                 (r.winnerId === incompatibilityFocusId() && r.loserId === other.id) ||
@@ -1269,12 +1279,26 @@ export function AlternativesPanel(props: AlternativesPanelProps) {
 
             {/* Add from list */}
             <Show when={availableToAdd().length > 0}>
+              {(() => {
+                const [altSearch, setAltSearch] = createSignal("");
+                const filteredAlts = () => {
+                  const q = altSearch().trim().toLowerCase();
+                  return q ? availableToAdd().filter(r => r.name.toLowerCase().includes(q)) : availableToAdd();
+                };
+                return (
               <div class="mt-4 border-t border-border pt-4">
                 <p class="mb-2 text-xs font-medium uppercase tracking-wider text-muted-foreground">
                   Add fallback from your mod list
                 </p>
-                <div class="space-y-1.5">
-                  <For each={availableToAdd()}>
+                <input
+                  type="text"
+                  placeholder="Search mods…"
+                  value={altSearch()}
+                  onInput={e => setAltSearch(e.currentTarget.value)}
+                  class="mb-2 w-full rounded-md border border-border bg-input px-3 py-1.5 text-sm text-foreground placeholder:text-muted-foreground outline-none focus:ring-1 focus:ring-primary"
+                />
+                <div class="space-y-1.5 max-h-48 overflow-y-auto">
+                  <For each={filteredAlts()}>
                     {(row) => (
                       <div class="flex items-center gap-2 rounded-md border border-border bg-muted/20 px-3 py-2">
                         <ModIcon modrinthId={row.modrinth_id} name={row.name} />
@@ -1294,6 +1318,8 @@ export function AlternativesPanel(props: AlternativesPanelProps) {
                   </For>
                 </div>
               </div>
+                );
+              })()}
             </Show>
           </div>
 

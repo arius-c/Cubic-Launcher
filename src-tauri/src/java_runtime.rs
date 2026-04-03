@@ -46,7 +46,17 @@ impl JavaBinaryInspector for CommandJavaBinaryInspector {
             return Ok(None);
         }
 
-        let output = match Command::new(path).arg("-version").output() {
+        let mut cmd = Command::new(path);
+        cmd.arg("-version");
+
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+
+        let output = match cmd.output() {
             Ok(output) => output,
             Err(_) => return Ok(None), // binary not executable or missing
         };

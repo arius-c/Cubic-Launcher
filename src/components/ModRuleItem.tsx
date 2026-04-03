@@ -20,6 +20,7 @@ import {
   ChevronRightIcon, AlertTriangleIcon, PackageIcon, XIcon, MaterialIcon,
 } from "./icons";
 import { AltSection } from "./AltSection";
+import { ModIcon } from "./ModIcon";
 
 interface ModRuleItemProps {
   row: ModRow;
@@ -251,6 +252,7 @@ export function ModRuleItem(props: ModRuleItemProps) {
                               : "\u2190";
                             return (
                               <div class="flex items-center gap-1.5 px-3 py-1.5 text-xs hover:bg-muted/30">
+                                <ModIcon modrinthId={props.row.modrinth_id} name={props.row.name} />
                                 <span class="truncate text-foreground">{props.row.name}</span>
                                 <button
                                   onClick={e => { e.stopPropagation(); cycleLinkDirection(props.row.id, link.partnerId); }}
@@ -259,6 +261,7 @@ export function ModRuleItem(props: ModRuleItemProps) {
                                 >
                                   {arrow()}
                                 </button>
+                                <ModIcon modrinthId={rowMap().get(link.partnerId)?.modrinth_id} name={partnerName()} />
                                 <span class="truncate text-foreground flex-1">{partnerName()}</span>
                                 <button
                                   onClick={e => { e.stopPropagation(); removeLink(props.row.id, link.partnerId); }}

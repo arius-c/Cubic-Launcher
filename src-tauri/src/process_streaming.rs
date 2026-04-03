@@ -79,12 +79,20 @@ pub fn spawn_and_stream_process(
     command: PreparedLaunchCommand,
     event_sink: Arc<dyn ProcessEventSink>,
 ) -> Result<ManagedProcess> {
-    let mut child = Command::new(&command.program)
-        .args(&command.args)
+    let mut cmd = Command::new(&command.program);
+    cmd.args(&command.args)
         .current_dir(&command.current_dir)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(Stdio::piped());
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let mut child = cmd.spawn()
         .with_context(|| format!("failed to spawn process '{}'", command.program.display()))?;
 
     let pid = child.id();

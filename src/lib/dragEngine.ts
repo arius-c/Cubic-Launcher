@@ -37,6 +37,9 @@ export function useDragEngine(config: DragEngineConfig) {
   const [cachedHeights,       setCachedHeights]       = createSignal<Map<string, number>>(new Map());
   const [cachedTops,          setCachedTops]           = createSignal<Map<string, number>>(new Map());
   const [cachedMidYs,         setCachedMidYs]         = createSignal<Map<string, number>>(new Map());
+  // Scroll offset delta since drag started (viewport-relative positions shift by this).
+  const [scrollDelta,         setScrollDelta]         = createSignal(0);
+  let scrollAtDragStart = 0;
 
   const anyDragging = () => draggingId() != null;
 
@@ -79,14 +82,16 @@ export function useDragEngine(config: DragEngineConfig) {
     const heights = cachedHeights();
     const tops    = cachedTops();
     const dragId  = draggingId()!;
+    const sd      = scrollDelta();
 
     for (const item of items) {
       const id = dragItemId(item);
       if (id === dragId) continue;
 
-      const y = tops.get(id);
+      const rawY = tops.get(id);
       const h = heights.get(id) ?? 40;
-      if (y === undefined) continue;
+      if (rawY === undefined) continue;
+      const y = rawY - sd; // adjust for scroll since drag started
 
       if (cursorY < y + h) {
         const isBottom = cursorY >= y + h / 2;
@@ -160,6 +165,12 @@ export function useDragEngine(config: DragEngineConfig) {
 
     measureAll();
 
+    // Capture initial scroll position of the scroll container (parent of item container).
+    const container = config.containerRef();
+    const scrollParent = container?.parentElement;
+    scrollAtDragStart = scrollParent?.scrollTop ?? 0;
+    setScrollDelta(0);
+
     batch(() => {
       setDraggingId(id);
       setDraggingKind(kind);
@@ -190,24 +201,39 @@ export function useDragEngine(config: DragEngineConfig) {
   }
 
   onMount(() => {
+    const updateScrollDelta = () => {
+      const container = config.containerRef();
+      const scrollParent = container?.parentElement;
+      if (scrollParent) setScrollDelta(scrollParent.scrollTop - scrollAtDragStart);
+    };
     const onMove = (event: PointerEvent) => {
       if (!draggingId()) return;
       setDragPointer({ x: event.clientX, y: event.clientY });
+      updateScrollDelta();
       const newTarget = detectDropTarget(event.clientY);
-      // Sticky: only update if we got a valid new target
       if (newTarget !== null) {
         setHoveredDropId(newTarget);
       }
-      // If null, keep the last non-null value (sticky behavior — Bug 2 fix)
+    };
+    const onScroll = () => {
+      if (!draggingId()) return;
+      updateScrollDelta();
+      const ptr = dragPointer();
+      if (ptr) {
+        const newTarget = detectDropTarget(ptr.y);
+        if (newTarget !== null) setHoveredDropId(newTarget);
+      }
     };
     const onUp = () => {
       if (draggingId()) finishDrag();
     };
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup",   onUp);
+    window.addEventListener("scroll", onScroll, true); // capture phase to catch all scrolls
     onCleanup(() => {
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup",   onUp);
+      window.removeEventListener("scroll", onScroll, true);
       document.body.style.userSelect = "";
     });
   });
@@ -226,6 +252,7 @@ export function useDragEngine(config: DragEngineConfig) {
     cachedTops,
     cachedMidYs,
     cachedContainerRect,
+    scrollDelta,
     // Allow components to override detection (for groups with inner rows, alt groups, etc.)
     setHoveredDropId,
   };
