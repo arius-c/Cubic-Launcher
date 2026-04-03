@@ -15,6 +15,7 @@ import {
 import { MOD_LOADERS } from "../lib/types";
 import { minecraftVersions, mcWithSnapshots, showSnapshots, setShowSnapshots } from "../store";
 import { MaterialIcon, XIcon } from "./icons";
+import { ModIcon } from "./ModIcon";
 
 const isTauri = () => "__TAURI_INTERNALS__" in window;
 
@@ -190,7 +191,7 @@ export function AdvancedModPanel(props: { onDelete?: (modId: string) => void }) 
           <div class="flex items-center justify-between border-b border-border px-6 py-4 shrink-0">
             <div>
               <h2 class="text-lg font-semibold text-foreground">Advanced</h2>
-              <p class="text-sm text-muted-foreground truncate max-w-md">{row()!.name}</p>
+              <p class="flex items-center gap-1.5 text-sm text-muted-foreground truncate max-w-md"><ModIcon modrinthId={row()!.modrinth_id} name={row()!.name} />{row()!.name}</p>
             </div>
             <button
               onClick={() => setAdvancedPanelModId(null)}
@@ -416,13 +417,13 @@ export function AdvancedModPanel(props: { onDelete?: (modId: string) => void }) 
                     const dir = () => currentLinkDir(link.partnerId);
                     return (
                       <div class="flex items-center gap-2 rounded-md border border-border bg-background p-2">
-                        <span class="text-sm font-medium text-foreground truncate min-w-0 flex-1 text-right">{row()!.name}</span>
+                        <span class="flex items-center gap-1 text-sm font-medium text-foreground truncate min-w-0 flex-1 justify-end"><ModIcon modrinthId={row()!.modrinth_id} name={row()!.name} />{row()!.name}</span>
                         <div class="flex shrink-0 items-center gap-0.5">
                           <button onClick={() => toggleLinkDir(link.partnerId, 'a-to-b')} class={dirBtnClass(dir() === 'a-to-b')} title={`${row()!.name} requires ${partnerName()}`}>→</button>
                           <button onClick={() => toggleLinkDir(link.partnerId, 'mutual')} class={dirBtnClass(dir() === 'mutual')} title="Mutual dependency">↔</button>
                           <button onClick={() => toggleLinkDir(link.partnerId, 'b-to-a')} class={dirBtnClass(dir() === 'b-to-a')} title={`${partnerName()} requires ${row()!.name}`}>←</button>
                         </div>
-                        <span class="text-sm font-medium text-foreground truncate min-w-0 flex-1">{partnerName()}</span>
+                        <span class="flex items-center gap-1 text-sm font-medium text-foreground truncate min-w-0 flex-1"><ModIcon modrinthId={rowMap().get(link.partnerId)?.modrinth_id} name={partnerName()} />{partnerName()}</span>
                         <button
                           onClick={() => setLinkDirection(link.partnerId, 'none')}
                           class="shrink-0 flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-destructive/10 hover:text-destructive transition-colors"
@@ -483,9 +484,9 @@ export function AdvancedModPanel(props: { onDelete?: (modId: string) => void }) 
                     <span class="text-xs text-muted-foreground shrink-0">Parent:</span>
                     <button
                       onClick={() => setAdvancedPanelModId(parentId()!)}
-                      class="text-sm font-medium text-primary hover:underline truncate"
+                      class="inline-flex items-center gap-1 text-sm font-medium text-primary hover:underline truncate"
                     >
-                      {parentRow()!.name}
+                      <ModIcon modrinthId={parentRow()!.modrinth_id} name={parentRow()!.name} />{parentRow()!.name}
                     </button>
                   </div>
                 </Show>
@@ -496,9 +497,9 @@ export function AdvancedModPanel(props: { onDelete?: (modId: string) => void }) 
                       {child => (
                         <button
                           onClick={() => setAdvancedPanelModId(child.id)}
-                          class="text-sm font-medium text-primary hover:underline"
+                          class="inline-flex items-center gap-1 text-sm font-medium text-primary hover:underline"
                         >
-                          {child.name}
+                          <ModIcon modrinthId={child.modrinth_id} name={child.name} />{child.name}
                         </button>
                       )}
                     </For>
@@ -526,7 +527,7 @@ export function AdvancedModPanel(props: { onDelete?: (modId: string) => void }) 
                     const otherName = () => rowMap().get(item.otherId)?.name ?? item.otherId;
                     return (
                       <div class="flex items-center gap-2 rounded-md border border-border bg-background p-2">
-                        <span class="text-sm font-medium text-foreground truncate min-w-0 flex-1 text-right">{row()!.name}</span>
+                        <span class="flex items-center gap-1 text-sm font-medium text-foreground truncate min-w-0 flex-1 justify-end"><ModIcon modrinthId={row()!.modrinth_id} name={row()!.name} />{row()!.name}</span>
                         <button
                           onClick={() => swapIncompat(item.otherId)}
                           class="shrink-0 rounded px-1.5 py-0.5 text-xs font-bold text-primary hover:bg-primary/20 transition-colors"
@@ -534,7 +535,7 @@ export function AdvancedModPanel(props: { onDelete?: (modId: string) => void }) 
                         >
                           {item.meWins ? ">" : "<"}
                         </button>
-                        <span class="text-sm font-medium text-foreground truncate min-w-0 flex-1">{otherName()}</span>
+                        <span class="flex items-center gap-1 text-sm font-medium text-foreground truncate min-w-0 flex-1"><ModIcon modrinthId={rowMap().get(item.otherId)?.modrinth_id} name={otherName()} />{otherName()}</span>
                         <button
                           onClick={() => removeIncompat(item.otherId)}
                           class="shrink-0 flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-destructive/10 hover:text-destructive transition-colors"

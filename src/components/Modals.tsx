@@ -4,6 +4,7 @@ import type { ModRow } from "../lib/types";
 import { appendDebugTrace } from "../lib/debugTrace";
 import { useDragEngine, type DragItem } from "../lib/dragEngine";
 import { GripVerticalIcon } from "./icons";
+import { ModIcon } from "./ModIcon";
 import {
   /* Settings */
   settingsModalOpen, setSettingsModalOpen, settingsTab, setSettingsTab,
@@ -95,6 +96,7 @@ function DraggableAltRow(props: {
         class="h-4 w-4 shrink-0 rounded text-primary"
       />
 
+      <ModIcon modrinthId={props.alt.modrinth_id} name={props.alt.name} />
       <div class="min-w-0 flex-1">
         <p class="truncate text-sm font-medium text-foreground">{props.alt.name}</p>
         <Show when={props.alt.kind === "local"}>
@@ -912,7 +914,7 @@ export function IncompatibilitiesModal(props: IncompatibilitiesModalProps) {
                     <Show
                       when={enabled()}
                       fallback={
-                        <span class="text-sm text-muted-foreground">{other.name}</span>
+                        <span class="flex items-center gap-1.5 text-sm text-muted-foreground"><ModIcon modrinthId={other.modrinth_id} name={other.name} />{other.name}</span>
                       }
                     >
                       <div class="flex flex-1 flex-wrap items-center gap-2">
@@ -926,7 +928,7 @@ export function IncompatibilitiesModal(props: IncompatibilitiesModalProps) {
                               : "bg-red-500/15 text-red-500 ring-1 ring-red-500/30"
                           }`}
                         >
-                          {focusedIncompatibilityMod()?.name}
+                          <span class="inline-flex items-center gap-1"><ModIcon modrinthId={focusedIncompatibilityMod()?.modrinth_id} name={focusedIncompatibilityMod()?.name} />{focusedIncompatibilityMod()?.name}</span>
                         </button>
 
                         <span class="text-xs text-muted-foreground">vs</span>
@@ -941,7 +943,7 @@ export function IncompatibilitiesModal(props: IncompatibilitiesModalProps) {
                               : "bg-red-500/15 text-red-500 ring-1 ring-red-500/30"
                           }`}
                         >
-                          {other.name}
+                          <span class="inline-flex items-center gap-1"><ModIcon modrinthId={other.modrinth_id} name={other.name} />{other.name}</span>
                         </button>
                       </div>
                     </Show>
@@ -1163,6 +1165,7 @@ export function AlternativesPanel(props: AlternativesPanelProps) {
             <div class="flex items-center gap-3 rounded-md border border-primary/30 bg-primary/5 px-3 py-2">
               <div class="h-4 w-4 shrink-0" /> {/* grip spacer */}
               <span class="w-5 shrink-0 text-center text-sm font-semibold text-primary">1</span>
+              <ModIcon modrinthId={parent().modrinth_id} name={parent().name} />
               <span class="flex-1 text-sm font-medium text-foreground">{parent().name}</span>
               <span class="text-xs text-muted-foreground">Primary</span>
             </div>
@@ -1273,7 +1276,8 @@ export function AlternativesPanel(props: AlternativesPanelProps) {
                 <div class="space-y-1.5">
                   <For each={availableToAdd()}>
                     {(row) => (
-                      <div class="flex items-center gap-3 rounded-md border border-border bg-muted/20 px-3 py-2">
+                      <div class="flex items-center gap-2 rounded-md border border-border bg-muted/20 px-3 py-2">
+                        <ModIcon modrinthId={row.modrinth_id} name={row.name} />
                         <span class="flex-1 truncate text-sm text-foreground">{row.name}</span>
                         <Show when={row.kind === "local"}>
                           <span class="text-[10px] text-warning">Local</span>
