@@ -8,13 +8,55 @@ use serde::Deserialize;
 use crate::resolver::{ModLoader, ResolutionTarget};
 
 const MODRINTH_API_BASE_URL: &str = "https://api.modrinth.com/v2";
+
+/// Check whether a game-version string from Modrinth matches a concrete MC
+/// version.  Handles wildcard patterns such as `"1.21.x"` / `"1.21.X"` where
+/// the last segment is a case-insensitive `x` meaning "any patch".
+pub fn mc_version_matches(pattern: &str, concrete: &str) -> bool {
+    if pattern == concrete {
+        return true;
+    }
+    // Check for trailing `.x` / `.X` wildcard
+    let Some(prefix) = pattern
+        .strip_suffix(".x")
+        .or_else(|| pattern.strip_suffix(".X"))
+    else {
+        return false;
+    };
+    // `concrete` must start with the prefix followed by a dot and at least one
+    // more character (the actual patch number).
+    // e.g. pattern "1.21.x" → prefix "1.21", concrete "1.21.1" ✓
+    concrete.starts_with(prefix) && concrete.as_bytes().get(prefix.len()) == Some(&b'.')
+}
+
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn build_http_client() -> reqwest::Client {
     reqwest::Client::builder()
+        .user_agent("cubic-launcher/0.1.0 (https://github.com/arius-c/Cubic-Launcher)")
         .timeout(REQUEST_TIMEOUT)
         .build()
         .unwrap_or_default()
+}
+
+// Retry once on HTTP 429 to be polite to Modrinth's rate limiter.
+async fn send_with_retry(
+    http_client: &reqwest::Client,
+    url: reqwest::Url,
+) -> reqwest::Result<reqwest::Response> {
+    let first = http_client.get(url.clone()).send().await?;
+    if first.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Ok(first);
+    }
+    let retry_after_secs = first
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(2)
+        .min(10);
+    tokio::time::sleep(std::time::Duration::from_secs(retry_after_secs)).await;
+    http_client.get(url).send().await
 }
 
 #[derive(Debug, Clone)]
@@ -48,10 +90,7 @@ impl ModrinthClient {
         }
 
         let url = build_project_versions_url(&self.base_url, project_id, target)?;
-        let response = self
-            .http_client
-            .get(url)
-            .send()
+        let response = send_with_retry(&self.http_client, url)
             .await
             .with_context(|| {
                 format!("failed to query Modrinth versions for project '{project_id}'")
@@ -96,14 +135,14 @@ impl ModrinthClient {
         let game_versions_json = serde_json::to_string(&vec![minecraft_version])?;
         url.query_pairs_mut()
             .append_pair("game_versions", &game_versions_json);
-        let response = self.http_client.get(url).send().await
+        let response = send_with_retry(&self.http_client, url).await
             .with_context(|| format!("failed to query Modrinth versions for content pack '{project_id}'"))?
             .error_for_status()
             .with_context(|| format!("Modrinth returned an error for content pack '{project_id}'"))?;
         let versions = response.json::<Vec<ModrinthVersion>>().await
             .with_context(|| format!("failed to deserialize Modrinth versions for content pack '{project_id}'"))?;
         // Filter to only versions matching the MC version
-        Ok(versions.into_iter().filter(|v| v.game_versions.iter().any(|gv| gv == minecraft_version)).collect())
+        Ok(versions.into_iter().filter(|v| v.game_versions.iter().any(|gv| mc_version_matches(gv, minecraft_version))).collect())
     }
 
     pub async fn fetch_version(&self, version_id: &str) -> Result<Option<ModrinthVersion>> {
@@ -112,10 +151,7 @@ impl ModrinthClient {
         }
 
         let url = build_version_url(&self.base_url, version_id)?;
-        let response = self
-            .http_client
-            .get(url)
-            .send()
+        let response = send_with_retry(&self.http_client, url)
             .await
             .with_context(|| format!("failed to query Modrinth version '{version_id}'"))?;
 
@@ -236,7 +272,7 @@ pub fn is_version_compatible(version: &ModrinthVersion, target: &ResolutionTarge
     version
         .game_versions
         .iter()
-        .any(|game_version| game_version == &target.minecraft_version)
+        .any(|game_version| mc_version_matches(game_version, &target.minecraft_version))
         && version
             .loaders
             .iter()

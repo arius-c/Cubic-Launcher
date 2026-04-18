@@ -1,10 +1,12 @@
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{bail, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use tauri::State;
+use tokio::sync::Semaphore;
 
 use crate::launcher_paths::LauncherPaths;
 use crate::modrinth::ModrinthClient;
@@ -229,7 +231,7 @@ fn try_alternatives(
 /// Returns true if the version rules exclude this mod for the given target.
 fn version_rules_conflict(version_rules: &[VersionRule], target: &ResolutionTarget) -> bool {
     for vr in version_rules {
-        let version_matches = vr.mc_versions.iter().any(|v| v == &target.minecraft_version);
+        let version_matches = vr.mc_versions.iter().any(|v| crate::modrinth::mc_version_matches(v, &target.minecraft_version));
         let vr_loader = vr.loader.to_ascii_lowercase();
         let loader_matches =
             vr_loader == "any" || vr_loader == target.mod_loader.as_modrinth_loader();
@@ -344,11 +346,14 @@ pub async fn resolve_modlist_command(
         if !uncached_ids.is_empty() {
             let client = ModrinthClient::new();
             let mut tasks = tokio::task::JoinSet::new();
+            let semaphore = Arc::new(Semaphore::new(10));
 
             for mod_id in uncached_ids {
                 let client = client.clone();
                 let target = target.clone();
+                let permit_source = semaphore.clone();
                 tasks.spawn(async move {
+                    let _permit = permit_source.acquire_owned().await.ok()?;
                     let result = client
                         .fetch_project_versions(&mod_id, &target)
                         .await;
@@ -398,9 +403,41 @@ pub async fn resolve_modlist_command(
     // After all checks (Modrinth availability, cascade), show which
     // alternatives are viable for rules whose primary is no longer in `ids`.
     // This runs last so it sees the final state of which mods survived.
+    let before_alts: HashSet<String> = ids.clone();
     for rule in &modlist.rules {
         if !ids.contains(&rule.mod_id) {
             check_viable_alts(rule, &mut ids, &target);
+        }
+    }
+
+    // check_viable_alts only tests user-defined constraints (version_rules,
+    // requires, exclude_if).  Modrinth-sourced alternatives still need an
+    // availability check — remove those the cache marks as unavailable.
+    {
+        let new_alt_modrinth_ids: Vec<String> = ids
+            .iter()
+            .filter(|id| !before_alts.contains(*id))
+            .filter(|id| {
+                modlist
+                    .find_rule(id)
+                    .map_or(false, |r| r.source == ModSource::Modrinth)
+            })
+            .cloned()
+            .collect();
+
+        if !new_alt_modrinth_ids.is_empty() {
+            let db_path = launcher_paths.database_path();
+            let cached = db_availability_get(
+                &db_path,
+                &new_alt_modrinth_ids,
+                &target.minecraft_version,
+                &mod_loader,
+            );
+            for (mod_id, available) in &cached {
+                if !available {
+                    ids.remove(mod_id);
+                }
+            }
         }
     }
 
@@ -441,14 +478,21 @@ pub async fn backfill_availability_command(
 
     let db_path = launcher_paths.database_path();
     let cached = db_availability_get(&db_path, &all_modrinth_ids, &mc_version, &mod_loader);
-    let cached_ids: HashSet<String> = cached.iter().map(|(id, _)| id.clone()).collect();
-
-    let uncached_ids: Vec<String> = all_modrinth_ids
-        .into_iter()
-        .filter(|id| !cached_ids.contains(id))
+    // Only skip mods that are cached as *available*.  Mods cached as
+    // unavailable are re-checked because mod authors frequently add
+    // version support after initial release.
+    let skip_ids: HashSet<String> = cached
+        .iter()
+        .filter(|(_, available)| *available)
+        .map(|(id, _)| id.clone())
         .collect();
 
-    if uncached_ids.is_empty() {
+    let ids_to_check: Vec<String> = all_modrinth_ids
+        .into_iter()
+        .filter(|id| !skip_ids.contains(id))
+        .collect();
+
+    if ids_to_check.is_empty() {
         return Ok(());
     }
 
@@ -461,7 +505,7 @@ pub async fn backfill_availability_command(
     let client = ModrinthClient::new();
     let mut tasks = tokio::task::JoinSet::new();
 
-    for mod_id in uncached_ids {
+    for mod_id in ids_to_check {
         let client = client.clone();
         let target = target.clone();
         tasks.spawn(async move {

@@ -319,8 +319,15 @@ fn toggle_rule_enabled_from_root(root_dir: &Path, input: &ToggleRuleEnabledInput
     let rule = modlist
         .find_rule_mut(&input.mod_id)
         .with_context(|| format!("rule '{}' not found", input.mod_id))?;
-    rule.enabled = input.enabled;
+    set_enabled_recursive(rule, input.enabled);
     save_modlist(root_dir, &input.modlist_name, &modlist)
+}
+
+fn set_enabled_recursive(rule: &mut Rule, enabled: bool) {
+    rule.enabled = enabled;
+    for alt in &mut rule.alternatives {
+        set_enabled_recursive(alt, enabled);
+    }
 }
 
 fn load_modlist(root_dir: &Path, modlist_name: &str) -> Result<ModList> {

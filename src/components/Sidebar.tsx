@@ -42,7 +42,7 @@ export function Sidebar(props: SidebarProps) {
                 }`}>
                   <Show when={ml.iconImage} fallback={
                     <span class="text-white font-bold text-xs">
-                      {(ml.iconLabel || ml.name).slice(0, 3).toUpperCase()}
+                      {(ml.displayName || ml.name).slice(0, 3).toUpperCase() || "ML"}
                     </span>
                   }>
                     <img src={ml.iconImage} class="block w-10 h-10 object-cover rounded-lg" alt="" />
@@ -54,7 +54,7 @@ export function Sidebar(props: SidebarProps) {
                   <span class={`text-sm font-medium truncate transition-colors duration-75 ${
                     isActive() ? "text-white" : "text-textMuted group-hover:text-white"
                   }`}>
-                    {ml.name}
+                    {ml.displayName || ml.name}
                   </span>
                   <span class="text-xs text-textMuted truncate">
                     {ml.modLoader || "Fabric"} {ml.mcVersion || minecraftVersions()[0] || "1.21.1"}

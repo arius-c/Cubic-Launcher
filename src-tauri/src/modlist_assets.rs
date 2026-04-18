@@ -59,6 +59,8 @@ pub struct ModlistGroupLayout {
 #[serde(rename_all = "camelCase")]
 pub struct SaveModlistPresentationInput {
     pub modlist_name: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
     pub icon_label: String,
     pub icon_accent: String,
     pub notes: String,
@@ -259,6 +261,7 @@ pub fn save_modlist_presentation_from_root(
     input: &SaveModlistPresentationInput,
 ) -> Result<()> {
     let presentation = ModlistPresentation {
+        display_name: input.display_name.clone().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
         icon_label: normalize_icon_label(&input.icon_label, &input.modlist_name),
         icon_accent: input.icon_accent.trim().to_string(),
         notes: input.notes.trim().to_string(),
@@ -519,6 +522,7 @@ fn modlist_group_layout_path(root_dir: &Path, modlist_name: &str) -> PathBuf {
 
 fn default_presentation(modlist_name: &str) -> ModlistPresentation {
     ModlistPresentation {
+        display_name: None,
         icon_label: normalize_icon_label("", modlist_name),
         icon_accent: String::new(),
         notes: String::new(),
@@ -739,6 +743,7 @@ mod tests {
         let root_dir = unique_test_root();
         let input = SaveModlistPresentationInput {
             modlist_name: "Sky Pack".into(),
+            display_name: None,
             icon_label: "sp".into(),
             icon_accent: "Aurora".into(),
             notes: "Bring shaders and minimap.".into(),
@@ -752,6 +757,7 @@ mod tests {
         assert_eq!(
             reloaded,
             ModlistPresentation {
+                display_name: None,
                 icon_label: "SP".into(),
                 icon_accent: "Aurora".into(),
                 notes: "Bring shaders and minimap.".into(),

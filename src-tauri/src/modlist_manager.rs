@@ -7,6 +7,7 @@ use tauri::State;
 use crate::editor_data::{add_mod_rule_from_root, AddModRuleInput};
 use crate::launcher_paths::LauncherPaths;
 use crate::rules::{ModList, RULES_FILENAME};
+use std::io;
 
 // ---------------------------------------------------------------------------
 // Create Mod-list
@@ -145,19 +146,125 @@ pub struct CopyLocalJarInput {
 #[tauri::command]
 pub fn import_modlist_command(
     launcher_paths: State<'_, LauncherPaths>,
-    modlist_name: String,
     source_path: String,
-) -> Result<(), String> {
-    let dest = launcher_paths
-        .modlists_dir()
-        .join(&modlist_name)
-        .join(crate::rules::RULES_FILENAME);
-    // Validate the source is valid rules.json
-    crate::rules::ModList::read_from_file(std::path::Path::new(&source_path))
-        .map_err(|e| format!("Invalid rules file: {e}"))?;
-    std::fs::copy(&source_path, &dest)
-        .map_err(|e| format!("Failed to copy: {e}"))?;
-    Ok(())
+) -> Result<String, String> {
+    import_modlist_from_root(launcher_paths.root_dir(), &source_path)
+        .map_err(|e| e.to_string())
+}
+
+/// Pick a unique name: if `base` already exists, try `base (1)`, `base (2)`, etc.
+fn unique_modlist_name(modlists_dir: &Path, base: &str) -> String {
+    if !modlists_dir.join(base).exists() {
+        return base.to_string();
+    }
+    for n in 1.. {
+        let candidate = format!("{base} ({n})");
+        if !modlists_dir.join(&candidate).exists() {
+            return candidate;
+        }
+    }
+    unreachable!()
+}
+
+fn import_modlist_from_root(root_dir: &Path, source_path: &str) -> Result<String> {
+    let launcher_paths = LauncherPaths::new(root_dir.to_path_buf());
+    let modlists_dir = launcher_paths.modlists_dir();
+
+    let source = Path::new(source_path);
+    let ext = source
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    if ext == "zip" {
+        let file = std::fs::File::open(source)
+            .with_context(|| format!("failed to open {}", source.display()))?;
+        let mut archive = zip::ZipArchive::new(file)
+            .with_context(|| format!("failed to read zip archive {}", source.display()))?;
+
+        // Derive name from the archive root folder
+        let archive_root = {
+            let mut root = String::new();
+            for i in 0..archive.len() {
+                let name = archive.by_index(i)?.name().to_string();
+                if let Some(slash) = name.find('/') {
+                    root = name[..slash].to_string();
+                    break;
+                }
+            }
+            root
+        };
+
+        let base_name = if archive_root.is_empty() {
+            source.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("Imported")
+                .to_string()
+        } else {
+            archive_root.clone()
+        };
+
+        let modlist_name = unique_modlist_name(&modlists_dir, &base_name);
+        let modlist_dir = modlists_dir.join(&modlist_name);
+        std::fs::create_dir_all(&modlist_dir)
+            .with_context(|| format!("failed to create modlist dir {}", modlist_dir.display()))?;
+
+        for i in 0..archive.len() {
+            let mut entry = archive.by_index(i)?;
+            let raw_name = entry.name().to_string();
+            if entry.is_dir() { continue; }
+
+            // Strip the archive root prefix to get relative path
+            let relative = if !archive_root.is_empty() && raw_name.starts_with(&archive_root) {
+                raw_name[archive_root.len()..].trim_start_matches('/').to_string()
+            } else {
+                raw_name.clone()
+            };
+            if relative.is_empty() { continue; }
+
+            // Skip cached mod jars — they'll be re-downloaded on launch
+            if relative.starts_with("cache/") { continue; }
+
+            let dest_path = modlist_dir.join(&relative);
+            if let Some(parent) = dest_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut out = std::fs::File::create(&dest_path)
+                .with_context(|| format!("failed to create {}", dest_path.display()))?;
+            io::copy(&mut entry, &mut out)
+                .with_context(|| format!("failed to extract {}", relative))?;
+        }
+
+        // Patch modlist_name inside rules.json to match the new folder name
+        let rules_path = modlist_dir.join(RULES_FILENAME);
+        if rules_path.exists() {
+            let mut modlist = ModList::read_from_file(&rules_path)
+                .with_context(|| "imported zip contains an invalid rules.json")?;
+            modlist.modlist_name = modlist_name.clone();
+            modlist.write_to_file(&rules_path)?;
+        }
+
+        Ok(modlist_name)
+    } else {
+        // Legacy: plain rules.json import — use filename as base name
+        let mut modlist = ModList::read_from_file(source)
+            .with_context(|| "invalid rules file")?;
+
+        let base_name = source.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Imported")
+            .to_string();
+        let modlist_name = unique_modlist_name(&modlists_dir, &base_name);
+        let modlist_dir = modlists_dir.join(&modlist_name);
+        std::fs::create_dir_all(&modlist_dir)
+            .with_context(|| format!("failed to create modlist dir {}", modlist_dir.display()))?;
+
+        modlist.modlist_name = modlist_name.clone();
+        modlist.write_to_file(&modlist_dir.join(RULES_FILENAME))?;
+
+        Ok(modlist_name)
+    }
 }
 
 #[tauri::command]

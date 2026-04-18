@@ -233,7 +233,7 @@ fn file_matches_sha1(path: &Path, expected: &str) -> bool {
 
 // ── Download helper ───────────────────────────────────────────────────────────
 
-async fn download_file_verified(
+pub(crate) async fn download_file_verified(
     client: &reqwest::Client,
     url: &str,
     dest: &Path,

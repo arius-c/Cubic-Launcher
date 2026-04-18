@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{bail, Context, Result};
 
@@ -39,6 +39,9 @@ pub struct DependencyLink {
 pub struct DependencyResolution {
     pub resolved_dependencies: Vec<ResolvedDependency>,
     pub links: Vec<DependencyLink>,
+    /// Parent mod project IDs that were excluded because a required dependency
+    /// had no compatible version available for the target.
+    pub excluded_parents: HashSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -138,45 +141,71 @@ pub async fn resolve_required_dependencies_with_client(
     parent_versions: &[ModrinthVersion],
     target: &ResolutionTarget,
     client: &ModrinthClient,
+    selected_mod_ids: &HashSet<String>,
 ) -> Result<DependencyResolution> {
     let requests = collect_required_dependency_requests(parent_versions)?;
     let mut candidates = Vec::with_capacity(requests.len());
+    let mut excluded_parents: HashSet<String> = HashSet::new();
 
     for request in &requests {
+        // Skip dependencies that are already explicitly selected in the mod
+        // list — those are managed by the user and will be fetched (or
+        // gracefully skipped) as parent mods, not as auto-resolved deps.
+        if let DependencySelector::ProjectId { project_id } = &request.selector {
+            if selected_mod_ids.contains(project_id) {
+                continue;
+            }
+        }
+
+        // If this parent was already excluded due to a previous missing
+        // dependency, skip all its remaining requests.
+        if excluded_parents.contains(&request.parent_mod_id) {
+            continue;
+        }
+
         let version = match &request.selector {
-            DependencySelector::ProjectId { project_id } => client
-                .fetch_latest_compatible_version(project_id, target)
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to resolve compatible dependency version for project '{}'",
-                        project_id
-                    )
-                })?
-                .with_context(|| {
-                    format!(
-                        "no compatible dependency version found for project '{}'",
-                        project_id
-                    )
-                })?,
-            DependencySelector::VersionId { version_id } => client
-                .fetch_version(version_id)
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to resolve exact dependency version '{}'",
-                        version_id
-                    )
-                })?
-                .with_context(|| {
-                    format!("dependency version '{}' could not be found", version_id)
-                })?,
+            DependencySelector::ProjectId { project_id } => {
+                match client
+                    .fetch_latest_compatible_version(project_id, target)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to resolve compatible dependency version for project '{}'",
+                            project_id
+                        )
+                    })? {
+                    Some(v) => v,
+                    None => {
+                        excluded_parents.insert(request.parent_mod_id.clone());
+                        continue;
+                    }
+                }
+            }
+            DependencySelector::VersionId { version_id } => {
+                match client
+                    .fetch_version(version_id)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to resolve exact dependency version '{}'",
+                            version_id
+                        )
+                    })? {
+                    Some(v) => v,
+                    None => {
+                        excluded_parents.insert(request.parent_mod_id.clone());
+                        continue;
+                    }
+                }
+            }
         };
 
         candidates.push(build_dependency_candidate(request, version)?);
     }
 
-    finalize_dependency_resolution(candidates)
+    let mut resolution = finalize_dependency_resolution(candidates)?;
+    resolution.excluded_parents = excluded_parents;
+    Ok(resolution)
 }
 
 fn build_dependency_candidate(
@@ -269,12 +298,13 @@ fn finalize_dependency_resolution(
     Ok(DependencyResolution {
         resolved_dependencies,
         links,
+        excluded_parents: HashSet::new(),
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     use crate::modrinth::ModrinthVersion;
 
@@ -549,6 +579,7 @@ mod tests {
                     specific_version: None,
                     jar_filename: "fabric-api-0.100.0.jar".into(),
                 }],
+                excluded_parents: HashSet::new(),
             }
         );
     }

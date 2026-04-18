@@ -223,6 +223,8 @@ fn find_rule_in_tree<'a>(rule: &'a Rule, mod_id: &str) -> Option<&'a Rule> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ModlistPresentation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     pub icon_label: String,
     pub icon_accent: String,
     pub notes: String,

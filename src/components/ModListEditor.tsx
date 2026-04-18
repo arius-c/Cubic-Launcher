@@ -25,7 +25,7 @@ import {
   PackageIcon, ChevronDownIcon, ChevronRightIcon, FolderOpenIcon,
   PencilIcon, ExternalLinkIcon, XIcon, MaterialIcon,
 } from "./icons";
-import { setInstancePresentationOpen, setExportModalOpen, instancePresentation } from "../store";
+import { setInstancePresentationOpen, setExportModalOpen, instancePresentation, setCreateModlistModalOpen } from "../store";
 import { useDragEngine, type DragItem } from "../lib/dragEngine";
 import { computePreviewTranslates } from "../lib/dragUtils";
 
@@ -740,13 +740,22 @@ function ContentTabView(props: { type: string; modlistName: string; onAddContent
 
   // ── Entry row renderer (matches ModRuleItem styling) ──────────────────
   // ── Version-based resolution check ─────────────────────────────────
+  /** Mirrors the Rust mc_version_matches: handles trailing .x/.X wildcards. */
+  const mcVersionMatches = (pattern: string, concrete: string): boolean => {
+    if (pattern === concrete) return true;
+    const lower = pattern.toLowerCase();
+    if (!lower.endsWith(".x")) return false;
+    const prefix = pattern.slice(0, -2); // drop ".x" / ".X"
+    return concrete.startsWith(prefix) && concrete[prefix.length] === ".";
+  };
+
   const isEntryResolved = (entry: ContentEntry): boolean | null => {
     const rules = entry.versionRules;
     if (rules.length === 0) return true; // no rules = always active
     const mcVer = selectedMcVersion();
     const loader = selectedModLoader();
     for (const rule of rules) {
-      const versionMatch = rule.mcVersions.length === 0 || rule.mcVersions.includes(mcVer);
+      const versionMatch = rule.mcVersions.length === 0 || rule.mcVersions.some(v => mcVersionMatches(v, mcVer));
       const loaderMatch = rule.loader === "any" || rule.loader === loader;
       if (rule.kind === "exclude" && versionMatch && loaderMatch) return false;
       if (rule.kind === "only" && !(versionMatch && loaderMatch)) return false;
@@ -1533,6 +1542,33 @@ export function ModListEditor(props: Props) {
               <p class="mt-1 text-sm text-muted-foreground">
                 Select a mod list from the sidebar or create a new one.
               </p>
+              <div class="mt-4 flex items-center gap-3">
+                <button
+                  onClick={() => setCreateModlistModalOpen(true)}
+                  class="flex items-center gap-1.5 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90"
+                >
+                  <MaterialIcon name="add" size="sm" />
+                  New
+                </button>
+                <button
+                  onClick={() => {
+                    void (async () => {
+                      try {
+                        const { open } = await import("@tauri-apps/plugin-dialog");
+                        const selected = await open({ title: "Import Mod List", filters: [{ name: "Mod List Archive", extensions: ["zip"] }, { name: "Rules JSON", extensions: ["json"] }], multiple: false });
+                        if (!selected) return;
+                        const { invoke: inv } = await import("@tauri-apps/api/core");
+                        await inv("import_modlist_command", { sourcePath: selected as string });
+                        window.location.reload();
+                      } catch { /* cancelled or error */ }
+                    })();
+                  }}
+                  class="flex items-center gap-1.5 rounded-md bg-secondary px-4 py-2 text-sm font-medium text-secondary-foreground hover:bg-secondary/80"
+                >
+                  <MaterialIcon name="download" size="sm" />
+                  Import
+                </button>
+              </div>
             </div>
           </div>
         }
@@ -1542,9 +1578,8 @@ export function ModListEditor(props: Props) {
           <div class="flex items-start justify-between gap-4">
             <div class="min-w-0 flex-1">
               <h2 class="text-lg font-semibold text-foreground">
-                {activeModList()!.name}
+                {activeModList()!.displayName || activeModList()!.name}
               </h2>
-              <p class="text-sm text-muted-foreground">{activeModList()!.description}</p>
               <div class="mt-1.5 flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
                 <span>{modRowsState().length} rule{modRowsState().length !== 1 ? "s" : ""}</span>
                 <span>·</span>
@@ -1565,18 +1600,16 @@ export function ModListEditor(props: Props) {
                   void (async () => {
                     try {
                       const { open } = await import("@tauri-apps/plugin-dialog");
-                      const selected = await open({ title: "Import Mod List (rules.json)", filters: [{ name: "JSON", extensions: ["json"] }], multiple: false });
+                      const selected = await open({ title: "Import Mod List", filters: [{ name: "Mod List Archive", extensions: ["zip"] }, { name: "Rules JSON", extensions: ["json"] }], multiple: false });
                       if (!selected) return;
                       const { invoke } = await import("@tauri-apps/api/core");
-                      const modlistName = selectedModListName();
-                      if (!modlistName) return;
-                      await invoke("import_modlist_command", { modlistName, sourcePath: selected as string });
+                      await invoke("import_modlist_command", { sourcePath: selected as string });
                       window.location.reload();
                     } catch { /* cancelled or error */ }
                   })();
                 }}
                 class="flex h-8 items-center gap-1.5 rounded-md px-2.5 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-                title="Import rules from a JSON file"
+                title="Import mod list from a zip archive or rules.json"
               >
                 <MaterialIcon name="download" size="sm" />
                 Import
@@ -1735,7 +1768,7 @@ export function ModListEditor(props: Props) {
                                   const handler = onToggleEnabled();
                                   if (!handler) return;
                                   const allEnabled = group.blocks.every(r => r.enabled);
-                                  for (const r of group.blocks) handler(r.id, !allEnabled);
+                                  handler(group.blocks.map(r => r.id), !allEnabled);
                                 }}
                               />
                             </div>

@@ -52,7 +52,7 @@ export const [accounts, setAccounts]                             = createSignal<
 export const [activeAccountId, setActiveAccountId]               = createSignal<string>("");
 export const [instancePresentationOpen, setInstancePresentationOpen] = createSignal(false);
 export const [verificationModalOpen, setVerificationModalOpen]   = createSignal(false);
-export const [instancePresentation, setInstancePresentation]     = createSignal({ iconLabel: "ML", iconAccent: "", notes: "", iconImage: "" });
+export const [instancePresentation, setInstancePresentation]     = createSignal({ displayName: "", iconLabel: "ML", iconAccent: "", notes: "", iconImage: "" });
 export const [exportModalOpen, setExportModalOpen]               = createSignal(false);
 export const [exportOptions, setExportOptions]                   = createSignal({ rulesJson: true, modJars: false, configFiles: false, resourcePacks: false, dataPacks: false, shaders: false, otherFiles: false, selectedOtherPaths: [] as string[] });
 export const [settingsModalOpen, setSettingsModalOpen]           = createSignal(false);
@@ -728,8 +728,9 @@ export function openAlternativesPanel(rowId: string) {
   setAlternativesPanelParentId(rowId);
 }
 
-// Toggle-enabled handler — set by App.tsx, called by ModRuleItem.
-export const [onToggleEnabled, setOnToggleEnabled] = createSignal<((rowId: string, enabled: boolean) => void) | null>(null);
+// Toggle-enabled handler — set by App.tsx, called by ModRuleItem and GroupHeader.
+// Accepts a single row ID or an array of IDs (for group toggles).
+export const [onToggleEnabled, setOnToggleEnabled] = createSignal<((rowId: string | string[], enabled: boolean) => void) | null>(null);
 
 export function openRenameRule(id: string, name: string) {
   setRenameRuleTargetId(id); setRenameRuleDraft(name); setRenameRuleModalOpen(true);

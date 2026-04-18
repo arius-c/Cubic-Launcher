@@ -41,7 +41,6 @@ use crate::token_storage::KeyringSecretStore;
 use std::sync::Mutex;
 
 pub const LAUNCH_PROGRESS_EVENT: &str = "launch-progress";
-const DOWNLOAD_PROGRESS_EVENT: &str = "download-progress";
 const LAUNCHER_ERROR_EVENT: &str = "launcher-error";
 
 /// Tracks the PID of the currently running Minecraft process so it can be killed.
@@ -62,13 +61,6 @@ pub struct LaunchProgressEvent {
     pub progress: u8,
     pub stage: String,
     pub detail: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DownloadProgressEvent {
-    pub filename: String,
-    pub percentage: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -233,7 +225,7 @@ async fn run_launch_pipeline(
     // alternatives get a chance.
     let resolution = {
         let mut selected = collect_selected_mods(&modlist, &resolution, &target);
-        let versions = prefetch_compatible_versions_for_selected(&selected, &modrinth_client, &target).await?;
+        let versions = prefetch_compatible_versions_for_selected(&app_handle, &selected, &modrinth_client, &target).await?;
         let mut unavailable: Vec<String> = Vec::new();
         for s in &selected {
             if matches!(s.source, ModSource::Modrinth) && !versions.contains_key(&s.mod_id) {
@@ -260,11 +252,34 @@ async fn run_launch_pipeline(
 
     let selected_mods = collect_selected_mods(&modlist, &resolution, &target);
     let compatible_versions =
-        prefetch_compatible_versions_for_selected(&selected_mods, &modrinth_client, &target).await?;
+        prefetch_compatible_versions_for_selected(&app_handle, &selected_mods, &modrinth_client, &target).await?;
     let parent_versions = collect_resolved_parent_versions(&selected_mods, &compatible_versions);
+    let selected_mod_ids: HashSet<String> = selected_mods.iter().map(|s| s.mod_id.clone()).collect();
     let dependency_resolution =
-        resolve_required_dependencies_with_client(&parent_versions, &target, &modrinth_client)
+        resolve_required_dependencies_with_client(&parent_versions, &target, &modrinth_client, &selected_mod_ids)
             .await?;
+
+    // Remove parent mods whose required dependencies are not available for
+    // this target — they cannot run without them, so skip them entirely.
+    let parent_versions: Vec<_> = if dependency_resolution.excluded_parents.is_empty() {
+        parent_versions
+    } else {
+        for excluded_id in &dependency_resolution.excluded_parents {
+            emit_log(
+                &app_handle,
+                ProcessLogStream::Stdout,
+                format!(
+                    "[Launch] skipping mod '{}': a required dependency has no compatible version for this target",
+                    excluded_id
+                ),
+            )?;
+        }
+        parent_versions
+            .into_iter()
+            .filter(|v| !dependency_resolution.excluded_parents.contains(&v.project_id))
+            .collect()
+    };
+
     let dependency_versions = fetch_dependency_versions(
         &dependency_resolution.resolved_dependencies,
         &modrinth_client,
@@ -303,6 +318,7 @@ async fn run_launch_pipeline(
                 filename: download.jar_filename.clone(),
                 url: download.download_url.clone(),
                 destination_path: launcher_paths.mods_cache_dir().join(&download.jar_filename),
+                file_hash: download.file_hash.clone(),
             })
             .collect::<Vec<_>>(),
     )
@@ -590,6 +606,7 @@ struct DownloadArtifact {
     filename: String,
     url: String,
     destination_path: PathBuf,
+    file_hash: Option<String>,
 }
 
 /// Extracts the artifact name from a jar filename by stripping the version suffix.
@@ -634,7 +651,10 @@ fn load_modlist(launcher_paths: &LauncherPaths, modlist_name: &str) -> Result<Mo
 
 
 /// Fetch compatible versions only for the mods that were actually selected by resolution.
+/// Network/API errors for individual mods are treated as "no compatible version"
+/// so that the re-resolution pass can disable them and try alternatives.
 async fn prefetch_compatible_versions_for_selected(
+    app_handle: &tauri::AppHandle,
     selected_mods: &[SelectedMod],
     client: &ModrinthClient,
     target: &ResolutionTarget,
@@ -648,11 +668,24 @@ async fn prefetch_compatible_versions_for_selected(
         if versions.contains_key(&selected.mod_id) {
             continue;
         }
-        if let Some(version) = client
+        match client
             .fetch_latest_compatible_version(&selected.mod_id, target)
-            .await?
+            .await
         {
-            versions.insert(selected.mod_id.clone(), version);
+            Ok(Some(version)) => {
+                versions.insert(selected.mod_id.clone(), version);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                let _ = emit_log(
+                    app_handle,
+                    ProcessLogStream::Stderr,
+                    format!(
+                        "[Launch] skipping mod '{}': failed to query Modrinth ({})",
+                        selected.mod_id, err
+                    ),
+                );
+            }
         }
     }
 
@@ -738,7 +771,7 @@ fn alt_viable_for_launch(
         return false;
     }
     for vr in &rule.version_rules {
-        let version_matches = vr.mc_versions.iter().any(|v| v == &target.minecraft_version);
+        let version_matches = vr.mc_versions.iter().any(|v| crate::modrinth::mc_version_matches(v, &target.minecraft_version));
         let vr_loader = vr.loader.to_ascii_lowercase();
         let loader_matches =
             vr_loader == "any" || vr_loader == target.mod_loader.as_modrinth_loader();
@@ -840,18 +873,68 @@ async fn download_pending_artifacts(
     default_directory: &Path,
     artifacts: &[DownloadArtifact],
 ) -> Result<()> {
+    let total = artifacts.len();
+    if total == 0 {
+        return Ok(());
+    }
+
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(10));
+    let mut tasks: tokio::task::JoinSet<Result<DownloadArtifact>> = tokio::task::JoinSet::new();
+
     for artifact in artifacts {
-        emit_download_progress(app_handle, &artifact.filename, 0)?;
-        download_file(http_client, &artifact.url, &artifact.destination_path)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to download '{}' to {}",
-                    artifact.url,
-                    artifact.destination_path.display()
+        let artifact = artifact.clone();
+        let http_client = http_client.clone();
+        let permit_source = semaphore.clone();
+        tasks.spawn(async move {
+            // Permit is held through the await so concurrency stays bounded.
+            let _permit = permit_source
+                .acquire_owned()
+                .await
+                .map_err(|error| anyhow::anyhow!("failed to acquire download permit: {error}"))?;
+            match &artifact.file_hash {
+                Some(hash) => crate::minecraft_downloader::download_file_verified(
+                    &http_client,
+                    &artifact.url,
+                    &artifact.destination_path,
+                    hash,
                 )
-            })?;
-        emit_download_progress(app_handle, &artifact.filename, 100)?;
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to download '{}' to {}",
+                        artifact.url,
+                        artifact.destination_path.display()
+                    )
+                })?,
+                None => download_file(&http_client, &artifact.url, &artifact.destination_path)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to download '{}' to {}",
+                            artifact.url,
+                            artifact.destination_path.display()
+                        )
+                    })?,
+            }
+            Ok(artifact)
+        });
+    }
+
+    let mut completed: usize = 0;
+    while let Some(join_result) = tasks.join_next().await {
+        let artifact = join_result
+            .map_err(|error| anyhow::anyhow!("download task panicked: {error}"))??;
+        completed += 1;
+
+        let progress = 42u8 + ((16usize * completed) / total) as u8;
+        emit_progress(
+            app_handle,
+            "resolving",
+            progress,
+            "Downloading Mods",
+            &format!("Downloaded {completed} of {total} mods."),
+        )?;
+
         emit_log(
             app_handle,
             ProcessLogStream::Stdout,
@@ -1018,13 +1101,16 @@ async fn resolve_and_install_content_packs(
             .filter(|e| is_content_entry_active(e, mc_version, loader_str))
             .collect();
 
+        let instance_dir = instance_root.join(instance_subdir);
+        if instance_dir.exists() {
+            // Clear existing content in instance dir (even if no active entries remain)
+            crate::instance_mods::clear_instance_mods_directory(&instance_dir)?;
+        }
+
         if active_entries.is_empty() { continue; }
 
-        let instance_dir = instance_root.join(instance_subdir);
         std::fs::create_dir_all(&instance_dir)
             .with_context(|| format!("failed to create {}", instance_dir.display()))?;
-        // Clear existing content in instance dir
-        crate::instance_mods::clear_instance_mods_directory(&instance_dir)?;
 
         for entry in &active_entries {
             if entry.source == "modrinth" {
@@ -1084,11 +1170,15 @@ async fn resolve_and_install_content_packs(
             .filter(|e| is_content_entry_active(e, mc_version, loader_str))
             .collect();
 
+        let instance_dir = instance_root.join("datapacks");
+        if instance_dir.exists() {
+            // Clear existing content (even if no active entries remain)
+            crate::instance_mods::clear_instance_mods_directory(&instance_dir)?;
+        }
+
         if !active_entries.is_empty() {
-            let instance_dir = instance_root.join("datapacks");
             std::fs::create_dir_all(&instance_dir)
                 .with_context(|| format!("failed to create {}", instance_dir.display()))?;
-            crate::instance_mods::clear_instance_mods_directory(&instance_dir)?;
 
             for entry in &active_entries {
                 if entry.source == "modrinth" {
@@ -1556,22 +1646,6 @@ fn emit_progress(
                 progress,
                 stage: stage.to_string(),
                 detail: detail.to_string(),
-            },
-        )
-        .map_err(|error| anyhow::anyhow!(error.to_string()))
-}
-
-fn emit_download_progress(
-    app_handle: &tauri::AppHandle,
-    filename: &str,
-    percentage: u8,
-) -> Result<()> {
-    app_handle
-        .emit(
-            DOWNLOAD_PROGRESS_EVENT,
-            DownloadProgressEvent {
-                filename: filename.to_string(),
-                percentage,
             },
         )
         .map_err(|error| anyhow::anyhow!(error.to_string()))

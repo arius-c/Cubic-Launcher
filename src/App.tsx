@@ -324,6 +324,7 @@ async function loadShellSnapshot(preferredName?: string | null) {
         iconImage: prev?.iconImage,
         iconLabel: prev?.iconLabel,
         iconAccent: prev?.iconAccent,
+        displayName: prev?.displayName,
         mcVersion: m.minecraft_version ?? undefined,
         modLoader: m.mod_loader ?? undefined,
       };
@@ -524,20 +525,21 @@ async function loadAllCardIcons(names: string[]) {
       const iconImage: string = p.iconImage ?? "";
       const iconLabel: string = p.iconLabel ?? "";
       const iconAccent: string = p.iconAccent ?? "";
-      setModListCards(cards => cards.map(c => c.name === name ? { ...c, iconImage, iconLabel, iconAccent } : c));
+      const displayName: string = p.displayName ?? name;
+      setModListCards(cards => cards.map(c => c.name === name ? { ...c, iconImage, iconLabel, iconAccent, displayName } : c));
     } catch (_) { /* silently skip */ }
   }));
 }
 
 async function loadModlistPresentation(modlistName: string) {
   if (!modlistName) {
-    setInstancePresentation({ iconLabel: "ML", iconAccent: "", notes: "", iconImage: "" });
+    setInstancePresentation({ displayName: "", iconLabel: "ML", iconAccent: "", notes: "", iconImage: "" });
     return null;
   }
 
   if (!isTauri()) {
     logger.warn("App", "loadModlistPresentation skipped — no backend");
-    setInstancePresentation({ iconLabel: buildDefaultIconLabel(modlistName), iconAccent: "", notes: "", iconImage: "" });
+    setInstancePresentation({ displayName: modlistName, iconLabel: buildDefaultIconLabel(modlistName), iconAccent: "", notes: "", iconImage: "" });
     return null;
   }
 
@@ -546,16 +548,18 @@ async function loadModlistPresentation(modlistName: string) {
     const iconImage = presentation.iconImage ?? "";
     const iconLabel = presentation.iconLabel ?? buildDefaultIconLabel(modlistName);
     const iconAccent = presentation.iconAccent ?? "";
+    const displayName = presentation.displayName ?? modlistName;
     setInstancePresentation({
+      displayName,
       iconLabel,
       iconAccent,
       notes: presentation.notes ?? "",
       iconImage,
     });
-    setModListCards(cards => cards.map(c => c.name === modlistName ? { ...c, iconImage, iconLabel, iconAccent } : c));
+    setModListCards(cards => cards.map(c => c.name === modlistName ? { ...c, iconImage, iconLabel, iconAccent, displayName } : c));
     return presentation;
   } catch (err) {
-    setInstancePresentation({ iconLabel: buildDefaultIconLabel(modlistName), iconAccent: "", notes: "", iconImage: "" });
+    setInstancePresentation({ displayName: modlistName, iconLabel: buildDefaultIconLabel(modlistName), iconAccent: "", notes: "", iconImage: "" });
     pushUiError({ title: "Could not load notes", message: `Saved notes for '${modlistName}' could not be loaded.`, detail: String(err), severity: "error", scope: "launch" });
     return null;
   }
@@ -946,6 +950,7 @@ export default function App() {
     if (cached?.iconLabel !== undefined) {
       setInstancePresentation(cur => ({
         ...cur,
+        displayName: cached.displayName ?? cur.displayName,
         iconLabel: cached.iconLabel ?? cur.iconLabel,
         iconAccent: cached.iconAccent ?? cur.iconAccent,
         iconImage: cached.iconImage ?? cur.iconImage,
@@ -1471,25 +1476,40 @@ export default function App() {
     }
   };
 
-  const handleToggleEnabled = async (rowId: string, enabled: boolean) => {
-    const modId = rowMap().get(rowId)?.primaryModId ?? rowId;
+  const handleToggleEnabled = async (rowId: string | string[], enabled: boolean) => {
+    const ids = Array.isArray(rowId) ? rowId : [rowId];
+    const modIds = ids.map(id => rowMap().get(id)?.primaryModId ?? id);
     if (!isTauri() || !selectedModListName()) return;
-    // Optimistic update
-    setModRowsState(cur => cur.map(function toggle(r: ModRow): ModRow {
-      const updated = r.id === rowId ? { ...r, enabled } : r;
-      if (updated.alternatives?.length) {
-        return { ...updated, alternatives: updated.alternatives.map(toggle) };
-      }
-      return updated;
-    }));
+
+    // Lock scroll position across all re-renders (optimistic + resolution).
+    const scrollEl = document.querySelector<HTMLElement>(".flex-1.p-4");
+    const savedScroll = scrollEl?.scrollTop ?? 0;
+    let scrollGuardId = 0;
+    const guardScroll = () => { if (scrollEl) scrollEl.scrollTop = savedScroll; scrollGuardId = requestAnimationFrame(guardScroll); };
+    scrollGuardId = requestAnimationFrame(guardScroll);
+
+    // Optimistic update — toggle all target IDs and their alternatives.
+    const idSet = new Set(ids);
+    const setEnabledDeep = (r: ModRow, en: boolean): ModRow => {
+      const next = r.enabled === en ? r : { ...r, enabled: en };
+      if (!next.alternatives?.length) return next;
+      const alts = next.alternatives.map(a => setEnabledDeep(a, en));
+      return alts === next.alternatives ? next : { ...next, alternatives: alts };
+    };
+    setModRowsState(cur => cur.map(r =>
+      idSet.has(r.id) ? setEnabledDeep(r, enabled) : r
+    ));
     try {
-      await invoke("toggle_rule_enabled_command", {
-        input: { modlistName: selectedModListName(), modId, enabled },
-      });
-      void runResolution();
+      await Promise.all(modIds.map(modId =>
+        invoke("toggle_rule_enabled_command", { input: { modlistName: selectedModListName(), modId, enabled } })
+      ));
+      await runResolution();
     } catch (err) {
-      pushUiError({ title: "Toggle failed", message: `Could not ${enabled ? "enable" : "disable"} the mod.`, detail: String(err), severity: "error", scope: "launch" });
+      pushUiError({ title: "Toggle failed", message: `Could not ${enabled ? "enable" : "disable"} the mod(s).`, detail: String(err), severity: "error", scope: "launch" });
       await loadEditorSnapshot(selectedModListName());
+    } finally {
+      cancelAnimationFrame(scrollGuardId);
+      if (scrollEl) scrollEl.scrollTop = savedScroll;
     }
   };
 
@@ -1508,6 +1528,7 @@ export default function App() {
       await invoke("save_modlist_presentation_command", {
         input: {
           modlistName: selectedModListName(),
+          displayName: presentation.displayName || null,
           iconLabel: presentation.iconLabel,
           iconAccent: presentation.iconAccent,
           notes: presentation.notes,
@@ -1561,7 +1582,7 @@ export default function App() {
         setAdvancedReady(true);
       } else {
         setSelectedModListName("");
-        setInstancePresentation({ iconLabel: "ML", iconAccent: "", notes: "", iconImage: "" });
+        setInstancePresentation({ displayName: "", iconLabel: "ML", iconAccent: "", notes: "", iconImage: "" });
         setModRowsState([]);
       }
     } catch (err) {

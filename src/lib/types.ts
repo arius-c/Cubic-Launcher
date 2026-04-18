@@ -22,6 +22,7 @@ export type ModRow = {
 
 export type ModListCard = {
   name: string;
+  displayName?: string;
   status: "Ready" | "Resolving" | "Offline";
   accent: string;
   description: string;

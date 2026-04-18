@@ -264,10 +264,13 @@ export function SettingsModal(props: { onSave: () => Promise<void> }) {
                 {field("Custom JVM Args", <textarea rows={3} value={globalSettings().customJvmArgs} onInput={e => setGlobalSettings(c => ({ ...c, customJvmArgs: e.currentTarget.value }))} class="w-full resize-none rounded-md border border-input bg-input px-3 py-1.5 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring" />)}
                 {field("Java Path Override", <input type="text" value={globalSettings().javaPathOverride} onInput={e => setGlobalSettings(c => ({ ...c, javaPathOverride: e.currentTarget.value }))} placeholder="Optional explicit Java binary path" class="w-full rounded-md border border-input bg-input px-3 py-1.5 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring" />)}
                 {field("Wrapper Command (Linux)", <input type="text" value={globalSettings().wrapperCommand} onInput={e => setGlobalSettings(c => ({ ...c, wrapperCommand: e.currentTarget.value }))} placeholder="gamemoderun mangohud" class="w-full rounded-md border border-input bg-input px-3 py-1.5 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring" />)}
-                <label class="flex items-center gap-3 text-sm">
-                  <input type="checkbox" checked={globalSettings().profilerEnabled} onChange={e => setGlobalSettings(c => ({ ...c, profilerEnabled: e.currentTarget.checked }))} class="h-4 w-4 rounded text-primary" />
-                  <span class="text-foreground">Enable profiler globally</span>
-                </label>
+                <div>
+                  <label class="flex items-center gap-3 text-sm">
+                    <input type="checkbox" checked={globalSettings().profilerEnabled} onChange={e => setGlobalSettings(c => ({ ...c, profilerEnabled: e.currentTarget.checked }))} class="h-4 w-4 rounded text-primary" />
+                    <span class="text-foreground">Enable profiler globally</span>
+                  </label>
+                  <p class="mt-1 ml-7 text-xs text-muted-foreground">Adds JVM profiling flags to the launch command, useful for diagnosing performance issues.</p>
+                </div>
               </div>
             </Show>
           </div>
@@ -465,7 +468,7 @@ export function InstancePresentationModal(props: { onSave: () => Promise<void>; 
                 title="Click to set a custom icon image"
               >
                 <Show when={draft().iconImage} fallback={
-                  <span>{(draft().iconLabel.trim() || "ML").toUpperCase()}</span>
+                  <span>{(draft().displayName || selectedModListName() || "ML").slice(0, 3).toUpperCase()}</span>
                 }>
                   <img src={draft().iconImage} class="absolute inset-0 h-full w-full object-cover" alt="icon" />
                 </Show>
@@ -489,9 +492,9 @@ export function InstancePresentationModal(props: { onSave: () => Promise<void>; 
               <label class="mb-1.5 block text-sm font-medium text-foreground">Name</label>
               <input
                 type="text"
-                value={draft().iconLabel}
-                onInput={e => setDraft(cur => ({ ...cur, iconLabel: e.currentTarget.value }))}
-                placeholder="My Mod List"
+                value={draft().displayName}
+                onInput={e => setDraft(cur => ({ ...cur, displayName: e.currentTarget.value }))}
+                placeholder={selectedModListName()}
                 class="w-full rounded-md border border-input bg-input px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
                 autofocus
               />
