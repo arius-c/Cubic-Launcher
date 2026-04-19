@@ -62,16 +62,14 @@ pub fn load_content_list(modlist_dir: &Path, content_type: &str) -> Result<Conte
             groups: vec![],
         });
     }
-    let contents = fs::read_to_string(&path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
-    serde_json::from_str(&contents)
-        .with_context(|| format!("failed to parse {}", path.display()))
+    let contents =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_str(&contents).with_context(|| format!("failed to parse {}", path.display()))
 }
 
 pub fn save_content_list(modlist_dir: &Path, list: &ContentList) -> Result<()> {
     let path = modlist_dir.join(filename_for_type(&list.content_type));
-    let json = serde_json::to_string_pretty(list)
-        .context("failed to serialize content list")?;
+    let json = serde_json::to_string_pretty(list).context("failed to serialize content list")?;
     fs::write(&path, format!("{json}\n"))
         .with_context(|| format!("failed to write {}", path.display()))
 }
@@ -169,27 +167,39 @@ pub fn load_content_list_command(
     let list = load_content_list(&dir, &input.content_type).map_err(|e| e.to_string())?;
     Ok(ContentSnapshot {
         content_type: list.content_type,
-        entries: list.entries.iter().map(|e| ContentEntrySnapshot {
-            id: e.id.clone(),
-            source: e.source.clone(),
-            version_rules: e.version_rules.iter().map(|vr| {
-                let kind_str = match vr.kind {
-                    crate::rules::VersionRuleKind::Exclude => "exclude",
-                    crate::rules::VersionRuleKind::Only => "only",
-                };
-                VersionRuleSnapshot {
-                    kind: kind_str.to_string(),
-                    mc_versions: vr.mc_versions.clone(),
-                    loader: vr.loader.clone(),
-                }
-            }).collect(),
-        }).collect(),
-        groups: list.groups.iter().map(|g| ContentGroupSnapshot {
-            id: g.id.clone(),
-            name: g.name.clone(),
-            collapsed: g.collapsed,
-            entry_ids: g.entry_ids.clone(),
-        }).collect(),
+        entries: list
+            .entries
+            .iter()
+            .map(|e| ContentEntrySnapshot {
+                id: e.id.clone(),
+                source: e.source.clone(),
+                version_rules: e
+                    .version_rules
+                    .iter()
+                    .map(|vr| {
+                        let kind_str = match vr.kind {
+                            crate::rules::VersionRuleKind::Exclude => "exclude",
+                            crate::rules::VersionRuleKind::Only => "only",
+                        };
+                        VersionRuleSnapshot {
+                            kind: kind_str.to_string(),
+                            mc_versions: vr.mc_versions.clone(),
+                            loader: vr.loader.clone(),
+                        }
+                    })
+                    .collect(),
+            })
+            .collect(),
+        groups: list
+            .groups
+            .iter()
+            .map(|g| ContentGroupSnapshot {
+                id: g.id.clone(),
+                name: g.name.clone(),
+                collapsed: g.collapsed,
+                entry_ids: g.entry_ids.clone(),
+            })
+            .collect(),
     })
 }
 
@@ -259,12 +269,16 @@ pub fn save_content_groups_command(
     let dir = launcher_paths.modlists_dir().join(&input.modlist_name);
     let mut list = load_content_list(&dir, &input.content_type).map_err(|e| e.to_string())?;
 
-    list.groups = input.groups.into_iter().map(|g| ContentGroup {
-        id: g.id,
-        name: g.name,
-        collapsed: g.collapsed,
-        entry_ids: g.entry_ids,
-    }).collect();
+    list.groups = input
+        .groups
+        .into_iter()
+        .map(|g| ContentGroup {
+            id: g.id,
+            name: g.name,
+            collapsed: g.collapsed,
+            entry_ids: g.entry_ids,
+        })
+        .collect();
 
     save_content_list(&dir, &list).map_err(|e| e.to_string())
 }

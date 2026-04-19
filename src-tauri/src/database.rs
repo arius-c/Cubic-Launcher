@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS java_installations (
 CREATE TABLE IF NOT EXISTS mod_cache (
     modrinth_project_id TEXT,
     modrinth_version_id TEXT,
-    jar_filename        TEXT NOT NULL UNIQUE,
+    jar_filename        TEXT NOT NULL,
     mc_version          TEXT NOT NULL,
     mod_loader          TEXT NOT NULL,
     file_hash           TEXT,
@@ -84,6 +84,75 @@ pub fn initialize_database(database_path: &Path) -> Result<()> {
 
     let connection = Connection::open(database_path)?;
     connection.execute_batch(SCHEMA_SQL)?;
+    migrate_mod_cache_schema(&connection)?;
+
+    Ok(())
+}
+
+fn migrate_mod_cache_schema(connection: &Connection) -> Result<()> {
+    let table_sql: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'mod_cache'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+
+    let Some(table_sql) = table_sql else {
+        return Ok(());
+    };
+
+    if !table_sql
+        .to_ascii_lowercase()
+        .contains("jar_filename        text not null unique")
+        && !table_sql
+            .to_ascii_lowercase()
+            .contains("jar_filename text not null unique")
+    {
+        return Ok(());
+    }
+
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute("ALTER TABLE mod_cache RENAME TO mod_cache_old", [])?;
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE mod_cache (
+            modrinth_project_id TEXT,
+            modrinth_version_id TEXT,
+            jar_filename        TEXT NOT NULL,
+            mc_version          TEXT NOT NULL,
+            mod_loader          TEXT NOT NULL,
+            file_hash           TEXT,
+            download_url        TEXT,
+            is_local            BOOLEAN DEFAULT FALSE,
+            PRIMARY KEY (modrinth_version_id)
+        );
+
+        INSERT INTO mod_cache (
+            modrinth_project_id,
+            modrinth_version_id,
+            jar_filename,
+            mc_version,
+            mod_loader,
+            file_hash,
+            download_url,
+            is_local
+        )
+        SELECT
+            modrinth_project_id,
+            modrinth_version_id,
+            jar_filename,
+            mc_version,
+            mod_loader,
+            file_hash,
+            download_url,
+            is_local
+        FROM mod_cache_old;
+
+        DROP TABLE mod_cache_old;
+        "#,
+    )?;
+    transaction.commit()?;
 
     Ok(())
 }
@@ -95,7 +164,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use rusqlite::Connection;
+    use rusqlite::{params, Connection};
 
     use super::{initialize_database, DATABASE_FILENAME};
 
@@ -173,5 +242,55 @@ mod tests {
                 .expect("database should have a parent"),
         )
         .expect("temporary directory should be removable");
+    }
+
+    #[test]
+    fn initialize_database_migrates_legacy_mod_cache_unique_filename_constraint() {
+        let database_path = unique_test_database_path();
+        let parent_dir = database_path
+            .parent()
+            .expect("database should have a parent")
+            .to_path_buf();
+        fs::create_dir_all(&parent_dir).expect("parent directory should exist");
+
+        let connection = Connection::open(&database_path).expect("database should open");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE mod_cache (
+                    modrinth_project_id TEXT,
+                    modrinth_version_id TEXT,
+                    jar_filename        TEXT NOT NULL UNIQUE,
+                    mc_version          TEXT NOT NULL,
+                    mod_loader          TEXT NOT NULL,
+                    file_hash           TEXT,
+                    download_url        TEXT,
+                    is_local            BOOLEAN DEFAULT FALSE,
+                    PRIMARY KEY (modrinth_version_id)
+                );
+                "#,
+            )
+            .expect("legacy mod_cache schema should create");
+        drop(connection);
+
+        initialize_database(&database_path).expect("migration should succeed");
+
+        let connection = Connection::open(&database_path).expect("database should reopen");
+        connection
+            .execute(
+                "INSERT INTO mod_cache (modrinth_project_id, modrinth_version_id, jar_filename, mc_version, mod_loader, file_hash, download_url, is_local) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params!["mod-a", "version-a", "shared.jar", "1.21.6", "fabric", Option::<String>::None, Option::<String>::None, false],
+            )
+            .expect("first insert should succeed");
+        connection
+            .execute(
+                "INSERT INTO mod_cache (modrinth_project_id, modrinth_version_id, jar_filename, mc_version, mod_loader, file_hash, download_url, is_local) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params!["mod-b", "version-b", "shared.jar", "1.21.6", "fabric", Option::<String>::None, Option::<String>::None, false],
+            )
+            .expect("second insert with same filename should succeed after migration");
+
+        drop(connection);
+        fs::remove_file(&database_path).expect("database file should be removable");
+        fs::remove_dir_all(&parent_dir).expect("temporary directory should be removable");
     }
 }

@@ -9,6 +9,8 @@ use crate::database::DATABASE_FILENAME;
 pub struct LauncherPaths {
     root_dir: PathBuf,
     cache_dir: PathBuf,
+    logs_dir: PathBuf,
+    launch_logs_dir: PathBuf,
     mods_cache_dir: PathBuf,
     configs_cache_dir: PathBuf,
     content_packs_cache_dir: PathBuf,
@@ -21,6 +23,8 @@ impl LauncherPaths {
     pub fn new(root_dir: impl Into<PathBuf>) -> Self {
         let root_dir = root_dir.into();
         let cache_dir = root_dir.join("cache");
+        let logs_dir = root_dir.join("logs");
+        let launch_logs_dir = logs_dir.join("launches");
         let mods_cache_dir = cache_dir.join("mods");
         let configs_cache_dir = cache_dir.join("configs");
         let content_packs_cache_dir = cache_dir.join("content-packs");
@@ -31,6 +35,8 @@ impl LauncherPaths {
         Self {
             root_dir,
             cache_dir,
+            logs_dir,
+            launch_logs_dir,
             mods_cache_dir,
             configs_cache_dir,
             content_packs_cache_dir,
@@ -54,6 +60,14 @@ impl LauncherPaths {
 
     pub fn mods_cache_dir(&self) -> &std::path::Path {
         &self.mods_cache_dir
+    }
+
+    pub fn logs_dir(&self) -> &std::path::Path {
+        &self.logs_dir
+    }
+
+    pub fn launch_logs_dir(&self) -> &std::path::Path {
+        &self.launch_logs_dir
     }
 
     pub fn configs_cache_dir(&self) -> &std::path::Path {
@@ -88,6 +102,8 @@ impl LauncherPaths {
         for directory in [
             &self.root_dir,
             &self.cache_dir,
+            &self.logs_dir,
+            &self.launch_logs_dir,
             &self.mods_cache_dir,
             &self.configs_cache_dir,
             &self.content_packs_cache_dir,

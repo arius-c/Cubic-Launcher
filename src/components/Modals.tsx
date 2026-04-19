@@ -1,6 +1,7 @@
-import { For, Show, createSignal, createEffect } from "solid-js";
+import { For, Show, createSignal, createEffect, on } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import type { ModRow } from "../lib/types";
+import type { GlobalSettingsState, ModlistOverridesState } from "../store";
 import { appendDebugTrace } from "../lib/debugTrace";
 import { useDragEngine, type DragItem } from "../lib/dragEngine";
 import { GripVerticalIcon } from "./icons";
@@ -8,7 +9,7 @@ import { ModIcon } from "./ModIcon";
 import {
   /* Settings */
   settingsModalOpen, setSettingsModalOpen, settingsTab, setSettingsTab,
-  globalSettings, setGlobalSettings, modlistOverrides, setModlistOverrides,
+  globalSettings, modlistOverrides,
   /* Accounts */
   accountsModalOpen, setAccountsModalOpen, accounts, setAccounts, activeAccountId, setActiveAccountId, activeAccount,
   toggleActiveAccountConnection,
@@ -207,7 +208,19 @@ export function CreateModlistModal(props: { onCreate: () => Promise<void> }) {
 }
 
 // ── Settings ──────────────────────────────────────────────────────────────────
-export function SettingsModal(props: { onSave: () => Promise<void> }) {
+export function SettingsModal(props: { onSave: (globalDraft: GlobalSettingsState, modlistDraft: ModlistOverridesState) => Promise<void> }) {
+  const [globalDraft, setGlobalDraft] = createSignal<GlobalSettingsState>({ ...globalSettings() });
+  const [modlistDraft, setModlistDraft] = createSignal<ModlistOverridesState>({ ...modlistOverrides() });
+
+  createEffect(on(settingsModalOpen, open => {
+    if (!open) return;
+    setGlobalDraft({ ...globalSettings() });
+    setModlistDraft({ ...modlistOverrides() });
+    setSettingsTab("global");
+  }));
+
+  const handleCancel = () => setSettingsModalOpen(false);
+
   const field = (label: string, content: any) => (
     <div class="rounded-md border border-border bg-background p-4">
       <p class="mb-2 text-sm font-medium text-foreground">{label}</p>
@@ -217,8 +230,8 @@ export function SettingsModal(props: { onSave: () => Promise<void> }) {
 
   return (
     <Show when={settingsModalOpen()}>
-      <Modal onClose={() => setSettingsModalOpen(false)} maxWidth="max-w-3xl">
-        <ModalHeader title="Settings" description="Global defaults and Mod-list overrides" onClose={() => setSettingsModalOpen(false)} />
+      <Modal onClose={handleCancel} maxWidth="max-w-3xl">
+        <ModalHeader title="Settings" description="Global defaults and Mod-list overrides" onClose={handleCancel} />
         <div class="flex flex-1 gap-0 overflow-hidden">
           {/* Tab nav */}
           <div class="w-44 shrink-0 border-r border-border p-3 space-y-1">
@@ -238,19 +251,19 @@ export function SettingsModal(props: { onSave: () => Promise<void> }) {
               /* Modlist overrides */
               <div class="space-y-4">
                 <p class="text-sm text-muted-foreground">Checked values override the global defaults for <strong class="text-foreground">{selectedModListName()}</strong>.</p>
-                {[
+                {[ 
                   { key: "minRam", label: "Min RAM (MB)", enabled: "minRamEnabled", value: "minRamMb" },
                   { key: "maxRam", label: "Max RAM (MB)", enabled: "maxRamEnabled", value: "maxRamMb" },
                 ].map(({ label, enabled, value }) => field(label,
                   <div class="flex gap-3">
-                    <input type="checkbox" checked={(modlistOverrides() as any)[enabled]} onChange={e => setModlistOverrides(c => ({ ...c, [enabled]: e.currentTarget.checked }))} class="mt-1 h-4 w-4 rounded text-primary" />
-                    <input type="number" value={(modlistOverrides() as any)[value]} disabled={!(modlistOverrides() as any)[enabled]} onInput={e => setModlistOverrides(c => ({ ...c, [value]: Number(e.currentTarget.value) }))} class="flex-1 rounded-md border border-input bg-input px-3 py-1.5 text-sm text-foreground disabled:opacity-40 focus:outline-none focus:ring-1 focus:ring-ring" />
+                    <input type="checkbox" checked={(modlistDraft() as any)[enabled]} onChange={e => setModlistDraft(c => ({ ...c, [enabled]: e.currentTarget.checked }))} class="mt-1 h-4 w-4 rounded text-primary" />
+                    <input type="number" value={(modlistDraft() as any)[value]} disabled={!(modlistDraft() as any)[enabled]} onInput={e => setModlistDraft(c => ({ ...c, [value]: Number(e.currentTarget.value) }))} class="flex-1 rounded-md border border-input bg-input px-3 py-1.5 text-sm text-foreground disabled:opacity-40 focus:outline-none focus:ring-1 focus:ring-ring" />
                   </div>
                 ))}
                 {field("Custom JVM Args",
                   <div class="flex gap-3">
-                    <input type="checkbox" checked={modlistOverrides().customArgsEnabled} onChange={e => setModlistOverrides(c => ({ ...c, customArgsEnabled: e.currentTarget.checked }))} class="mt-1 h-4 w-4 rounded text-primary" />
-                    <textarea rows={3} value={modlistOverrides().customJvmArgs} disabled={!modlistOverrides().customArgsEnabled} onInput={e => setModlistOverrides(c => ({ ...c, customJvmArgs: e.currentTarget.value }))} class="flex-1 resize-none rounded-md border border-input bg-input px-3 py-1.5 text-sm text-foreground disabled:opacity-40 focus:outline-none" />
+                    <input type="checkbox" checked={modlistDraft().customArgsEnabled} onChange={e => setModlistDraft(c => ({ ...c, customArgsEnabled: e.currentTarget.checked }))} class="mt-1 h-4 w-4 rounded text-primary" />
+                    <textarea rows={3} value={modlistDraft().customJvmArgs} disabled={!modlistDraft().customArgsEnabled} onInput={e => setModlistDraft(c => ({ ...c, customJvmArgs: e.currentTarget.value }))} class="flex-1 resize-none rounded-md border border-input bg-input px-3 py-1.5 text-sm text-foreground disabled:opacity-40 focus:outline-none" />
                   </div>
                 )}
               </div>
@@ -258,26 +271,33 @@ export function SettingsModal(props: { onSave: () => Promise<void> }) {
               {/* Global settings */}
               <div class="space-y-4">
                 <div class="grid grid-cols-2 gap-4">
-                  {field("Min RAM (MB)", <input type="number" value={globalSettings().minRamMb} onInput={e => setGlobalSettings(c => ({ ...c, minRamMb: Number(e.currentTarget.value) }))} class="w-full rounded-md border border-input bg-input px-3 py-1.5 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring" />)}
-                  {field("Max RAM (MB)", <input type="number" value={globalSettings().maxRamMb} onInput={e => setGlobalSettings(c => ({ ...c, maxRamMb: Number(e.currentTarget.value) }))} class="w-full rounded-md border border-input bg-input px-3 py-1.5 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring" />)}
+                  {field("Min RAM (MB)", <input type="number" value={globalDraft().minRamMb} onInput={e => setGlobalDraft(c => ({ ...c, minRamMb: Number(e.currentTarget.value) }))} class="w-full rounded-md border border-input bg-input px-3 py-1.5 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring" />)}
+                  {field("Max RAM (MB)", <input type="number" value={globalDraft().maxRamMb} onInput={e => setGlobalDraft(c => ({ ...c, maxRamMb: Number(e.currentTarget.value) }))} class="w-full rounded-md border border-input bg-input px-3 py-1.5 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring" />)}
                 </div>
-                {field("Custom JVM Args", <textarea rows={3} value={globalSettings().customJvmArgs} onInput={e => setGlobalSettings(c => ({ ...c, customJvmArgs: e.currentTarget.value }))} class="w-full resize-none rounded-md border border-input bg-input px-3 py-1.5 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring" />)}
-                {field("Java Path Override", <input type="text" value={globalSettings().javaPathOverride} onInput={e => setGlobalSettings(c => ({ ...c, javaPathOverride: e.currentTarget.value }))} placeholder="Optional explicit Java binary path" class="w-full rounded-md border border-input bg-input px-3 py-1.5 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring" />)}
-                {field("Wrapper Command (Linux)", <input type="text" value={globalSettings().wrapperCommand} onInput={e => setGlobalSettings(c => ({ ...c, wrapperCommand: e.currentTarget.value }))} placeholder="gamemoderun mangohud" class="w-full rounded-md border border-input bg-input px-3 py-1.5 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring" />)}
+                {field("Custom JVM Args", <textarea rows={3} value={globalDraft().customJvmArgs} onInput={e => setGlobalDraft(c => ({ ...c, customJvmArgs: e.currentTarget.value }))} class="w-full resize-none rounded-md border border-input bg-input px-3 py-1.5 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring" />)}
+                {field("Java Path Override", <input type="text" value={globalDraft().javaPathOverride} onInput={e => setGlobalDraft(c => ({ ...c, javaPathOverride: e.currentTarget.value }))} placeholder="Optional explicit Java binary path" class="w-full rounded-md border border-input bg-input px-3 py-1.5 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring" />)}
+                {field("Wrapper Command (Linux)", <input type="text" value={globalDraft().wrapperCommand} onInput={e => setGlobalDraft(c => ({ ...c, wrapperCommand: e.currentTarget.value }))} placeholder="gamemoderun mangohud" class="w-full rounded-md border border-input bg-input px-3 py-1.5 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring" />)}
                 <div>
                   <label class="flex items-center gap-3 text-sm">
-                    <input type="checkbox" checked={globalSettings().profilerEnabled} onChange={e => setGlobalSettings(c => ({ ...c, profilerEnabled: e.currentTarget.checked }))} class="h-4 w-4 rounded text-primary" />
+                    <input type="checkbox" checked={globalDraft().profilerEnabled} onChange={e => setGlobalDraft(c => ({ ...c, profilerEnabled: e.currentTarget.checked }))} class="h-4 w-4 rounded text-primary" />
                     <span class="text-foreground">Enable profiler globally</span>
                   </label>
                   <p class="mt-1 ml-7 text-xs text-muted-foreground">Adds JVM profiling flags to the launch command, useful for diagnosing performance issues.</p>
+                </div>
+                <div>
+                  <label class="flex items-center gap-3 text-sm">
+                    <input type="checkbox" checked={globalDraft().cacheOnlyMode} onChange={e => setGlobalDraft(c => ({ ...c, cacheOnlyMode: e.currentTarget.checked }))} class="h-4 w-4 rounded text-primary" />
+                    <span class="text-foreground">Cache-Only Mode</span>
+                  </label>
+                  <p class="mt-1 ml-7 text-xs text-muted-foreground">Prefer cached mod artifacts and stored dependency links before querying Modrinth. Useful for large packs and faster repeat launches.</p>
                 </div>
               </div>
             </Show>
           </div>
         </div>
         <div class="flex justify-end gap-2 border-t border-border px-6 py-4">
-          <button onClick={() => setSettingsModalOpen(false)} class="rounded-md bg-secondary px-4 py-2 text-sm text-secondary-foreground hover:bg-secondary/80">Cancel</button>
-          <button onClick={() => void props.onSave()} class="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90">Save Settings</button>
+          <button onClick={handleCancel} class="rounded-md bg-secondary px-4 py-2 text-sm text-secondary-foreground hover:bg-secondary/80">Cancel</button>
+          <button onClick={() => void props.onSave(globalDraft(), modlistDraft())} class="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90">Save Settings</button>
         </div>
       </Modal>
     </Show>

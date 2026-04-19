@@ -1,42 +1,48 @@
 use std::collections::{HashMap, HashSet};
+use std::io::{Cursor, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, State};
 
-use crate::adoptium::{AdoptiumClient, host_adoptium_os, normalize_adoptium_architecture, plan_runtime_download};
+use crate::adoptium::{
+    host_adoptium_os, normalize_adoptium_architecture, plan_runtime_download, AdoptiumClient,
+};
 use crate::app_shell::{load_shell_snapshot_from_root, ShellGlobalSettings, ShellModListOverrides};
-use crate::minecraft_downloader::{ensure_minecraft_version, extract_natives};
-use crate::dependencies::{resolve_required_dependencies_with_client, DependencyLink};
+use crate::content_packs::{load_content_list, ContentEntry};
+use crate::dependencies::{
+    collect_required_dependency_requests, resolve_required_dependencies_with_client,
+    DependencyLink, DependencyRequest, DependencyResolution, DependencySelector,
+    ResolvedDependency,
+};
 use crate::instance_configs::{prepare_instance_config_directory, CachedConfigPlacement};
 use crate::instance_mods::{prepare_instance_mods_directory, CachedModJar};
 use crate::java_runtime::{
     discover_java_installations, persist_java_installations, required_java_version_for_minecraft,
-    select_java_for_minecraft, CommandJavaBinaryInspector, JavaBinaryInspector,
+    select_java_for_requirement, CommandJavaBinaryInspector, JavaBinaryInspector,
 };
 use crate::launch_command::{build_launch_command, JavaLaunchRequest, JavaLaunchSettings};
 use crate::launcher_paths::LauncherPaths;
 use crate::loader_metadata::{LoaderLibrary, LoaderMetadata, LoaderMetadataClient};
+use crate::minecraft_downloader::{ensure_minecraft_version, extract_natives};
 use crate::mod_cache::{
-    build_mod_acquisition_plan, cache_record_from_version, SqliteModCacheRepository,
+    build_mod_acquisition_plan, cache_record_from_version, pending_download_from_version,
+    ModAcquisitionPlan, ModCacheLookup, ModCacheRecord, SqliteModCacheRepository,
 };
-use crate::modrinth::{ModrinthClient, ModrinthVersion};
-use crate::offline_account::{deterministic_offline_uuid, OfflineAccountService};
+use crate::modrinth::{DependencyType, ModrinthClient, ModrinthVersion};
+use crate::offline_account::deterministic_offline_uuid;
 use crate::process_streaming::{
-    spawn_and_stream_process, ProcessEventSink, ProcessLogEvent, ProcessLogStream,
-    TauriProcessEventSink, MINECRAFT_LOG_EVENT,
+    spawn_and_stream_process, ProcessEventSink, ProcessExitEvent, ProcessLogEvent,
+    ProcessLogStream, TauriProcessEventSink, MINECRAFT_LOG_EVENT,
 };
 use crate::resolver::{
-    resolve_modlist, ModLoader, ResolutionResult, ResolutionTarget,
-    FailureReason, RuleOutcome,
+    resolve_modlist, FailureReason, ModLoader, ResolutionResult, ResolutionTarget, RuleOutcome,
 };
-use crate::content_packs::{load_content_list, ContentEntry};
 use crate::rules::{ModList, ModSource, Rule, VersionRuleKind, RULES_FILENAME};
-use crate::token_storage::KeyringSecretStore;
 
 use std::sync::Mutex;
 
@@ -45,6 +51,18 @@ const LAUNCHER_ERROR_EVENT: &str = "launcher-error";
 
 /// Tracks the PID of the currently running Minecraft process so it can be killed.
 static ACTIVE_MC_PID: Mutex<Option<u32>> = Mutex::new(None);
+static ACTIVE_LAUNCH_LOG_SESSION: Mutex<Option<Arc<LaunchLogSession>>> = Mutex::new(None);
+
+#[derive(Debug)]
+struct LaunchLogSession {
+    dir: PathBuf,
+}
+
+#[derive(Clone)]
+struct LoggingProcessEventSink {
+    inner: TauriProcessEventSink,
+    session: Arc<LaunchLogSession>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -52,6 +70,36 @@ pub struct LaunchRequest {
     pub modlist_name: String,
     pub minecraft_version: String,
     pub mod_loader: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchVerificationRequest {
+    pub modlist_name: String,
+    pub minecraft_version: String,
+    pub mod_loader: String,
+    #[serde(default = "default_verification_timeout_seconds")]
+    pub timeout_seconds: u64,
+    #[serde(default = "default_success_after_seconds")]
+    pub success_after_seconds: u64,
+    #[serde(default = "default_terminate_on_success")]
+    pub terminate_on_success: bool,
+    #[serde(default = "default_terminate_on_timeout")]
+    pub terminate_on_timeout: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchVerificationResult {
+    pub started: bool,
+    pub success: bool,
+    pub state: String,
+    pub pid: Option<u32>,
+    pub launch_log_dir: Option<String>,
+    pub duration_ms: u64,
+    pub failure_kind: Option<String>,
+    pub failure_summary: Option<String>,
+    pub minecraft_log_tail: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -79,6 +127,7 @@ struct EffectiveLaunchSettings {
     min_ram_mb: u32,
     max_ram_mb: u32,
     custom_jvm_args: String,
+    cache_only_mode: bool,
     wrapper_command: Option<String>,
     java_path_override: Option<PathBuf>,
 }
@@ -117,6 +166,405 @@ struct SelectedMod {
     source: ModSource,
 }
 
+impl SelectedMod {
+    fn source_label(&self) -> &'static str {
+        match self.source {
+            ModSource::Modrinth => "modrinth",
+            ModSource::Local => "local",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TopLevelVersionCandidates {
+    selected_mod_id: String,
+    project_id: String,
+    candidates: Vec<ModrinthVersion>,
+}
+
+#[derive(Debug, Clone)]
+enum RemoteArtifact {
+    Live(ModrinthVersion),
+    Cached(ModCacheRecord),
+}
+
+#[derive(Debug, Clone)]
+struct DependencyResolutionCandidate {
+    parent_mod_id: String,
+    selector: DependencySelector,
+    resolved_dependency: ResolvedDependency,
+    artifact: RemoteArtifact,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct EmbeddedFabricRequirementSet {
+    minecraft_predicates: Vec<String>,
+    java_predicates: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct EmbeddedFabricRequirements {
+    root_entry: Option<EmbeddedFabricRequirementSet>,
+    entries: Vec<EmbeddedFabricRequirementSet>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct EmbeddedFabricModMetadata {
+    mod_id: String,
+    version: String,
+    provides: Vec<String>,
+    depends: HashMap<String, Vec<String>>,
+    breaks: HashMap<String, Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OwnedEmbeddedFabricModMetadata {
+    owner_project_id: String,
+    metadata: EmbeddedFabricModMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FabricValidationIssue {
+    reason_code: &'static str,
+    owner_project_id: String,
+    mod_id: String,
+    dependency_id: Option<String>,
+    detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FabricIssueRetryState {
+    signature: String,
+    consecutive_attempts: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StartedLaunch {
+    pid: u32,
+    launch_log_dir: PathBuf,
+}
+
+fn default_verification_timeout_seconds() -> u64 {
+    45
+}
+
+fn default_success_after_seconds() -> u64 {
+    15
+}
+
+fn default_terminate_on_success() -> bool {
+    true
+}
+
+fn default_terminate_on_timeout() -> bool {
+    true
+}
+
+impl LaunchVerificationRequest {
+    fn into_launch_request(self) -> LaunchRequest {
+        LaunchRequest {
+            modlist_name: self.modlist_name,
+            minecraft_version: self.minecraft_version,
+            mod_loader: self.mod_loader,
+        }
+    }
+}
+
+fn fabric_issue_signature(issue: &FabricValidationIssue) -> String {
+    format!(
+        "{}|{}|{}|{}",
+        issue.reason_code,
+        issue.owner_project_id,
+        issue.mod_id,
+        issue.dependency_id.as_deref().unwrap_or("-"),
+    )
+}
+
+fn fabric_issue_reason_priority(reason_code: &str) -> u8 {
+    match reason_code {
+        "exact_dependency_conflict" => 0,
+        "breaks_conflict" => 1,
+        "incompatible_dependency_version" => 2,
+        "missing_dependency" => 3,
+        "embedded_version_incompatible" => 4,
+        _ => 10,
+    }
+}
+
+fn choose_primary_fabric_issue<'a>(
+    issues: &'a HashMap<String, FabricValidationIssue>,
+) -> Option<(&'a String, &'a FabricValidationIssue)> {
+    let mut entries = issues.iter().collect::<Vec<_>>();
+    entries.sort_by(|(left_project_id, left_issue), (right_project_id, right_issue)| {
+        fabric_issue_reason_priority(left_issue.reason_code)
+            .cmp(&fabric_issue_reason_priority(right_issue.reason_code))
+            .then_with(|| left_project_id.cmp(right_project_id))
+    });
+    entries.into_iter().next()
+}
+
+impl LaunchLogSession {
+    fn create(
+        launcher_paths: &LauncherPaths,
+        modlist_name: &str,
+        target: &ResolutionTarget,
+    ) -> Result<Arc<Self>> {
+        let launch_id = format!(
+            "{}-{}-{}-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            sanitize_log_path_component(modlist_name),
+            sanitize_log_path_component(&target.minecraft_version),
+            sanitize_log_path_component(target.mod_loader.as_modrinth_loader()),
+        );
+        let dir = launcher_paths.launch_logs_dir().join(launch_id);
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("failed to create launch log directory {}", dir.display()))?;
+
+        let session = Arc::new(Self { dir });
+        session.append_summary_line(&format!("modlist={modlist_name}"))?;
+        session.append_summary_line(&format!("minecraft_version={}", target.minecraft_version))?;
+        session.append_summary_line(&format!(
+            "mod_loader={}",
+            target.mod_loader.as_modrinth_loader()
+        ))?;
+        session.append_summary_line(&format!("log_dir={}", session.dir.display()))?;
+        Ok(session)
+    }
+
+    fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    fn append_launcher_line(&self, stream: ProcessLogStream, line: &str) -> Result<()> {
+        let stream_label = match stream {
+            ProcessLogStream::Stdout => "stdout",
+            ProcessLogStream::Stderr => "stderr",
+        };
+        self.append_line("all.log", &format!("[launcher:{stream_label}] {line}"))?;
+        self.append_line("launcher.log", line)?;
+
+        if let Some(category_file) = launcher_category_file(line) {
+            self.append_line(category_file, line)?;
+        }
+
+        Ok(())
+    }
+
+    fn append_minecraft_log(&self, event: &ProcessLogEvent) -> Result<()> {
+        let stream_label = match event.stream {
+            ProcessLogStream::Stdout => "stdout",
+            ProcessLogStream::Stderr => "stderr",
+        };
+        self.append_line(
+            "all.log",
+            &format!("[minecraft:{stream_label}] {}", event.line),
+        )?;
+        self.append_line("minecraft.log", &format!("[{stream_label}] {}", event.line))
+    }
+
+    fn append_exit_event(&self, event: &ProcessExitEvent) -> Result<()> {
+        self.append_summary_line(&format!("minecraft_exit_success={}", event.success))?;
+        self.append_summary_line(&format!(
+            "minecraft_exit_code={}",
+            event
+                .exit_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "none".to_string())
+        ))?;
+        self.append_line(
+            "all.log",
+            &format!(
+                "[minecraft:exit] success={} exit_code={}",
+                event.success,
+                event
+                    .exit_code
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "none".to_string())
+            ),
+        )
+    }
+
+    fn write_selected_mods(&self, selected_mods: &[SelectedMod]) -> Result<()> {
+        let mut lines = Vec::with_capacity(selected_mods.len() + 1);
+        lines.push(format!("count={}", selected_mods.len()));
+        for selected in selected_mods {
+            lines.push(format!(
+                "{} | source={}",
+                selected.mod_id,
+                selected.source_label()
+            ));
+        }
+        self.write_file("selected_mods.log", &lines)
+    }
+
+    fn write_dependency_summary(&self, resolution: &DependencyResolution) -> Result<()> {
+        let mut lines = vec![
+            format!(
+                "resolved_dependencies={}",
+                resolution.resolved_dependencies.len()
+            ),
+            format!("links={}", resolution.links.len()),
+            format!("excluded_parents={}", resolution.excluded_parents.len()),
+            String::new(),
+            "[resolved_dependencies]".to_string(),
+        ];
+
+        for dependency in &resolution.resolved_dependencies {
+            lines.push(format!(
+                "{} | version_id={} | jar={}",
+                dependency.dependency_id, dependency.version_id, dependency.jar_filename
+            ));
+        }
+
+        lines.push(String::new());
+        lines.push("[links]".to_string());
+        for link in &resolution.links {
+            lines.push(format!(
+                "{} -> {} | specific_version={} | jar={}",
+                link.parent_mod_id,
+                link.dependency_id,
+                link.specific_version.as_deref().unwrap_or("-"),
+                link.jar_filename
+            ));
+        }
+
+        lines.push(String::new());
+        lines.push("[excluded_parents]".to_string());
+        let mut excluded = resolution
+            .excluded_parents
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        excluded.sort();
+        for parent in excluded {
+            lines.push(parent);
+        }
+
+        self.write_file("dependencies.log", &lines)
+    }
+
+    fn write_resolved_versions(
+        &self,
+        remote_versions: &[ModrinthVersion],
+        cached_records: &[ModCacheRecord],
+    ) -> Result<()> {
+        let mut lines = vec![
+            format!("live_versions={}", remote_versions.len()),
+            format!("cached_records={}", cached_records.len()),
+            String::new(),
+            "[live_versions]".to_string(),
+        ];
+
+        for version in remote_versions {
+            let primary_file = version.primary_file();
+            lines.push(format!(
+                "{} | version_id={} | version_number={} | file={}",
+                version.project_id,
+                version.id,
+                version.version_number,
+                primary_file
+                    .map(|file| file.filename.as_str())
+                    .unwrap_or("<missing>")
+            ));
+        }
+
+        lines.push(String::new());
+        lines.push("[cached_records]".to_string());
+        for record in cached_records {
+            lines.push(format!(
+                "{} | version_id={} | jar={} | local={}",
+                record.modrinth_project_id,
+                record.modrinth_version_id,
+                record.jar_filename,
+                record.is_local
+            ));
+        }
+
+        self.write_file("resolved_versions.log", &lines)
+    }
+
+    fn write_cache_plan(&self, plan: &ModAcquisitionPlan) -> Result<()> {
+        let mut lines = vec![
+            format!("cached={}", plan.cached.len()),
+            format!("to_download={}", plan.to_download.len()),
+            String::new(),
+            "[cached]".to_string(),
+        ];
+
+        for record in &plan.cached {
+            lines.push(format!(
+                "{} | version_id={} | jar={}",
+                record.modrinth_project_id, record.modrinth_version_id, record.jar_filename
+            ));
+        }
+
+        lines.push(String::new());
+        lines.push("[to_download]".to_string());
+        for pending in &plan.to_download {
+            lines.push(format!(
+                "{} | version_id={} | jar={}",
+                pending.modrinth_project_id, pending.modrinth_version_id, pending.jar_filename
+            ));
+        }
+
+        self.write_file("cache_plan.log", &lines)
+    }
+
+    fn write_final_mod_set(&self, jars: &[CachedModJar]) -> Result<()> {
+        let mut lines = vec![format!("count={}", jars.len())];
+        for jar in jars {
+            lines.push(jar.jar_filename.clone());
+        }
+        self.write_file("final_mod_set.log", &lines)
+    }
+
+    fn append_summary_line(&self, line: &str) -> Result<()> {
+        self.append_line("summary.log", line)
+    }
+
+    fn append_line(&self, file_name: &str, line: &str) -> Result<()> {
+        let path = self.dir.join(file_name);
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        writeln!(file, "{line}").with_context(|| format!("failed to write {}", path.display()))
+    }
+
+    fn write_file(&self, file_name: &str, lines: &[String]) -> Result<()> {
+        let path = self.dir.join(file_name);
+        let mut content = lines.join("\n");
+        content.push('\n');
+        std::fs::write(&path, content)
+            .with_context(|| format!("failed to write {}", path.display()))
+    }
+}
+
+impl LoggingProcessEventSink {
+    fn new(app_handle: tauri::AppHandle, session: Arc<LaunchLogSession>) -> Self {
+        Self {
+            inner: TauriProcessEventSink::new(app_handle),
+            session,
+        }
+    }
+}
+
+impl ProcessEventSink for LoggingProcessEventSink {
+    fn emit_log(&self, event: ProcessLogEvent) -> Result<()> {
+        let _ = self.session.append_minecraft_log(&event);
+        self.inner.emit_log(event)
+    }
+
+    fn emit_exit(&self, event: ProcessExitEvent) -> Result<()> {
+        let _ = self.session.append_exit_event(&event);
+        self.inner.emit_exit(event)
+    }
+}
+
 #[tauri::command]
 pub fn start_launch_command(
     app_handle: tauri::AppHandle,
@@ -128,28 +576,23 @@ pub fn start_launch_command(
     tauri::async_runtime::spawn(async move {
         if let Err(error) = run_launch_pipeline(app_handle.clone(), launcher_paths, request).await {
             let detail = format!("{error:#}");
-            let _ = emit_log(
-                &app_handle,
-                ProcessLogStream::Stderr,
-                format!("[Launch] {detail}"),
-            );
-            let _ = emit_progress(
-                &app_handle,
-                "idle",
-                0,
-                "Launch Aborted",
-                "Launch preparation stopped before Minecraft could start.",
-            );
-            let _ = emit_launcher_error(
-                &app_handle,
-                "Launch failed",
-                "The launcher could not finish preparing the selected mod list.",
-                &detail,
-            );
+            let _ = emit_launch_failure(&app_handle, &detail);
+            set_active_launch_log_session(None);
         }
     });
 
     Ok(())
+}
+
+#[tauri::command]
+pub async fn verify_launch_command(
+    app_handle: tauri::AppHandle,
+    launcher_paths: State<'_, LauncherPaths>,
+    request: LaunchVerificationRequest,
+) -> Result<LaunchVerificationResult, String> {
+    run_launch_verification(app_handle, launcher_paths.inner().clone(), request)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// Kills the currently running Minecraft process, if any.
@@ -157,36 +600,575 @@ pub fn start_launch_command(
 pub fn stop_minecraft_command() -> Result<(), String> {
     let pid = ACTIVE_MC_PID.lock().unwrap().take();
     if let Some(pid) = pid {
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x08000000;
-            let _ = std::process::Command::new("taskkill")
-                .args(["/F", "/T", "/PID", &pid.to_string()])
-                .creation_flags(CREATE_NO_WINDOW)
-                .output();
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            unsafe { libc::kill(pid as i32, libc::SIGTERM); }
-        }
-        Ok(())
+        terminate_minecraft_pid(pid).map_err(|error| error.to_string())
     } else {
         Err("No Minecraft process is running.".into())
     }
+}
+
+pub fn maybe_start_automation_verifier(
+    app_handle: tauri::AppHandle,
+    launcher_paths: LauncherPaths,
+) -> Result<()> {
+    let request_json = match std::env::var("CUBIC_AUTOMATION_VERIFY_REQUEST") {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => return Ok(()),
+    };
+
+    let request: LaunchVerificationRequest =
+        serde_json::from_str(&request_json).context("failed to parse automation request JSON")?;
+    let output_path = std::env::var("CUBIC_AUTOMATION_VERIFY_OUTPUT")
+        .ok()
+        .map(PathBuf::from);
+    let should_exit = std::env::var("CUBIC_AUTOMATION_VERIFY_EXIT")
+        .ok()
+        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+    append_automation_trace(
+        &launcher_paths,
+        &format!(
+            "automation bootstrap requested: output={} exit_on_failure={should_exit}",
+            output_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<none>".to_string())
+        ),
+    );
+
+    tauri::async_runtime::spawn(async move {
+        append_automation_trace(&launcher_paths, "automation task started");
+        let result = run_launch_pipeline(
+            app_handle.clone(),
+            launcher_paths.clone(),
+            request.into_launch_request(),
+        )
+        .await;
+        let launch_failed = result.is_err();
+
+        let output_result = match result {
+            Ok(started_launch) => {
+                append_automation_trace(
+                    &launcher_paths,
+                    &format!(
+                        "launch pipeline started minecraft: pid={} log_dir={}",
+                        started_launch.pid,
+                        started_launch.launch_log_dir.display()
+                    ),
+                );
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "started": true,
+                    "success": false,
+                    "state": "started",
+                    "pid": started_launch.pid,
+                    "launchLogDir": started_launch.launch_log_dir.display().to_string(),
+                }))
+                .context("failed to serialize automation launch start")
+            }
+            Err(error) => {
+                let detail = format!("{error:#}");
+                let _ = emit_launch_failure(&app_handle, &detail);
+                append_automation_trace(
+                    &launcher_paths,
+                    &format!("launch pipeline failed before spawn: {detail}"),
+                );
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "started": false,
+                    "success": false,
+                    "state": "launch_failed",
+                    "failureKind": "launch_failed",
+                    "failureSummary": detail,
+                    "launchLogDir": current_launch_log_session().map(|session| session.dir().display().to_string()),
+                }))
+                .context("failed to serialize automation launch failure")
+            }
+        };
+
+        if let Some(path) = output_path {
+            if let Err(error) = write_automation_output_json(&path, output_result) {
+                append_automation_trace(
+                    &launcher_paths,
+                    &format!(
+                        "failed to write automation output {}: {error:#}",
+                        path.display()
+                    ),
+                );
+                eprintln!(
+                    "failed to write automation verification output {}: {error:#}",
+                    path.display()
+                );
+            } else {
+                append_automation_trace(
+                    &launcher_paths,
+                    &format!("wrote automation output {}", path.display()),
+                );
+            }
+        }
+
+        if launch_failed {
+            set_active_launch_log_session(None);
+        }
+
+        if should_exit && launch_failed {
+            app_handle.exit(1);
+        }
+    });
+
+    Ok(())
+}
+
+fn set_active_launch_log_session(session: Option<Arc<LaunchLogSession>>) {
+    *ACTIVE_LAUNCH_LOG_SESSION.lock().unwrap() = session;
+}
+
+fn current_launch_log_session() -> Option<Arc<LaunchLogSession>> {
+    ACTIVE_LAUNCH_LOG_SESSION.lock().unwrap().clone()
+}
+
+fn current_minecraft_pid() -> Option<u32> {
+    *ACTIVE_MC_PID.lock().unwrap()
+}
+
+pub fn automation_mode_enabled() -> bool {
+    std::env::var("CUBIC_AUTOMATION_VERIFY_REQUEST")
+        .ok()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+}
+
+fn append_automation_trace(launcher_paths: &LauncherPaths, message: &str) {
+    let path = launcher_paths.logs_dir().join("automation.log");
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let line = format!("[{timestamp}] {message}\n");
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, line.as_bytes()));
+}
+
+fn emit_launch_failure(app_handle: &tauri::AppHandle, detail: &str) -> Result<()> {
+    emit_log(
+        app_handle,
+        ProcessLogStream::Stderr,
+        format!("[Launch] {detail}"),
+    )?;
+    emit_progress(
+        app_handle,
+        "idle",
+        0,
+        "Launch Aborted",
+        "Launch preparation stopped before Minecraft could start.",
+    )?;
+    emit_launcher_issue(
+        app_handle,
+        "Launch failed",
+        "The launcher could not finish preparing the selected mod list.",
+        detail,
+        "error",
+        "launch",
+    )
+}
+
+fn terminate_minecraft_pid(pid: u32) -> Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        let output = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .with_context(|| format!("failed to terminate Minecraft PID {pid}"))?;
+
+        if output.status.success() {
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            bail!(
+                "failed to terminate Minecraft PID {pid}: {}",
+                if stderr.is_empty() {
+                    "taskkill returned a non-zero exit code"
+                } else {
+                    &stderr
+                }
+            )
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let result = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+        if result == 0 {
+            Ok(())
+        } else {
+            bail!("failed to terminate Minecraft PID {pid}")
+        }
+    }
+}
+
+async fn run_launch_verification(
+    app_handle: tauri::AppHandle,
+    launcher_paths: LauncherPaths,
+    request: LaunchVerificationRequest,
+) -> Result<LaunchVerificationResult> {
+    anyhow::ensure!(
+        current_minecraft_pid().is_none(),
+        "cannot verify launch while another Minecraft process is already tracked"
+    );
+
+    let started_at = Instant::now();
+    let timeout = Duration::from_secs(request.timeout_seconds.max(5));
+    let success_after = Duration::from_secs(request.success_after_seconds.max(1));
+    let launch_request = request.clone().into_launch_request();
+
+    let started_launch = match run_launch_pipeline(app_handle.clone(), launcher_paths, launch_request).await
+    {
+        Ok(started_launch) => started_launch,
+        Err(error) => {
+            let detail = format!("{error:#}");
+            let _ = emit_launch_failure(&app_handle, &detail);
+            let result = build_failed_verification_result(
+                started_at.elapsed(),
+                current_launch_log_session(),
+                None,
+                "launch_failed",
+                "launch_failed",
+                &detail,
+            )?;
+            set_active_launch_log_session(None);
+            return Ok(result);
+        }
+    };
+
+    loop {
+        let elapsed = started_at.elapsed();
+        let log_tail = read_log_tail(&started_launch.launch_log_dir.join("minecraft.log"), 80)?;
+        let summary_exit = summary_reports_minecraft_exit(&started_launch.launch_log_dir)?;
+
+        if let Some((failure_kind, failure_summary)) = summarize_launch_failure(&log_tail) {
+            if current_minecraft_pid() == Some(started_launch.pid) {
+                let _ = terminate_minecraft_pid(started_launch.pid);
+            }
+            let result = finalize_verification_result(LaunchVerificationResult {
+                started: true,
+                success: false,
+                state: "crashed".to_string(),
+                pid: Some(started_launch.pid),
+                launch_log_dir: Some(started_launch.launch_log_dir.display().to_string()),
+                duration_ms: elapsed.as_millis() as u64,
+                failure_kind: Some(failure_kind),
+                failure_summary: Some(failure_summary),
+                minecraft_log_tail: log_tail,
+            })?;
+            return Ok(result);
+        }
+
+        if current_minecraft_pid() != Some(started_launch.pid) || summary_exit.is_some() {
+            let failure_summary = if let Some((_, exit_code)) = summary_exit {
+                format!(
+                    "Minecraft exited before the verification success window was reached{}.",
+                    exit_code
+                        .map(|code| format!(" (exit code {code})"))
+                        .unwrap_or_default()
+                )
+            } else {
+                "Minecraft exited before the verification success window was reached."
+                    .to_string()
+            };
+            let result = finalize_verification_result(LaunchVerificationResult {
+                started: true,
+                success: false,
+                state: "exited".to_string(),
+                pid: Some(started_launch.pid),
+                launch_log_dir: Some(started_launch.launch_log_dir.display().to_string()),
+                duration_ms: elapsed.as_millis() as u64,
+                failure_kind: Some("process_exited".to_string()),
+                failure_summary: Some(failure_summary),
+                minecraft_log_tail: log_tail,
+            })?;
+            return Ok(result);
+        }
+
+        if elapsed >= success_after && launch_appears_healthy(&log_tail) {
+            if request.terminate_on_success {
+                let _ = terminate_minecraft_pid(started_launch.pid);
+            }
+            let result = finalize_verification_result(LaunchVerificationResult {
+                started: true,
+                success: true,
+                state: "running".to_string(),
+                pid: Some(started_launch.pid),
+                launch_log_dir: Some(started_launch.launch_log_dir.display().to_string()),
+                duration_ms: elapsed.as_millis() as u64,
+                failure_kind: None,
+                failure_summary: None,
+                minecraft_log_tail: log_tail,
+            })?;
+            return Ok(result);
+        }
+
+        if elapsed >= timeout {
+            if request.terminate_on_timeout && current_minecraft_pid() == Some(started_launch.pid) {
+                let _ = terminate_minecraft_pid(started_launch.pid);
+            }
+            let result = finalize_verification_result(LaunchVerificationResult {
+                started: true,
+                success: false,
+                state: "timed_out".to_string(),
+                pid: Some(started_launch.pid),
+                launch_log_dir: Some(started_launch.launch_log_dir.display().to_string()),
+                duration_ms: elapsed.as_millis() as u64,
+                failure_kind: Some("timed_out".to_string()),
+                failure_summary: Some(format!(
+                    "Minecraft did not reach the verification success window within {} seconds.",
+                    timeout.as_secs()
+                )),
+                minecraft_log_tail: log_tail,
+            })?;
+            return Ok(result);
+        }
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+fn sanitize_log_path_component(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|character| match character {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => character,
+            _ => '-',
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_ascii_lowercase();
+
+    if sanitized.is_empty() {
+        "launch".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn launcher_category_file(line: &str) -> Option<&'static str> {
+    if line.starts_with("[Resolver]") {
+        Some("resolver.log")
+    } else if line.starts_with("[Cache]") {
+        Some("cache.log")
+    } else if line.starts_with("[Dependencies]") {
+        Some("dependencies.log")
+    } else {
+        None
+    }
+}
+
+fn read_log_tail(path: &Path, max_lines: usize) -> Result<Vec<String>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let content =
+        std::fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut lines = content.lines().map(str::to_string).collect::<Vec<_>>();
+    if lines.len() > max_lines {
+        let split_point = lines.len() - max_lines;
+        lines.drain(0..split_point);
+    }
+    Ok(lines)
+}
+
+fn summary_reports_minecraft_exit(log_dir: &Path) -> Result<Option<(bool, Option<String>)>> {
+    let lines = read_log_tail(&log_dir.join("summary.log"), 30)?;
+    let mut exit_success = None;
+    let mut exit_code = None;
+
+    for line in lines {
+        if let Some(value) = line.strip_prefix("minecraft_exit_success=") {
+            exit_success = Some(value.trim() == "true");
+        } else if let Some(value) = line.strip_prefix("minecraft_exit_code=") {
+            let trimmed = value.trim();
+            if trimmed != "none" {
+                exit_code = Some(trimmed.to_string());
+            }
+        }
+    }
+
+    Ok(exit_success.map(|success| (success, exit_code)))
+}
+
+fn summarize_launch_failure(lines: &[String]) -> Option<(String, String)> {
+    let joined = lines.join("\n");
+    let lowercase = joined.to_ascii_lowercase();
+
+    if lowercase.contains("requires version")
+        && lowercase.contains("which is missing")
+        && lowercase.contains("mod '")
+    {
+        return Some((
+            "missing_dependency".to_string(),
+            "Fabric reported a missing required dependency in the selected mod set.".to_string(),
+        ));
+    }
+
+    if lowercase.contains("requires version")
+        && lowercase.contains("java")
+        && lowercase.contains("wrong version is present")
+    {
+        return Some((
+            "wrong_java".to_string(),
+            "A selected mod requires a newer Java runtime than the launcher used.".to_string(),
+        ));
+    }
+
+    if lowercase.contains("noclassdeffounderror")
+        || (lowercase.contains("classnotfoundexception")
+            && lowercase.contains("caused by:")
+            && !lowercase.contains("error loading class:"))
+    {
+        return Some((
+            "missing_class".to_string(),
+            "Minecraft crashed because a required class was missing at runtime.".to_string(),
+        ));
+    }
+
+    if lowercase.contains("nosuchmethoderror") {
+        return Some((
+            "method_mismatch".to_string(),
+            "Minecraft crashed because two mods loaded incompatible method signatures.".to_string(),
+        ));
+    }
+
+    if lowercase.contains("could not execute entrypoint stage")
+        || lowercase.contains("exception caught from launcher")
+    {
+        return Some((
+            "entrypoint_crash".to_string(),
+            "Minecraft crashed while loading a mod entrypoint.".to_string(),
+        ));
+    }
+
+    if lowercase.contains("incompatible mods found") {
+        return Some((
+            "incompatible_mods".to_string(),
+            "Fabric rejected the selected mod set as incompatible.".to_string(),
+        ));
+    }
+
+    None
+}
+
+fn launch_appears_healthy(lines: &[String]) -> bool {
+    if lines.is_empty() || summarize_launch_failure(lines).is_some() {
+        return false;
+    }
+
+    lines.iter().any(|line| {
+        line.contains("[Render thread/")
+            || line.contains("Loading Minecraft")
+            || line.contains("OpenAL initialized")
+            || line.contains("Reloading ResourceManager")
+    })
+}
+
+fn write_verification_result(log_dir: &Path, result: &LaunchVerificationResult) -> Result<()> {
+    let json = serde_json::to_string_pretty(result).context("failed to serialize verification result")?;
+    std::fs::write(log_dir.join("verification.json"), json).with_context(|| {
+        format!(
+            "failed to write {}",
+            log_dir.join("verification.json").display()
+        )
+    })
+}
+
+fn finalize_verification_result(
+    result: LaunchVerificationResult,
+) -> Result<LaunchVerificationResult> {
+    if let Some(log_dir) = &result.launch_log_dir {
+        let path = PathBuf::from(log_dir);
+        write_verification_result(&path, &result)?;
+        if let Some(session) = current_launch_log_session() {
+            let _ = session.append_summary_line(&format!("verification_success={}", result.success));
+            let _ = session.append_summary_line(&format!("verification_state={}", result.state));
+            if let Some(failure_kind) = &result.failure_kind {
+                let _ = session.append_summary_line(&format!("verification_failure_kind={failure_kind}"));
+            }
+            if let Some(failure_summary) = &result.failure_summary {
+                let _ = session.append_summary_line(&format!(
+                    "verification_failure_summary={failure_summary}"
+                ));
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+fn build_failed_verification_result(
+    elapsed: Duration,
+    session: Option<Arc<LaunchLogSession>>,
+    pid: Option<u32>,
+    state: &str,
+    failure_kind: &str,
+    failure_summary: &str,
+) -> Result<LaunchVerificationResult> {
+    let launch_log_dir = session.as_ref().map(|entry| entry.dir().display().to_string());
+    let minecraft_log_tail = if let Some(entry) = &session {
+        read_log_tail(&entry.dir().join("minecraft.log"), 80)?
+    } else {
+        Vec::new()
+    };
+    let result = LaunchVerificationResult {
+        started: false,
+        success: false,
+        state: state.to_string(),
+        pid,
+        launch_log_dir,
+        duration_ms: elapsed.as_millis() as u64,
+        failure_kind: Some(failure_kind.to_string()),
+        failure_summary: Some(failure_summary.to_string()),
+        minecraft_log_tail,
+    };
+    finalize_verification_result(result)
+}
+
+fn write_automation_output_json(path: &Path, json: Result<String>) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    let json = match json {
+        Ok(value) => value,
+        Err(error) => serde_json::to_string_pretty(&serde_json::json!({
+            "started": false,
+            "success": false,
+            "state": "automation_error",
+            "failureKind": "automation_error",
+            "failureSummary": format!("{error:#}")
+        }))
+        .context("failed to serialize automation verification failure")?,
+    };
+
+    std::fs::write(path, json)
+        .with_context(|| format!("failed to write automation result to {}", path.display()))
 }
 
 async fn run_launch_pipeline(
     app_handle: tauri::AppHandle,
     launcher_paths: LauncherPaths,
     request: LaunchRequest,
-) -> Result<()> {
+) -> Result<StartedLaunch> {
     let target = ResolutionTarget {
         minecraft_version: request.minecraft_version.trim().to_string(),
         mod_loader: parse_mod_loader(&request.mod_loader)?,
     };
     let modlist_name = request.modlist_name.trim().to_string();
     anyhow::ensure!(!modlist_name.is_empty(), "modlist_name cannot be empty");
+    let launch_log_session = LaunchLogSession::create(&launcher_paths, &modlist_name, &target)?;
+    set_active_launch_log_session(Some(launch_log_session.clone()));
 
     emit_progress(
         &app_handle,
@@ -206,6 +1188,14 @@ async fn run_launch_pipeline(
             modlist_name, target.minecraft_version, request.mod_loader
         ),
     )?;
+    emit_log(
+        &app_handle,
+        ProcessLogStream::Stdout,
+        format!(
+            "[Launcher] Writing launch logs to {}",
+            launch_log_session.dir().display()
+        ),
+    )?;
 
     let modlist = load_modlist(&launcher_paths, &modlist_name)?;
     let shell_snapshot =
@@ -222,70 +1212,525 @@ async fn run_launch_pipeline(
 
     // Verify Modrinth availability for resolved mods. If a resolved mod has no
     // compatible version on Modrinth, temporarily disable it and re-resolve so
-    // alternatives get a chance.
-    let resolution = {
-        let mut selected = collect_selected_mods(&modlist, &resolution, &target);
-        let versions = prefetch_compatible_versions_for_selected(&app_handle, &selected, &modrinth_client, &target).await?;
-        let mut unavailable: Vec<String> = Vec::new();
-        for s in &selected {
-            if matches!(s.source, ModSource::Modrinth) && !versions.contains_key(&s.mod_id) {
-                unavailable.push(s.mod_id.clone());
-            }
-        }
+    // alternatives get a chance. In cache-only mode, a valid cached artifact
+    // also counts as available.
+    let resolution = if effective_settings.cache_only_mode {
+        let selected = collect_selected_mods(&modlist, &resolution, &target);
+        let available_artifacts =
+            resolve_selected_remote_artifacts(&launcher_paths, &selected, &target).await?;
+        let unavailable = selected
+            .iter()
+            .filter(|selected| matches!(selected.source, ModSource::Modrinth))
+            .filter(|selected| !available_artifacts.contains_key(&selected.mod_id))
+            .map(|selected| selected.mod_id.clone())
+            .collect::<Vec<_>>();
+
         if unavailable.is_empty() {
             resolution
         } else {
-            // Temporarily disable unavailable mods and re-resolve.
             let mut patched = modlist.clone();
             for uid in &unavailable {
                 if let Some(rule) = patched.find_rule_mut(uid) {
                     rule.enabled = false;
                 }
             }
-            let re_resolved = resolve_modlist(&patched, &target)?;
-            // Restore enabled flags (they're only changed on the clone).
-            selected = collect_selected_mods(&modlist, &re_resolved, &target);
-            re_resolved
+            resolve_modlist(&patched, &target)?
+        }
+    } else {
+        let selected = collect_selected_mods(&modlist, &resolution, &target);
+        let versions = prefetch_compatible_versions_for_selected(
+            &app_handle,
+            &launcher_paths,
+            &http_client,
+            &selected,
+            &modrinth_client,
+            &target,
+        )
+        .await?;
+        let unavailable = selected
+            .iter()
+            .filter(|selected| matches!(selected.source, ModSource::Modrinth))
+            .filter(|selected| !versions.contains_key(&selected.mod_id))
+            .map(|selected| selected.mod_id.clone())
+            .collect::<Vec<_>>();
+
+        if unavailable.is_empty() {
+            resolution
+        } else {
+            let mut patched = modlist.clone();
+            for uid in &unavailable {
+                if let Some(rule) = patched.find_rule_mut(uid) {
+                    rule.enabled = false;
+                }
+            }
+            resolve_modlist(&patched, &target)?
         }
     };
     log_resolution(&app_handle, &resolution)?;
 
     let selected_mods = collect_selected_mods(&modlist, &resolution, &target);
-    let compatible_versions =
-        prefetch_compatible_versions_for_selected(&app_handle, &selected_mods, &modrinth_client, &target).await?;
-    let parent_versions = collect_resolved_parent_versions(&selected_mods, &compatible_versions);
-    let selected_mod_ids: HashSet<String> = selected_mods.iter().map(|s| s.mod_id.clone()).collect();
-    let dependency_resolution =
-        resolve_required_dependencies_with_client(&parent_versions, &target, &modrinth_client, &selected_mod_ids)
+    launch_log_session.write_selected_mods(&selected_mods)?;
+    if selected_mods.len() > 300 {
+        let detail = if effective_settings.cache_only_mode {
+            "You have more than 300 mods. The first launch may still take 1-2 minutes, but cache-only mode is already enabled for future launches."
+        } else {
+            "You have more than 300 mods. The first launch may take 1-2 minutes due to API rate limits. You can enable \"Cache-Only Mode\" in Settings to skip API checks on future launches."
+        };
+        emit_launcher_issue(
+            &app_handle,
+            "Large modpack detected",
+            "Launch preparation may take longer than usual.",
+            detail,
+            "warning",
+            "launch",
+        )?;
+    }
+
+    let (
+        all_remote_versions,
+        cached_remote_records,
+        dependency_resolution,
+        effective_required_java,
+    ) = if effective_settings.cache_only_mode {
+        emit_log(
+            &app_handle,
+            ProcessLogStream::Stdout,
+            "[Cache] Cache-only mode enabled. Reusing cached artifacts only; uncached mods and dependencies will be skipped."
+                .to_string(),
+        )?;
+
+        let parent_artifacts =
+            resolve_selected_remote_artifacts(&launcher_paths, &selected_mods, &target).await?;
+        let parent_artifact_values = parent_artifacts.into_values().collect::<Vec<_>>();
+        let (parent_versions, cached_parent_records) =
+            split_remote_artifacts(&parent_artifact_values);
+        let selected_project_ids = collect_selected_project_ids(&parent_versions);
+
+        let mut dependency_requests = collect_required_dependency_requests(&parent_versions)?;
+        let cached_parent_ids = cached_parent_records
+            .iter()
+            .map(|record| record.modrinth_project_id.clone())
+            .collect::<Vec<_>>();
+        dependency_requests.extend(load_cached_dependency_requests(
+            &launcher_paths,
+            &cached_parent_ids,
+        )?);
+
+        let (dependency_resolution, dependency_artifacts) =
+            resolve_dependency_requests_with_cache_fallback(
+                &launcher_paths,
+                &dependency_requests,
+                &selected_project_ids,
+                &target,
+            )
             .await?;
 
-    // Remove parent mods whose required dependencies are not available for
-    // this target — they cannot run without them, so skip them entirely.
-    let parent_versions: Vec<_> = if dependency_resolution.excluded_parents.is_empty() {
-        parent_versions
-    } else {
-        for excluded_id in &dependency_resolution.excluded_parents {
-            emit_log(
-                &app_handle,
-                ProcessLogStream::Stdout,
-                format!(
-                    "[Launch] skipping mod '{}': a required dependency has no compatible version for this target",
-                    excluded_id
-                ),
-            )?;
+        if !dependency_resolution.excluded_parents.is_empty() {
+            for excluded_id in &dependency_resolution.excluded_parents {
+                emit_log(
+                        &app_handle,
+                        ProcessLogStream::Stdout,
+                        format!(
+                            "[Launch] skipping mod '{}': a required dependency has no compatible version for this target",
+                            excluded_id
+                        ),
+                    )?;
+            }
         }
-        parent_versions
-            .into_iter()
-            .filter(|v| !dependency_resolution.excluded_parents.contains(&v.project_id))
-            .collect()
-    };
 
-    let dependency_versions = fetch_dependency_versions(
-        &dependency_resolution.resolved_dependencies,
-        &modrinth_client,
-    )
-    .await?;
-    let all_remote_versions = deduplicate_versions(parent_versions, dependency_versions);
+        let filtered_parent_artifacts = parent_artifact_values
+            .into_iter()
+            .filter(|artifact| {
+                !dependency_resolution
+                    .excluded_parents
+                    .contains(remote_artifact_project_id(artifact))
+            })
+            .collect::<Vec<_>>();
+        let mut all_artifacts = filtered_parent_artifacts;
+        all_artifacts.extend(dependency_artifacts);
+        let (live_versions, cached_records) = split_remote_artifacts(&all_artifacts);
+        (
+            live_versions,
+            cached_records,
+            dependency_resolution,
+            required_java_version_for_minecraft(&target.minecraft_version)?,
+        )
+    } else {
+        let compatible_versions = prefetch_ranked_versions_for_selected(
+            &app_handle,
+            &selected_mods,
+            &modrinth_client,
+            &target,
+        )
+        .await?;
+        let top_level_candidates =
+            collect_top_level_version_candidates(&selected_mods, &compatible_versions);
+        let mut current_candidate_indexes = top_level_candidates
+            .iter()
+            .map(|entry| (entry.project_id.clone(), 0usize))
+            .collect::<HashMap<_, _>>();
+        let selected_mod_ids_by_project = top_level_candidates
+            .iter()
+            .map(|entry| (entry.project_id.clone(), entry.selected_mod_id.clone()))
+            .collect::<HashMap<_, _>>();
+        let mut excluded_parent_ids = HashSet::new();
+        let mut exclusion_reasons = HashMap::new();
+        let mut retry_states = HashMap::<String, FabricIssueRetryState>::new();
+        let max_same_issue_retries = 2usize;
+        let (
+            mut dependency_resolution,
+            final_parent_versions,
+            mut final_dependency_versions,
+            metadata_required_java,
+            excluded_parent_ids,
+            excluded_dependency_ids,
+            fabric_validation_issues,
+        ) = loop {
+            let parent_versions = top_level_candidates
+                .iter()
+                .filter(|entry| !excluded_parent_ids.contains(&entry.project_id))
+                .filter_map(|entry| {
+                    entry.candidates.get(
+                        *current_candidate_indexes
+                            .get(&entry.project_id)
+                            .unwrap_or(&0usize),
+                    )
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let selected_parent_versions = parent_versions
+                .iter()
+                .map(|version| (version.project_id.clone(), version.clone()))
+                .collect::<HashMap<_, _>>();
+            let selected_project_ids = collect_selected_project_ids(&parent_versions);
+            let exact_conflict_excluded = validate_selected_parent_dependencies(
+                &parent_versions,
+                &selected_parent_versions,
+                &selected_project_ids,
+            );
+            let resolved_dependencies = resolve_required_dependencies_with_client(
+                &parent_versions,
+                &target,
+                &modrinth_client,
+                &selected_project_ids,
+            )
+            .await?;
+            let mut dependency_versions = fetch_dependency_versions(
+                &resolved_dependencies.resolved_dependencies,
+                &modrinth_client,
+            )
+            .await?;
+            let mut resolved_dependencies = resolved_dependencies;
+            resolve_embedded_metadata_dependencies(
+                &app_handle,
+                &launcher_paths,
+                &http_client,
+                &modrinth_client,
+                &target,
+                &parent_versions,
+                &mut dependency_versions,
+                &mut resolved_dependencies,
+            )
+            .await?;
+            suppress_redundant_bundled_dependencies(
+                &app_handle,
+                &launcher_paths,
+                &http_client,
+                &target,
+                &parent_versions,
+                &mut dependency_versions,
+                &mut resolved_dependencies,
+            )
+            .await?;
+            let (incompatible_parent_projects, parent_required_java) =
+                inspect_remote_versions_for_launch(
+                    &launcher_paths,
+                    &http_client,
+                    &parent_versions,
+                    &target,
+                )
+                .await?;
+            let (incompatible_dependency_projects, dependency_required_java) =
+                inspect_remote_versions_for_launch(
+                    &launcher_paths,
+                    &http_client,
+                    &dependency_versions,
+                    &target,
+                )
+                .await?;
+            let owner_map =
+                build_top_level_owner_map(&parent_versions, &resolved_dependencies.links);
+            let mut fabric_validation_issues = if target.mod_loader == ModLoader::Fabric {
+                let all_versions =
+                    deduplicate_versions(parent_versions.clone(), dependency_versions.clone());
+                let metadata_entries = load_embedded_fabric_metadata_for_versions(
+                    &launcher_paths,
+                    &http_client,
+                    &all_versions,
+                    &target,
+                )
+                .await?;
+                let parent_root_metadata = load_root_fabric_metadata_for_versions(
+                    &launcher_paths,
+                    &http_client,
+                    &parent_versions,
+                    &target,
+                )
+                .await?;
+                let mut issues = validate_root_parent_fabric_runtime(
+                    &parent_root_metadata,
+                    &metadata_entries,
+                );
+                issues.extend(validate_final_fabric_runtime(&metadata_entries, &owner_map));
+                issues
+            } else {
+                HashMap::new()
+            };
+            for project_id in &incompatible_parent_projects {
+                fabric_validation_issues
+                    .entry(project_id.clone())
+                    .or_insert_with(|| FabricValidationIssue {
+                        reason_code: "embedded_version_incompatible",
+                        owner_project_id: project_id.clone(),
+                        mod_id: project_id.clone(),
+                        dependency_id: None,
+                        detail: format!(
+                            "the selected jar is incompatible with {} / {}",
+                            target.minecraft_version,
+                            target.mod_loader.as_modrinth_loader()
+                        ),
+                    });
+            }
+            for project_id in &resolved_dependencies.excluded_parents {
+                if let Some(top_level_owners) = owner_map.get(project_id) {
+                    for top_level_owner in top_level_owners {
+                        fabric_validation_issues
+                            .entry(top_level_owner.clone())
+                            .or_insert_with(|| FabricValidationIssue {
+                                reason_code: "missing_dependency",
+                                owner_project_id: project_id.clone(),
+                                mod_id: project_id.clone(),
+                                dependency_id: None,
+                                detail:
+                                    "a required dependency has no compatible version for this target"
+                                        .into(),
+                            });
+                    }
+                }
+            }
+            for project_id in &exact_conflict_excluded {
+                fabric_validation_issues
+                    .entry(project_id.clone())
+                    .or_insert_with(|| FabricValidationIssue {
+                        reason_code: "exact_dependency_conflict",
+                        owner_project_id: project_id.clone(),
+                        mod_id: project_id.clone(),
+                        dependency_id: None,
+                        detail: "an exact dependency version conflicts with an already-selected mod"
+                            .into(),
+                    });
+            }
+            for dependency_id in &incompatible_dependency_projects {
+                if let Some(top_level_owners) = owner_map.get(dependency_id) {
+                    for top_level_owner in top_level_owners {
+                        fabric_validation_issues
+                            .entry(top_level_owner.clone())
+                            .or_insert_with(|| FabricValidationIssue {
+                                reason_code: "embedded_version_incompatible",
+                                owner_project_id: dependency_id.clone(),
+                                mod_id: dependency_id.clone(),
+                                dependency_id: Some(dependency_id.clone()),
+                                detail: format!(
+                                    "a required dependency jar is incompatible with {} / {}",
+                                    target.minecraft_version,
+                                    target.mod_loader.as_modrinth_loader()
+                                ),
+                            });
+                    }
+                }
+            }
+            let mut advanced_parent_ids = HashSet::new();
+            let mut next_excluded_parent_ids = excluded_parent_ids.clone();
+
+            if let Some((project_id, issue)) = choose_primary_fabric_issue(&fabric_validation_issues)
+            {
+                let issue_signature = fabric_issue_signature(issue);
+                let retry_state = retry_states
+                    .entry(project_id.clone())
+                    .or_insert_with(|| FabricIssueRetryState {
+                        signature: issue_signature.clone(),
+                        consecutive_attempts: 0,
+                    });
+                if retry_state.signature == issue_signature {
+                    retry_state.consecutive_attempts += 1;
+                } else {
+                    retry_state.signature = issue_signature.clone();
+                    retry_state.consecutive_attempts = 1;
+                }
+
+                let should_retry_older_version =
+                    retry_state.consecutive_attempts <= max_same_issue_retries;
+
+                if should_retry_older_version {
+                    if let Some(candidate_entry) = top_level_candidates
+                        .iter()
+                        .find(|entry| entry.project_id == *project_id)
+                    {
+                        let current_index = current_candidate_indexes
+                            .entry(project_id.clone())
+                            .or_insert(0usize);
+                        if *current_index + 1 < candidate_entry.candidates.len() {
+                            *current_index += 1;
+                            advanced_parent_ids.insert(project_id.clone());
+                            let selected_mod_id = selected_mod_ids_by_project
+                                .get(project_id)
+                                .cloned()
+                                .unwrap_or_else(|| project_id.clone());
+                            let next_version = &candidate_entry.candidates[*current_index];
+                            emit_log(
+                                &app_handle,
+                                ProcessLogStream::Stdout,
+                                format!(
+                                    "[Launch] retrying mod '{}' with older compatible version '{}'",
+                                    selected_mod_id, next_version.version_number
+                                ),
+                            )?;
+                        }
+                    }
+                }
+
+                if advanced_parent_ids.is_empty() {
+                    next_excluded_parent_ids.insert(project_id.clone());
+                    exclusion_reasons
+                        .entry(project_id.clone())
+                        .or_insert_with(|| issue.clone());
+
+                    if retry_state.consecutive_attempts > max_same_issue_retries {
+                        emit_log(
+                            &app_handle,
+                            ProcessLogStream::Stdout,
+                            format!(
+                                "[Launch] excluding mod '{}': the same Fabric compatibility issue persisted across older versions ({})",
+                                selected_mod_ids_by_project
+                                    .get(project_id)
+                                    .cloned()
+                                    .unwrap_or_else(|| project_id.clone()),
+                                issue.reason_code
+                            ),
+                        )?;
+                    }
+                }
+            }
+
+            if advanced_parent_ids.is_empty() && next_excluded_parent_ids == excluded_parent_ids {
+                break (
+                    resolved_dependencies,
+                    parent_versions,
+                    dependency_versions,
+                    parent_required_java.max(dependency_required_java),
+                    next_excluded_parent_ids,
+                    incompatible_dependency_projects,
+                    exclusion_reasons.clone(),
+                );
+            }
+
+            excluded_parent_ids = next_excluded_parent_ids;
+        };
+
+        final_dependency_versions.retain(|version| {
+            !excluded_dependency_ids.contains(&version.project_id)
+                && !dependency_resolution
+                    .excluded_parents
+                    .contains(&version.project_id)
+        });
+        let allowed_dependency_ids = final_dependency_versions
+            .iter()
+            .map(|version| version.project_id.clone())
+            .collect::<HashSet<_>>();
+        dependency_resolution
+            .resolved_dependencies
+            .retain(|dependency| allowed_dependency_ids.contains(&dependency.dependency_id));
+        dependency_resolution.links.retain(|link| {
+            !excluded_parent_ids.contains(&link.parent_mod_id)
+                && allowed_dependency_ids.contains(&link.dependency_id)
+        });
+
+        for excluded_id in &excluded_parent_ids {
+            if let Some(issue) = fabric_validation_issues.get(excluded_id) {
+                emit_log(
+                    &app_handle,
+                    ProcessLogStream::Stdout,
+                    format!(
+                        "[Launch] skipping mod '{}': {} ({})",
+                        excluded_id, issue.detail, issue.reason_code
+                    ),
+                )?;
+            } else if dependency_resolution.excluded_parents.contains(excluded_id) {
+                emit_log(
+                    &app_handle,
+                    ProcessLogStream::Stdout,
+                    format!(
+                        "[Launch] skipping mod '{}': a required dependency has no compatible version for this target",
+                        excluded_id
+                    ),
+                )?;
+            } else {
+                emit_log(
+                    &app_handle,
+                    ProcessLogStream::Stdout,
+                    format!(
+                        "[Launch] skipping mod '{}': embedded metadata is incompatible with {} / {}",
+                        excluded_id,
+                        target.minecraft_version,
+                        target.mod_loader.as_modrinth_loader()
+                    ),
+                )?;
+            }
+        }
+        launch_log_session.append_summary_line(&format!(
+            "excluded_top_level_mods={}",
+            excluded_parent_ids.len()
+        ))?;
+        let mut excluded_with_reasons = fabric_validation_issues
+            .iter()
+            .map(|(project_id, issue)| {
+                format!(
+                    "excluded_mod={} reason={} detail={}",
+                    project_id, issue.reason_code, issue.detail
+                )
+            })
+            .collect::<Vec<_>>();
+        excluded_with_reasons.sort();
+        for line in excluded_with_reasons {
+            launch_log_session.append_summary_line(&line)?;
+        }
+
+        (
+            deduplicate_versions(final_parent_versions, final_dependency_versions),
+            Vec::new(),
+            dependency_resolution,
+            metadata_required_java,
+        )
+    };
+    launch_log_session.write_dependency_summary(&dependency_resolution)?;
+    launch_log_session.write_resolved_versions(&all_remote_versions, &cached_remote_records)?;
+    launch_log_session.append_summary_line(&format!(
+        "cache_only_mode={}",
+        effective_settings.cache_only_mode
+    ))?;
+    launch_log_session.append_summary_line(&format!("selected_mods={}", selected_mods.len()))?;
+    launch_log_session.append_summary_line(&format!(
+        "resolved_remote_versions={}",
+        all_remote_versions.len()
+    ))?;
+    launch_log_session.append_summary_line(&format!(
+        "resolved_cached_records={}",
+        cached_remote_records.len()
+    ))?;
+    launch_log_session.append_summary_line(&format!(
+        "required_java_before_loader={}",
+        effective_required_java
+    ))?;
 
     emit_progress(
         &app_handle,
@@ -295,8 +1740,16 @@ async fn run_launch_pipeline(
         "Inspecting cached mods and downloading missing dependencies.",
     )?;
 
-    let acquisition_plan =
-        build_remote_acquisition_plan(&launcher_paths, &all_remote_versions, &target)?;
+    let acquisition_plan = if effective_settings.cache_only_mode {
+        build_remote_acquisition_plan_from_artifacts(
+            &launcher_paths,
+            &all_remote_versions,
+            &cached_remote_records,
+            &target,
+        )?
+    } else {
+        build_remote_acquisition_plan(&launcher_paths, &all_remote_versions, &target)?
+    };
     emit_log(
         &app_handle,
         ProcessLogStream::Stdout,
@@ -306,6 +1759,7 @@ async fn run_launch_pipeline(
             acquisition_plan.to_download.len()
         ),
     )?;
+    launch_log_session.write_cache_plan(&acquisition_plan)?;
 
     download_pending_artifacts(
         &app_handle,
@@ -372,10 +1826,20 @@ async fn run_launch_pipeline(
     std::fs::create_dir_all(&instance_natives_dir)
         .with_context(|| format!("failed to create {}", instance_natives_dir.display()))?;
 
+    let cached_mod_jars = build_cached_mod_jars(
+        &app_handle,
+        &selected_mods,
+        &all_remote_versions,
+        &cached_remote_records,
+        &target,
+        &launcher_paths,
+        &modlist_name,
+    )?;
+    launch_log_session.write_final_mod_set(&cached_mod_jars)?;
     prepare_instance_mods_directory(
         launcher_paths.mods_cache_dir(),
         &instance_mods_dir,
-        &build_cached_mod_jars(&selected_mods, &all_remote_versions, &target, &launcher_paths, &modlist_name)?,
+        &cached_mod_jars,
     )?;
     prepare_instance_config_directory(
         launcher_paths.configs_cache_dir(),
@@ -392,7 +1856,8 @@ async fn run_launch_pipeline(
         &modlist_name,
         &target,
         &instance_root,
-    ).await?;
+    )
+    .await?;
 
     let mut loader_metadata = LoaderMetadataClient::new()
         .fetch_loader_metadata(&target.minecraft_version, target.mod_loader)
@@ -427,11 +1892,25 @@ async fn run_launch_pipeline(
         loader_metadata.game_arguments = mc_args;
     }
 
-    emit_progress(&app_handle, "resolving", 90, "Authenticating", "Refreshing Minecraft session...")?;
+    emit_progress(
+        &app_handle,
+        "resolving",
+        90,
+        "Authenticating",
+        "Refreshing Minecraft session...",
+    )?;
     let player_identity = load_player_identity(&launcher_paths).await?;
-    emit_log(&app_handle, ProcessLogStream::Stdout,
-        format!("[Auth] username={}, uuid={}, user_type={}, token_len={}",
-            player_identity.username, player_identity.uuid, player_identity.user_type, player_identity.access_token.len()))?;
+    emit_log(
+        &app_handle,
+        ProcessLogStream::Stdout,
+        format!(
+            "[Auth] username={}, uuid={}, user_type={}, token_len={}",
+            player_identity.username,
+            player_identity.uuid,
+            player_identity.user_type,
+            player_identity.access_token.len()
+        ),
+    )?;
     let placeholders = LaunchPlaceholders::new(
         &player_identity,
         &modlist_name,
@@ -444,7 +1923,35 @@ async fn run_launch_pipeline(
     );
     substitute_loader_placeholders(&mut loader_metadata, &placeholders);
 
-    let java_binary_path = select_or_download_java(&app_handle, &launcher_paths, &effective_settings, &target).await?;
+    let effective_required_java = effective_required_java.max(required_java_for_cached_mod_jars(
+        launcher_paths.mods_cache_dir(),
+        &cached_mod_jars,
+    )?);
+    let effective_required_java = effective_required_java.max(
+        loader_metadata
+            .min_java_version
+            .unwrap_or(effective_required_java),
+    );
+    emit_log(
+        &app_handle,
+        ProcessLogStream::Stdout,
+        format!(
+            "[Java] Effective runtime requirement is Java {}",
+            effective_required_java
+        ),
+    )?;
+    launch_log_session.append_summary_line(&format!(
+        "required_java_after_loader={}",
+        effective_required_java
+    ))?;
+    let java_binary_path = select_or_download_java(
+        &app_handle,
+        &launcher_paths,
+        &effective_settings,
+        &target,
+        effective_required_java,
+    )
+    .await?;
     emit_log(
         &app_handle,
         ProcessLogStream::Stdout,
@@ -459,16 +1966,20 @@ async fn run_launch_pipeline(
             // provide the same artifact (e.g. ASM). We deduplicate by jar
             // stem prefix: "asm-9.9.jar" and "asm-9.6.jar" share stem "asm",
             // so the loader version wins.
-            let loader_artifacts: std::collections::HashSet<String> = loader_library_paths.iter()
+            let loader_artifacts: std::collections::HashSet<String> = loader_library_paths
+                .iter()
                 .filter_map(|p| {
                     p.file_name()
                         .and_then(|n| n.to_str())
                         .map(|n| extract_artifact_name(n))
                 })
                 .collect();
-            let mut entries: Vec<PathBuf> = mc_data.library_paths.iter()
+            let mut entries: Vec<PathBuf> = mc_data
+                .library_paths
+                .iter()
                 .filter(|p| {
-                    let dominated = p.file_name()
+                    let dominated = p
+                        .file_name()
                         .and_then(|n| n.to_str())
                         .map(|n| loader_artifacts.contains(&extract_artifact_name(n)))
                         .unwrap_or(false);
@@ -492,7 +2003,10 @@ async fn run_launch_pipeline(
         config_attribution: None,
     })?;
 
-    let sink: Arc<dyn ProcessEventSink> = Arc::new(TauriProcessEventSink::new(app_handle.clone()));
+    let sink: Arc<dyn ProcessEventSink> = Arc::new(LoggingProcessEventSink::new(
+        app_handle.clone(),
+        launch_log_session.clone(),
+    ));
     let process = spawn_and_stream_process(prepared_command, sink)?;
 
     let pid = process.pid;
@@ -516,16 +2030,14 @@ async fn run_launch_pipeline(
     tauri::async_runtime::spawn_blocking(move || {
         let _ = process.wait();
         *ACTIVE_MC_PID.lock().unwrap() = None;
-        let _ = emit_progress(
-            &app_for_wait,
-            "idle",
-            0,
-            "Ready",
-            "Minecraft has exited.",
-        );
+        set_active_launch_log_session(None);
+        let _ = emit_progress(&app_for_wait, "idle", 0, "Ready", "Minecraft has exited.");
     });
 
-    Ok(())
+    Ok(StartedLaunch {
+        pid,
+        launch_log_dir: launch_log_session.dir().to_path_buf(),
+    })
 }
 
 impl EffectiveLaunchSettings {
@@ -541,6 +2053,8 @@ impl EffectiveLaunchSettings {
             .to_string();
         let java_path_override = global.java_path_override.trim();
 
+        let cache_only_mode = automation_cache_only_override().unwrap_or(global.cache_only_mode);
+
         Self {
             min_ram_mb: overrides.min_ram_mb.unwrap_or(global.min_ram_mb),
             max_ram_mb: overrides.max_ram_mb.unwrap_or(global.max_ram_mb),
@@ -548,6 +2062,7 @@ impl EffectiveLaunchSettings {
                 .custom_jvm_args
                 .clone()
                 .unwrap_or_else(|| global.custom_jvm_args.clone()),
+            cache_only_mode,
             wrapper_command: if wrapper_command.is_empty() {
                 None
             } else {
@@ -559,6 +2074,15 @@ impl EffectiveLaunchSettings {
                 Some(PathBuf::from(java_path_override))
             },
         }
+    }
+}
+
+fn automation_cache_only_override() -> Option<bool> {
+    let value = std::env::var("CUBIC_AUTOMATION_CACHE_ONLY_MODE").ok()?;
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" => Some(true),
+        "0" | "false" | "off" => Some(false),
+        _ => None,
     }
 }
 
@@ -615,7 +2139,11 @@ fn extract_artifact_name(filename: &str) -> String {
     let stem = filename.strip_suffix(".jar").unwrap_or(filename);
     // Find the last '-' followed by a digit — everything before it is the artifact name
     if let Some(pos) = stem.rfind(|c: char| c == '-').and_then(|i| {
-        if stem[i + 1..].starts_with(|c: char| c.is_ascii_digit()) { Some(i) } else { None }
+        if stem[i + 1..].starts_with(|c: char| c.is_ascii_digit()) {
+            Some(i)
+        } else {
+            None
+        }
     }) {
         stem[..pos].to_string()
     } else {
@@ -649,12 +2177,13 @@ fn load_modlist(launcher_paths: &LauncherPaths, modlist_name: &str) -> Result<Mo
     })
 }
 
-
 /// Fetch compatible versions only for the mods that were actually selected by resolution.
 /// Network/API errors for individual mods are treated as "no compatible version"
 /// so that the re-resolution pass can disable them and try alternatives.
 async fn prefetch_compatible_versions_for_selected(
     app_handle: &tauri::AppHandle,
+    launcher_paths: &LauncherPaths,
+    http_client: &reqwest::Client,
     selected_mods: &[SelectedMod],
     client: &ModrinthClient,
     target: &ResolutionTarget,
@@ -668,9 +2197,15 @@ async fn prefetch_compatible_versions_for_selected(
         if versions.contains_key(&selected.mod_id) {
             continue;
         }
-        match client
-            .fetch_latest_compatible_version(&selected.mod_id, target)
-            .await
+        match select_latest_launch_compatible_version(
+            app_handle,
+            launcher_paths,
+            http_client,
+            client,
+            &selected.mod_id,
+            target,
+        )
+        .await
         {
             Ok(Some(version)) => {
                 versions.insert(selected.mod_id.clone(), version);
@@ -681,7 +2216,7 @@ async fn prefetch_compatible_versions_for_selected(
                     app_handle,
                     ProcessLogStream::Stderr,
                     format!(
-                        "[Launch] skipping mod '{}': failed to query Modrinth ({})",
+                        "[Launch] skipping mod '{}': failed to query Modrinth ({:#})",
                         selected.mod_id, err
                     ),
                 );
@@ -692,17 +2227,152 @@ async fn prefetch_compatible_versions_for_selected(
     Ok(versions)
 }
 
+async fn prefetch_ranked_versions_for_selected(
+    app_handle: &tauri::AppHandle,
+    selected_mods: &[SelectedMod],
+    client: &ModrinthClient,
+    target: &ResolutionTarget,
+) -> Result<HashMap<String, Vec<ModrinthVersion>>> {
+    let mut versions = HashMap::new();
+
+    for selected in selected_mods {
+        if !matches!(selected.source, ModSource::Modrinth) || versions.contains_key(&selected.mod_id)
+        {
+            continue;
+        }
+
+        match client.fetch_project_versions(&selected.mod_id, target).await {
+            Ok(mut candidate_versions) => {
+                crate::modrinth::sort_versions_by_target_preference(&mut candidate_versions, target);
+                if !candidate_versions.is_empty() {
+                    versions.insert(selected.mod_id.clone(), candidate_versions);
+                }
+            }
+            Err(err) => {
+                let _ = emit_log(
+                    app_handle,
+                    ProcessLogStream::Stderr,
+                    format!(
+                        "[Launch] skipping mod '{}': failed to query Modrinth ({:#})",
+                        selected.mod_id, err
+                    ),
+                );
+            }
+        }
+    }
+
+    Ok(versions)
+}
+
+async fn select_latest_launch_compatible_version(
+    app_handle: &tauri::AppHandle,
+    launcher_paths: &LauncherPaths,
+    http_client: &reqwest::Client,
+    client: &ModrinthClient,
+    project_id_or_slug: &str,
+    target: &ResolutionTarget,
+) -> Result<Option<ModrinthVersion>> {
+    Ok(select_launch_compatible_versions(
+        app_handle,
+        launcher_paths,
+        http_client,
+        client,
+        project_id_or_slug,
+        target,
+    )
+    .await?
+    .into_iter()
+    .next())
+}
+
+async fn select_launch_compatible_versions(
+    app_handle: &tauri::AppHandle,
+    launcher_paths: &LauncherPaths,
+    http_client: &reqwest::Client,
+    client: &ModrinthClient,
+    project_id_or_slug: &str,
+    target: &ResolutionTarget,
+) -> Result<Vec<ModrinthVersion>> {
+    let mut versions = client
+        .fetch_project_versions(project_id_or_slug, target)
+        .await?;
+    crate::modrinth::sort_versions_by_target_preference(&mut versions, target);
+
+    let mut compatible_versions = Vec::new();
+    for version in versions {
+        let jar_path = ensure_remote_version_cached(http_client, launcher_paths, &version, target)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to cache '{}' candidate version '{}'",
+                    project_id_or_slug, version.id
+                )
+            })?;
+        let requirements = read_embedded_fabric_requirements(&jar_path)?;
+        if requirements.entries.is_empty()
+            || embedded_minecraft_requirements_match(&requirements, target)
+        {
+            compatible_versions.push(version);
+            continue;
+        }
+
+        let _ = emit_log(
+            app_handle,
+            ProcessLogStream::Stdout,
+            format!(
+                "[Launch] skipping remote version '{}' for '{}': embedded metadata is incompatible with {} / {}",
+                version.version_number,
+                project_id_or_slug,
+                target.minecraft_version,
+                target.mod_loader.as_modrinth_loader()
+            ),
+        );
+    }
+
+    Ok(compatible_versions)
+}
+
+async fn ensure_remote_version_cached(
+    http_client: &reqwest::Client,
+    launcher_paths: &LauncherPaths,
+    version: &ModrinthVersion,
+    target: &ResolutionTarget,
+) -> Result<PathBuf> {
+    let record = cache_record_from_version(version, target)?;
+    let destination_path = launcher_paths.mods_cache_dir().join(&record.jar_filename);
+    if destination_path.exists() {
+        return Ok(destination_path);
+    }
+
+    let file = version.primary_file().with_context(|| {
+        format!(
+            "version '{}' for project '{}' does not expose a primary file",
+            version.id, version.project_id
+        )
+    })?;
+    match file.hashes.get("sha1").map(String::as_str) {
+        Some(hash) => {
+            crate::minecraft_downloader::download_file_verified(
+                http_client,
+                &file.url,
+                &destination_path,
+                hash,
+            )
+            .await?
+        }
+        None => download_file(http_client, &file.url, &destination_path).await?,
+    }
+
+    Ok(destination_path)
+}
+
 fn log_resolution(app_handle: &tauri::AppHandle, resolution: &ResolutionResult) -> Result<()> {
     for rule in &resolution.resolved_rules {
         match &rule.outcome {
             RuleOutcome::Resolved { resolved_id } => emit_log(
                 app_handle,
                 ProcessLogStream::Stdout,
-                format!(
-                    "[Resolver] {} -> {}",
-                    rule.mod_id,
-                    resolved_id,
-                ),
+                format!("[Resolver] {} -> {}", rule.mod_id, resolved_id,),
             )?,
             RuleOutcome::Unresolved { reason } => emit_log(
                 app_handle,
@@ -738,13 +2408,13 @@ fn collect_selected_mods(
     let mut selected = Vec::new();
 
     for (i, resolved) in resolution.resolved_rules.iter().enumerate() {
-        let Some(top_rule) = modlist.rules.get(i) else { continue };
+        let Some(top_rule) = modlist.rules.get(i) else {
+            continue;
+        };
 
         if let RuleOutcome::Resolved { resolved_id } = &resolved.outcome {
             // Find the actual rule (primary or any nested alternative) to get its source.
-            let rule = modlist
-                .find_rule(resolved_id)
-                .unwrap_or(top_rule);
+            let rule = modlist.find_rule(resolved_id).unwrap_or(top_rule);
             selected.push(SelectedMod {
                 mod_id: resolved_id.clone(),
                 source: rule.source.clone(),
@@ -753,6 +2423,62 @@ fn collect_selected_mods(
     }
 
     selected
+}
+
+fn remote_artifact_project_id(artifact: &RemoteArtifact) -> &str {
+    match artifact {
+        RemoteArtifact::Live(version) => &version.project_id,
+        RemoteArtifact::Cached(record) => &record.modrinth_project_id,
+    }
+}
+
+fn split_remote_artifacts(
+    artifacts: &[RemoteArtifact],
+) -> (Vec<ModrinthVersion>, Vec<ModCacheRecord>) {
+    let mut live_versions = Vec::new();
+    let mut cached_records = Vec::new();
+    let mut seen_version_ids = HashSet::new();
+
+    for artifact in artifacts {
+        match artifact {
+            RemoteArtifact::Live(version) => {
+                if seen_version_ids.insert(version.id.clone()) {
+                    live_versions.push(version.clone());
+                }
+            }
+            RemoteArtifact::Cached(record) => {
+                if seen_version_ids.insert(record.modrinth_version_id.clone()) {
+                    cached_records.push(record.clone());
+                }
+            }
+        }
+    }
+
+    (live_versions, cached_records)
+}
+
+async fn resolve_selected_remote_artifacts(
+    launcher_paths: &LauncherPaths,
+    selected_mods: &[SelectedMod],
+    target: &ResolutionTarget,
+) -> Result<HashMap<String, RemoteArtifact>> {
+    let mut artifacts = HashMap::new();
+
+    for selected in selected_mods {
+        if !matches!(selected.source, ModSource::Modrinth)
+            || artifacts.contains_key(&selected.mod_id)
+        {
+            continue;
+        }
+
+        if let Some(record) =
+            load_cached_mod_record_for_target(launcher_paths, &selected.mod_id, target)?
+        {
+            artifacts.insert(selected.mod_id.clone(), RemoteArtifact::Cached(record));
+        }
+    }
+
+    Ok(artifacts)
 }
 
 fn alt_viable_for_launch(
@@ -771,16 +2497,23 @@ fn alt_viable_for_launch(
         return false;
     }
     for vr in &rule.version_rules {
-        let version_matches = vr.mc_versions.iter().any(|v| crate::modrinth::mc_version_matches(v, &target.minecraft_version));
+        let version_matches = vr
+            .mc_versions
+            .iter()
+            .any(|v| crate::modrinth::mc_version_matches(v, &target.minecraft_version));
         let vr_loader = vr.loader.to_ascii_lowercase();
         let loader_matches =
             vr_loader == "any" || vr_loader == target.mod_loader.as_modrinth_loader();
         match vr.kind {
             VersionRuleKind::Only => {
-                if !(version_matches && loader_matches) { return false; }
+                if !(version_matches && loader_matches) {
+                    return false;
+                }
             }
             VersionRuleKind::Exclude => {
-                if version_matches && loader_matches { return false; }
+                if version_matches && loader_matches {
+                    return false;
+                }
             }
         }
     }
@@ -789,7 +2522,7 @@ fn alt_viable_for_launch(
 
 fn collect_resolved_parent_versions(
     selected_mods: &[SelectedMod],
-    compatible_versions: &HashMap<String, ModrinthVersion>,
+    compatible_versions: &HashMap<String, Vec<ModrinthVersion>>,
 ) -> Vec<ModrinthVersion> {
     let mut versions = Vec::new();
     let mut seen_projects = HashSet::new();
@@ -804,12 +2537,698 @@ fn collect_resolved_parent_versions(
         // Skip mods that have no compatible version on Modrinth for this
         // target — they were resolved by local rules but simply don't have
         // a release for this MC version + loader.
-        if let Some(version) = compatible_versions.get(&selected.mod_id) {
+        if let Some(version) = compatible_versions
+            .get(&selected.mod_id)
+            .and_then(|versions| versions.first())
+        {
             versions.push(version.clone());
         }
     }
 
     versions
+}
+
+fn collect_top_level_version_candidates(
+    selected_mods: &[SelectedMod],
+    compatible_versions: &HashMap<String, Vec<ModrinthVersion>>,
+) -> Vec<TopLevelVersionCandidates> {
+    let mut top_level_candidates = Vec::new();
+    let mut seen_selected_mod_ids = HashSet::new();
+
+    for selected in selected_mods {
+        if !matches!(selected.source, ModSource::Modrinth)
+            || !seen_selected_mod_ids.insert(selected.mod_id.clone())
+        {
+            continue;
+        }
+
+        let Some(candidates) = compatible_versions.get(&selected.mod_id) else {
+            continue;
+        };
+        let Some(first_candidate) = candidates.first() else {
+            continue;
+        };
+
+        top_level_candidates.push(TopLevelVersionCandidates {
+            selected_mod_id: selected.mod_id.clone(),
+            project_id: first_candidate.project_id.clone(),
+            candidates: candidates.clone(),
+        });
+    }
+
+    top_level_candidates
+}
+
+fn collect_selected_project_ids(parent_versions: &[ModrinthVersion]) -> HashSet<String> {
+    parent_versions
+        .iter()
+        .map(|version| version.project_id.clone())
+        .collect()
+}
+
+async fn inspect_remote_versions_for_launch(
+    launcher_paths: &LauncherPaths,
+    http_client: &reqwest::Client,
+    versions: &[ModrinthVersion],
+    target: &ResolutionTarget,
+) -> Result<(HashSet<String>, u32)> {
+    let mut incompatible_projects = HashSet::new();
+    let mut required_java = required_java_version_for_minecraft(&target.minecraft_version)?;
+
+    for version in versions {
+        let jar_path =
+            ensure_remote_version_cached(http_client, launcher_paths, version, target).await?;
+        let requirements = read_embedded_fabric_requirements(&jar_path)?;
+        if !embedded_minecraft_requirements_match(&requirements, target) {
+            incompatible_projects.insert(version.project_id.clone());
+            continue;
+        }
+        if let Some(min_java) = embedded_min_java_requirement(&requirements) {
+            required_java = required_java.max(min_java);
+        }
+    }
+
+    Ok((incompatible_projects, required_java))
+}
+
+async fn resolve_embedded_metadata_dependencies(
+    app_handle: &tauri::AppHandle,
+    launcher_paths: &LauncherPaths,
+    http_client: &reqwest::Client,
+    client: &ModrinthClient,
+    target: &ResolutionTarget,
+    parent_versions: &[ModrinthVersion],
+    dependency_versions: &mut Vec<ModrinthVersion>,
+    dependency_resolution: &mut DependencyResolution,
+) -> Result<()> {
+    let mut attempted_dependency_ids = HashSet::new();
+
+    loop {
+        let all_versions = deduplicate_versions(parent_versions.to_vec(), dependency_versions.clone());
+        let metadata_entries = load_embedded_fabric_metadata_for_versions(
+            launcher_paths,
+            http_client,
+            &all_versions,
+            target,
+        )
+        .await?;
+        let missing_dependencies = collect_missing_embedded_dependencies(&metadata_entries);
+        if missing_dependencies.is_empty() {
+            return Ok(());
+        }
+
+        let mut added_any = false;
+
+        for (logical_dependency_id, owners) in missing_dependencies {
+            if !attempted_dependency_ids.insert(logical_dependency_id.clone()) {
+                continue;
+            }
+
+            let existing_project_ids = all_versions
+                .iter()
+                .map(|version| version.project_id.as_str())
+                .collect::<HashSet<_>>();
+
+            let resolved_version = resolve_embedded_dependency_version(
+                app_handle,
+                launcher_paths,
+                http_client,
+                client,
+                target,
+                &logical_dependency_id,
+                &existing_project_ids,
+            )
+            .await?;
+
+            let Some(version) = resolved_version else {
+                let _ = emit_log(
+                    app_handle,
+                    ProcessLogStream::Stdout,
+                    format!(
+                        "[Dependencies] embedded dependency '{}' could not be resolved for {} / {}",
+                        logical_dependency_id,
+                        target.minecraft_version,
+                        target.mod_loader.as_modrinth_loader()
+                    ),
+                );
+                continue;
+            };
+
+            let primary_file = version.primary_file().with_context(|| {
+                format!(
+                    "embedded dependency '{}' version '{}' is missing a primary file",
+                    logical_dependency_id, version.id
+                )
+            })?;
+
+            if dependency_versions.iter().all(|candidate| candidate.id != version.id) {
+                dependency_versions.push(version.clone());
+            }
+
+            if dependency_resolution
+                .resolved_dependencies
+                .iter()
+                .all(|dependency| dependency.version_id != version.id)
+            {
+                dependency_resolution
+                    .resolved_dependencies
+                    .push(ResolvedDependency {
+                        dependency_id: version.project_id.clone(),
+                        version_id: version.id.clone(),
+                        jar_filename: primary_file.filename.clone(),
+                        download_url: primary_file.url.clone(),
+                        file_hash: primary_file.hashes.get("sha1").cloned(),
+                        date_published: version.date_published.clone(),
+                    });
+            }
+
+            for owner in owners {
+                let already_linked = dependency_resolution.links.iter().any(|link| {
+                    link.parent_mod_id == owner && link.dependency_id == version.project_id
+                });
+                if already_linked {
+                    continue;
+                }
+
+                dependency_resolution.links.push(DependencyLink {
+                    parent_mod_id: owner,
+                    dependency_id: version.project_id.clone(),
+                    specific_version: None,
+                    jar_filename: primary_file.filename.clone(),
+                });
+            }
+
+            let _ = emit_log(
+                app_handle,
+                ProcessLogStream::Stdout,
+                format!(
+                    "[Dependencies] added embedded dependency '{}' as '{}'",
+                    logical_dependency_id, version.project_id
+                ),
+            );
+            added_any = true;
+        }
+
+        if !added_any {
+            return Ok(());
+        }
+    }
+}
+
+async fn suppress_redundant_bundled_dependencies(
+    app_handle: &tauri::AppHandle,
+    launcher_paths: &LauncherPaths,
+    http_client: &reqwest::Client,
+    target: &ResolutionTarget,
+    parent_versions: &[ModrinthVersion],
+    dependency_versions: &mut Vec<ModrinthVersion>,
+    dependency_resolution: &mut DependencyResolution,
+) -> Result<()> {
+    let all_versions = deduplicate_versions(parent_versions.to_vec(), dependency_versions.clone());
+    let mut bundled_ids_by_project: HashMap<String, HashSet<String>> = HashMap::new();
+
+    for version in &all_versions {
+        let jar_path = ensure_remote_version_cached(http_client, launcher_paths, version, target)
+            .await?;
+        let bundled_ids = read_bundled_fabric_provided_ids(&jar_path)?;
+        if !bundled_ids.is_empty() {
+            bundled_ids_by_project.insert(version.project_id.clone(), bundled_ids);
+        }
+    }
+
+    if bundled_ids_by_project.is_empty() {
+        return Ok(());
+    }
+
+    let mut dependency_root_ids: HashMap<String, HashSet<String>> = HashMap::new();
+    for version in dependency_versions.iter() {
+        let jar_path = ensure_remote_version_cached(http_client, launcher_paths, version, target)
+            .await?;
+        let root_ids = read_root_fabric_provided_ids(&jar_path)?;
+        if !root_ids.is_empty() {
+            dependency_root_ids.insert(version.project_id.clone(), root_ids);
+        }
+    }
+
+    let mut removable_dependency_projects = HashSet::new();
+    for dependency_version in dependency_versions.iter() {
+        let Some(root_ids) = dependency_root_ids.get(&dependency_version.project_id) else {
+            continue;
+        };
+
+        let links = dependency_resolution
+            .links
+            .iter()
+            .filter(|link| {
+                link.dependency_id == dependency_version.project_id && link.specific_version.is_none()
+            })
+            .collect::<Vec<_>>();
+        if links.is_empty() {
+            continue;
+        }
+
+        let covered_by_bundled_parent = links.iter().all(|link| {
+            bundled_ids_by_project
+                .get(&link.parent_mod_id)
+                .is_some_and(|bundled_ids| root_ids.iter().any(|id| bundled_ids.contains(id)))
+        });
+        if !covered_by_bundled_parent {
+            continue;
+        }
+
+        removable_dependency_projects.insert(dependency_version.project_id.clone());
+        let _ = emit_log(
+            app_handle,
+            ProcessLogStream::Stdout,
+            format!(
+                "[Dependencies] dropped standalone dependency '{}' because all requiring parents already bundle it",
+                dependency_version.project_id
+            ),
+        );
+    }
+
+    if removable_dependency_projects.is_empty() {
+        return Ok(());
+    }
+
+    dependency_versions.retain(|version| !removable_dependency_projects.contains(&version.project_id));
+    dependency_resolution
+        .resolved_dependencies
+        .retain(|dependency| !removable_dependency_projects.contains(&dependency.dependency_id));
+    dependency_resolution
+        .links
+        .retain(|link| !removable_dependency_projects.contains(&link.dependency_id));
+
+    Ok(())
+}
+
+async fn load_embedded_fabric_metadata_for_versions(
+    launcher_paths: &LauncherPaths,
+    http_client: &reqwest::Client,
+    versions: &[ModrinthVersion],
+    target: &ResolutionTarget,
+) -> Result<Vec<OwnedEmbeddedFabricModMetadata>> {
+    let mut entries = Vec::new();
+
+    for version in versions {
+        let jar_path = ensure_remote_version_cached(http_client, launcher_paths, version, target)
+            .await?;
+        for metadata in read_embedded_fabric_mod_metadata(&jar_path)? {
+            entries.push(OwnedEmbeddedFabricModMetadata {
+                owner_project_id: version.project_id.clone(),
+                metadata,
+            });
+        }
+    }
+
+    Ok(entries)
+}
+
+async fn load_root_fabric_metadata_for_versions(
+    launcher_paths: &LauncherPaths,
+    http_client: &reqwest::Client,
+    versions: &[ModrinthVersion],
+    target: &ResolutionTarget,
+) -> Result<HashMap<String, EmbeddedFabricModMetadata>> {
+    let mut entries = HashMap::new();
+
+    for version in versions {
+        let jar_path = ensure_remote_version_cached(http_client, launcher_paths, version, target)
+            .await?;
+        if let Some(metadata) = read_root_fabric_mod_metadata(&jar_path)? {
+            entries.insert(version.project_id.clone(), metadata);
+        }
+    }
+
+    Ok(entries)
+}
+
+fn collect_missing_embedded_dependencies(
+    entries: &[OwnedEmbeddedFabricModMetadata],
+) -> Vec<(String, Vec<String>)> {
+    let mut provided_ids = HashSet::new();
+    for entry in entries {
+        if !entry.metadata.mod_id.trim().is_empty() {
+            provided_ids.insert(entry.metadata.mod_id.clone());
+        }
+        provided_ids.extend(entry.metadata.provides.iter().cloned());
+    }
+
+    let mut missing_by_dependency: HashMap<String, HashSet<String>> = HashMap::new();
+    for entry in entries {
+        for dependency_id in entry.metadata.depends.keys() {
+            if embedded_dependency_is_builtin(dependency_id) || provided_ids.contains(dependency_id) {
+                continue;
+            }
+            missing_by_dependency
+                .entry(dependency_id.clone())
+                .or_default()
+                .insert(entry.owner_project_id.clone());
+        }
+    }
+
+    let mut missing = missing_by_dependency
+        .into_iter()
+        .map(|(dependency_id, owners)| {
+            let mut owners = owners.into_iter().collect::<Vec<_>>();
+            owners.sort();
+            (dependency_id, owners)
+        })
+        .collect::<Vec<_>>();
+    missing.sort_by(|left, right| left.0.cmp(&right.0));
+    missing
+}
+
+fn build_top_level_owner_map(
+    parent_versions: &[ModrinthVersion],
+    dependency_links: &[DependencyLink],
+) -> HashMap<String, HashSet<String>> {
+    let mut owners = parent_versions
+        .iter()
+        .map(|version| {
+            (
+                version.project_id.clone(),
+                HashSet::from([version.project_id.clone()]),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+    loop {
+        let mut changed = false;
+
+        for link in dependency_links {
+            let parent_owners = owners
+                .get(&link.parent_mod_id)
+                .cloned()
+                .unwrap_or_default();
+            if parent_owners.is_empty() {
+                continue;
+            }
+
+            let dependency_owners = owners.entry(link.dependency_id.clone()).or_default();
+            let previous_len = dependency_owners.len();
+            dependency_owners.extend(parent_owners);
+            if dependency_owners.len() != previous_len {
+                changed = true;
+            }
+        }
+
+        if !changed {
+            return owners;
+        }
+    }
+}
+
+fn collect_top_level_owner_ids(
+    project_ids: &HashSet<String>,
+    owner_map: &HashMap<String, HashSet<String>>,
+) -> HashSet<String> {
+    let mut top_level_ids = HashSet::new();
+
+    for project_id in project_ids {
+        if let Some(owners) = owner_map.get(project_id) {
+            top_level_ids.extend(owners.iter().cloned());
+        }
+    }
+
+    top_level_ids
+}
+
+fn validate_final_fabric_runtime(
+    metadata_entries: &[OwnedEmbeddedFabricModMetadata],
+    owner_map: &HashMap<String, HashSet<String>>,
+) -> HashMap<String, FabricValidationIssue> {
+    let mut providers_by_id: HashMap<String, Vec<&OwnedEmbeddedFabricModMetadata>> = HashMap::new();
+    for entry in metadata_entries {
+        for provided_id in provided_ids_for_metadata(&entry.metadata) {
+            providers_by_id
+                .entry(provided_id)
+                .or_default()
+                .push(entry);
+        }
+    }
+
+    let mut issues = HashMap::new();
+    for entry in metadata_entries {
+        let Some(top_level_owners) = owner_map.get(&entry.owner_project_id) else {
+            continue;
+        };
+
+        for (dependency_id, predicates) in &entry.metadata.depends {
+            if embedded_dependency_is_builtin(dependency_id) {
+                continue;
+            }
+
+            let providers = providers_by_id.get(dependency_id);
+            let satisfied = providers.is_some_and(|providers| {
+                providers.iter().any(|provider| {
+                    fabric_dependency_predicates_match(
+                        predicates,
+                        &provider.metadata.version,
+                    )
+                })
+            });
+            if satisfied {
+                continue;
+            }
+
+            let reason_code = if providers.is_some() {
+                "incompatible_dependency_version"
+            } else {
+                "missing_dependency"
+            };
+            let detail = if providers.is_some() {
+                format!(
+                    "embedded metadata requires '{}' with a compatible version, but only incompatible versions are present",
+                    dependency_id
+                )
+            } else {
+                format!("embedded metadata requires '{}', which is missing", dependency_id)
+            };
+
+            for top_level_owner in top_level_owners {
+                issues.entry(top_level_owner.clone()).or_insert_with(|| FabricValidationIssue {
+                    reason_code,
+                    owner_project_id: entry.owner_project_id.clone(),
+                    mod_id: entry.metadata.mod_id.clone(),
+                    dependency_id: Some(dependency_id.clone()),
+                    detail: detail.clone(),
+                });
+            }
+        }
+
+        for (dependency_id, predicates) in &entry.metadata.breaks {
+            let Some(providers) = providers_by_id.get(dependency_id) else {
+                continue;
+            };
+            let Some(conflicting_provider) = providers.iter().find(|provider| {
+                fabric_dependency_predicates_match(predicates, &provider.metadata.version)
+            }) else {
+                continue;
+            };
+
+            let detail = format!(
+                "embedded metadata breaks '{}' version {}",
+                dependency_id, conflicting_provider.metadata.version
+            );
+            for top_level_owner in top_level_owners {
+                issues.entry(top_level_owner.clone()).or_insert_with(|| FabricValidationIssue {
+                    reason_code: "breaks_conflict",
+                    owner_project_id: entry.owner_project_id.clone(),
+                    mod_id: entry.metadata.mod_id.clone(),
+                    dependency_id: Some(dependency_id.clone()),
+                    detail: detail.clone(),
+                });
+            }
+        }
+    }
+
+    issues
+}
+
+fn validate_root_parent_fabric_runtime(
+    parent_metadata_by_project: &HashMap<String, EmbeddedFabricModMetadata>,
+    all_metadata_entries: &[OwnedEmbeddedFabricModMetadata],
+) -> HashMap<String, FabricValidationIssue> {
+    let mut providers_by_id: HashMap<String, Vec<&OwnedEmbeddedFabricModMetadata>> = HashMap::new();
+    for entry in all_metadata_entries {
+        for provided_id in provided_ids_for_metadata(&entry.metadata) {
+            providers_by_id
+                .entry(provided_id)
+                .or_default()
+                .push(entry);
+        }
+    }
+
+    let mut issues = HashMap::new();
+    for (project_id, metadata) in parent_metadata_by_project {
+        for (dependency_id, predicates) in &metadata.depends {
+            if embedded_dependency_is_builtin(dependency_id) {
+                continue;
+            }
+
+            let providers = providers_by_id.get(dependency_id);
+            let satisfied = providers.is_some_and(|providers| {
+                providers.iter().any(|provider| {
+                    fabric_dependency_predicates_match(
+                        predicates,
+                        &provider.metadata.version,
+                    )
+                })
+            });
+            if satisfied {
+                continue;
+            }
+
+            let reason_code = if providers.is_some() {
+                "incompatible_dependency_version"
+            } else {
+                "missing_dependency"
+            };
+            issues.insert(
+                project_id.clone(),
+                FabricValidationIssue {
+                    reason_code,
+                    owner_project_id: project_id.clone(),
+                    mod_id: metadata.mod_id.clone(),
+                    dependency_id: Some(dependency_id.clone()),
+                    detail: if providers.is_some() {
+                        format!(
+                            "embedded metadata requires '{}' with a compatible version, but only incompatible versions are present",
+                            dependency_id
+                        )
+                    } else {
+                        format!("embedded metadata requires '{}', which is missing", dependency_id)
+                    },
+                },
+            );
+            break;
+        }
+
+        if issues.contains_key(project_id) {
+            continue;
+        }
+
+        for (dependency_id, predicates) in &metadata.breaks {
+            let Some(providers) = providers_by_id.get(dependency_id) else {
+                continue;
+            };
+            let Some(conflicting_provider) = providers.iter().find(|provider| {
+                fabric_dependency_predicates_match(predicates, &provider.metadata.version)
+            }) else {
+                continue;
+            };
+
+            issues.insert(
+                project_id.clone(),
+                FabricValidationIssue {
+                    reason_code: "breaks_conflict",
+                    owner_project_id: project_id.clone(),
+                    mod_id: metadata.mod_id.clone(),
+                    dependency_id: Some(dependency_id.clone()),
+                    detail: format!(
+                        "embedded metadata breaks '{}' version {}",
+                        dependency_id, conflicting_provider.metadata.version
+                    ),
+                },
+            );
+            break;
+        }
+    }
+
+    issues
+}
+
+async fn resolve_embedded_dependency_version(
+    app_handle: &tauri::AppHandle,
+    launcher_paths: &LauncherPaths,
+    http_client: &reqwest::Client,
+    client: &ModrinthClient,
+    target: &ResolutionTarget,
+    logical_dependency_id: &str,
+    existing_project_ids: &HashSet<&str>,
+) -> Result<Option<ModrinthVersion>> {
+    for candidate_project_id in embedded_dependency_project_candidates(logical_dependency_id) {
+        if existing_project_ids.contains(candidate_project_id.as_str()) {
+            return Ok(None);
+        }
+
+        if let Some(version) = select_latest_launch_compatible_version(
+            app_handle,
+            launcher_paths,
+            http_client,
+            client,
+            &candidate_project_id,
+            target,
+        )
+        .await?
+        {
+            return Ok(Some(version));
+        }
+    }
+
+    Ok(None)
+}
+
+fn embedded_dependency_project_candidates(logical_dependency_id: &str) -> Vec<String> {
+    match logical_dependency_id {
+        "fabric" | "fabric-api" => vec!["fabric-api".to_string()],
+        other => vec![other.to_string()],
+    }
+}
+
+fn embedded_dependency_is_builtin(dependency_id: &str) -> bool {
+    matches!(
+        dependency_id.trim().to_ascii_lowercase().as_str(),
+        "minecraft" | "java" | "fabricloader" | "fabric-loader" | "quilt_loader" | "quiltloader"
+    )
+}
+
+fn validate_selected_parent_dependencies(
+    parent_versions: &[ModrinthVersion],
+    selected_parent_versions: &HashMap<String, ModrinthVersion>,
+    selected_project_ids: &HashSet<String>,
+) -> HashSet<String> {
+    let mut excluded_parents = HashSet::new();
+
+    for parent_version in parent_versions {
+        for dependency in &parent_version.dependencies {
+            if dependency.dependency_type != DependencyType::Required {
+                continue;
+            }
+
+            let Some(project_id) = dependency
+                .project_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+
+            if !selected_project_ids.contains(project_id) {
+                continue;
+            }
+
+            let Some(selected_version) = selected_parent_versions.get(project_id) else {
+                continue;
+            };
+
+            let exact_version_matches = dependency
+                .version_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_none_or(|version_id| version_id == selected_version.id);
+
+            if !exact_version_matches {
+                excluded_parents.insert(parent_version.project_id.clone());
+                break;
+            }
+        }
+    }
+
+    excluded_parents
 }
 
 async fn fetch_dependency_versions(
@@ -849,6 +3268,367 @@ fn deduplicate_versions(
     }
 
     versions
+}
+
+fn load_cached_mod_record_for_target(
+    launcher_paths: &LauncherPaths,
+    project_id: &str,
+    target: &ResolutionTarget,
+) -> Result<Option<ModCacheRecord>> {
+    let connection = Connection::open(launcher_paths.database_path()).with_context(|| {
+        format!(
+            "failed to open launcher database at {}",
+            launcher_paths.database_path().display()
+        )
+    })?;
+    let repository = SqliteModCacheRepository::new(&connection, launcher_paths.mods_cache_dir());
+    repository.find_compatible_by_project(project_id, target)
+}
+
+fn load_cached_mod_record_by_version(
+    launcher_paths: &LauncherPaths,
+    version_id: &str,
+) -> Result<Option<ModCacheRecord>> {
+    let connection = Connection::open(launcher_paths.database_path()).with_context(|| {
+        format!(
+            "failed to open launcher database at {}",
+            launcher_paths.database_path().display()
+        )
+    })?;
+    let repository = SqliteModCacheRepository::new(&connection, launcher_paths.mods_cache_dir());
+    repository.find_by_version_id(version_id)
+}
+
+fn load_cached_dependency_requests(
+    launcher_paths: &LauncherPaths,
+    parent_mod_ids: &[String],
+) -> Result<Vec<DependencyRequest>> {
+    if parent_mod_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let connection = Connection::open(launcher_paths.database_path()).with_context(|| {
+        format!(
+            "failed to open launcher database at {}",
+            launcher_paths.database_path().display()
+        )
+    })?;
+
+    let mut requests = Vec::new();
+    let mut statement = connection.prepare(
+        r#"
+        SELECT dependency_id, specific_version
+        FROM dependencies
+        WHERE mod_parent_id = ?1
+          AND dep_type = 'required'
+        ORDER BY dependency_id ASC
+        "#,
+    )?;
+
+    for parent_mod_id in parent_mod_ids {
+        let rows = statement.query_map([parent_mod_id.as_str()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+
+        for row in rows {
+            let (dependency_id, specific_version) = row?;
+            let selector = match specific_version {
+                Some(version_id) if !version_id.trim().is_empty() => {
+                    DependencySelector::VersionId { version_id }
+                }
+                _ => DependencySelector::ProjectId {
+                    project_id: dependency_id.clone(),
+                },
+            };
+
+            requests.push(DependencyRequest {
+                parent_mod_id: parent_mod_id.clone(),
+                selector,
+            });
+        }
+    }
+
+    Ok(requests)
+}
+
+fn resolved_dependency_from_cache_record(record: &ModCacheRecord) -> ResolvedDependency {
+    ResolvedDependency {
+        dependency_id: record.modrinth_project_id.clone(),
+        version_id: record.modrinth_version_id.clone(),
+        jar_filename: record.jar_filename.clone(),
+        download_url: record.download_url.clone().unwrap_or_default(),
+        file_hash: record.file_hash.clone(),
+        date_published: String::new(),
+    }
+}
+
+fn finalize_dependency_candidates(
+    candidates: Vec<DependencyResolutionCandidate>,
+    mut excluded_parents: HashSet<String>,
+) -> Result<(DependencyResolution, Vec<RemoteArtifact>)> {
+    loop {
+        let valid_candidates = candidates
+            .iter()
+            .filter(|candidate| !excluded_parents.contains(&candidate.parent_mod_id))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let (selected_by_dependency, newly_excluded_parents) =
+            select_cached_dependency_candidates(&valid_candidates);
+
+        if newly_excluded_parents.is_empty() {
+            return build_cached_dependency_resolution(
+                valid_candidates,
+                selected_by_dependency,
+                excluded_parents,
+            );
+        }
+
+        excluded_parents.extend(newly_excluded_parents);
+    }
+}
+
+fn select_cached_dependency_candidates(
+    candidates: &[DependencyResolutionCandidate],
+) -> (
+    HashMap<String, DependencyResolutionCandidate>,
+    HashSet<String>,
+) {
+    let mut groups: HashMap<String, Vec<&DependencyResolutionCandidate>> = HashMap::new();
+    for candidate in candidates {
+        groups
+            .entry(candidate.resolved_dependency.dependency_id.clone())
+            .or_default()
+            .push(candidate);
+    }
+
+    let mut selected_by_dependency = HashMap::new();
+    let mut excluded_parents = HashSet::new();
+
+    for (dependency_id, group) in groups {
+        let exact_candidates = group
+            .iter()
+            .copied()
+            .filter(|candidate| matches!(candidate.selector, DependencySelector::VersionId { .. }))
+            .collect::<Vec<_>>();
+
+        let selected = if exact_candidates.is_empty() {
+            group.into_iter().max_by(|left, right| {
+                left.resolved_dependency
+                    .date_published
+                    .cmp(&right.resolved_dependency.date_published)
+            })
+        } else {
+            let distinct_exact_versions = exact_candidates
+                .iter()
+                .map(|candidate| candidate.resolved_dependency.version_id.as_str())
+                .collect::<HashSet<_>>();
+
+            if distinct_exact_versions.len() > 1 {
+                for candidate in exact_candidates {
+                    excluded_parents.insert(candidate.parent_mod_id.clone());
+                }
+                None
+            } else {
+                exact_candidates.into_iter().max_by(|left, right| {
+                    left.resolved_dependency
+                        .date_published
+                        .cmp(&right.resolved_dependency.date_published)
+                })
+            }
+        };
+
+        if let Some(selected) = selected {
+            selected_by_dependency.insert(dependency_id, selected.clone());
+        }
+    }
+
+    for candidate in candidates {
+        let Some(selected) =
+            selected_by_dependency.get(&candidate.resolved_dependency.dependency_id)
+        else {
+            continue;
+        };
+
+        if matches!(candidate.selector, DependencySelector::VersionId { .. })
+            && selected.resolved_dependency.version_id != candidate.resolved_dependency.version_id
+        {
+            excluded_parents.insert(candidate.parent_mod_id.clone());
+        }
+    }
+
+    (selected_by_dependency, excluded_parents)
+}
+
+fn build_cached_dependency_resolution(
+    candidates: Vec<DependencyResolutionCandidate>,
+    selected_by_dependency: HashMap<String, DependencyResolutionCandidate>,
+    excluded_parents: HashSet<String>,
+) -> Result<(DependencyResolution, Vec<RemoteArtifact>)> {
+    let mut resolved_dependencies = selected_by_dependency
+        .values()
+        .map(|candidate| candidate.resolved_dependency.clone())
+        .collect::<Vec<_>>();
+    resolved_dependencies.sort_by(|left, right| left.dependency_id.cmp(&right.dependency_id));
+
+    let mut deduplicated_links = HashMap::new();
+    for candidate in candidates {
+        let Some(selected_candidate) =
+            selected_by_dependency.get(&candidate.resolved_dependency.dependency_id)
+        else {
+            continue;
+        };
+
+        if matches!(candidate.selector, DependencySelector::VersionId { .. })
+            && selected_candidate.resolved_dependency.version_id
+                != candidate.resolved_dependency.version_id
+        {
+            continue;
+        }
+
+        let selected_dependency = &selected_candidate.resolved_dependency;
+        let specific_version = match candidate.selector {
+            DependencySelector::ProjectId { .. } => None,
+            DependencySelector::VersionId { .. } => Some(selected_dependency.version_id.clone()),
+        };
+
+        deduplicated_links.insert(
+            (
+                candidate.parent_mod_id.clone(),
+                selected_dependency.dependency_id.clone(),
+            ),
+            DependencyLink {
+                parent_mod_id: candidate.parent_mod_id,
+                dependency_id: selected_dependency.dependency_id.clone(),
+                specific_version,
+                jar_filename: selected_dependency.jar_filename.clone(),
+            },
+        );
+    }
+
+    let mut links = deduplicated_links.into_values().collect::<Vec<_>>();
+    links.sort_by(|left, right| {
+        left.parent_mod_id
+            .cmp(&right.parent_mod_id)
+            .then(left.dependency_id.cmp(&right.dependency_id))
+    });
+
+    let artifacts = resolved_dependencies
+        .iter()
+        .filter_map(|dependency| {
+            selected_by_dependency
+                .get(&dependency.dependency_id)
+                .map(|candidate| candidate.artifact.clone())
+        })
+        .collect::<Vec<_>>();
+
+    Ok((
+        DependencyResolution {
+            resolved_dependencies,
+            links,
+            excluded_parents,
+        },
+        artifacts,
+    ))
+}
+
+async fn resolve_dependency_requests_with_cache_fallback(
+    launcher_paths: &LauncherPaths,
+    requests: &[DependencyRequest],
+    selected_mod_ids: &HashSet<String>,
+    target: &ResolutionTarget,
+) -> Result<(DependencyResolution, Vec<RemoteArtifact>)> {
+    let mut candidates = Vec::with_capacity(requests.len());
+    let mut excluded_parents = HashSet::new();
+
+    for request in requests {
+        if let DependencySelector::ProjectId { project_id } = &request.selector {
+            if selected_mod_ids.contains(project_id) {
+                continue;
+            }
+        }
+
+        if excluded_parents.contains(&request.parent_mod_id) {
+            continue;
+        }
+
+        let candidate = match &request.selector {
+            DependencySelector::ProjectId { project_id } => {
+                if let Some(record) =
+                    load_cached_mod_record_for_target(launcher_paths, project_id, target)?
+                {
+                    DependencyResolutionCandidate {
+                        parent_mod_id: request.parent_mod_id.clone(),
+                        selector: request.selector.clone(),
+                        resolved_dependency: resolved_dependency_from_cache_record(&record),
+                        artifact: RemoteArtifact::Cached(record),
+                    }
+                } else {
+                    excluded_parents.insert(request.parent_mod_id.clone());
+                    continue;
+                }
+            }
+            DependencySelector::VersionId { version_id } => {
+                if let Some(record) = load_cached_mod_record_by_version(launcher_paths, version_id)?
+                {
+                    DependencyResolutionCandidate {
+                        parent_mod_id: request.parent_mod_id.clone(),
+                        selector: request.selector.clone(),
+                        resolved_dependency: resolved_dependency_from_cache_record(&record),
+                        artifact: RemoteArtifact::Cached(record),
+                    }
+                } else {
+                    excluded_parents.insert(request.parent_mod_id.clone());
+                    continue;
+                }
+            }
+        };
+
+        candidates.push(candidate);
+    }
+
+    finalize_dependency_candidates(candidates, excluded_parents)
+}
+
+fn build_remote_acquisition_plan_from_artifacts(
+    launcher_paths: &LauncherPaths,
+    live_versions: &[ModrinthVersion],
+    cached_records: &[ModCacheRecord],
+    target: &ResolutionTarget,
+) -> Result<ModAcquisitionPlan> {
+    let connection = Connection::open(launcher_paths.database_path()).with_context(|| {
+        format!(
+            "failed to open launcher database at {}",
+            launcher_paths.database_path().display()
+        )
+    })?;
+    let repository = SqliteModCacheRepository::new(&connection, launcher_paths.mods_cache_dir());
+
+    let mut seen_version_ids = HashSet::new();
+    let mut cached = Vec::new();
+    let mut to_download = Vec::new();
+
+    for record in cached_records {
+        if seen_version_ids.insert(record.modrinth_version_id.clone()) {
+            cached.push(record.clone());
+        }
+    }
+
+    for version in live_versions {
+        if !seen_version_ids.insert(version.id.clone()) {
+            continue;
+        }
+
+        match repository.find_by_version_id(&version.id)? {
+            Some(record) => cached.push(record),
+            None => to_download.push(pending_download_from_version(version, target)?),
+        }
+    }
+
+    Ok(ModAcquisitionPlan {
+        cached,
+        to_download,
+    })
 }
 
 fn build_remote_acquisition_plan(
@@ -922,8 +3702,8 @@ async fn download_pending_artifacts(
 
     let mut completed: usize = 0;
     while let Some(join_result) = tasks.join_next().await {
-        let artifact = join_result
-            .map_err(|error| anyhow::anyhow!("download task panicked: {error}"))??;
+        let artifact =
+            join_result.map_err(|error| anyhow::anyhow!("download task panicked: {error}"))??;
         completed += 1;
 
         let progress = 42u8 + ((16usize * completed) / total) as u8;
@@ -1056,11 +3836,20 @@ fn build_instance_root(
 /// Checks whether a content entry is active for the current MC version + loader.
 fn is_content_entry_active(entry: &ContentEntry, mc_version: &str, loader: &str) -> bool {
     for rule in &entry.version_rules {
-        let version_match = rule.mc_versions.is_empty() || rule.mc_versions.iter().any(|v| v == mc_version);
+        let version_match =
+            rule.mc_versions.is_empty() || rule.mc_versions.iter().any(|v| v == mc_version);
         let loader_match = rule.loader == "any" || rule.loader.eq_ignore_ascii_case(loader);
         match rule.kind {
-            VersionRuleKind::Exclude => { if version_match && loader_match { return false; } }
-            VersionRuleKind::Only   => { if !(version_match && loader_match) { return false; } }
+            VersionRuleKind::Exclude => {
+                if version_match && loader_match {
+                    return false;
+                }
+            }
+            VersionRuleKind::Only => {
+                if !(version_match && loader_match) {
+                    return false;
+                }
+            }
         }
     }
     true
@@ -1078,16 +3867,19 @@ async fn resolve_and_install_content_packs(
 ) -> Result<()> {
     let modlist_dir = launcher_paths.modlists_dir().join(modlist_name);
     let cache_dir = launcher_paths.content_packs_cache_dir();
-    std::fs::create_dir_all(cache_dir)
-        .with_context(|| format!("failed to create content packs cache at {}", cache_dir.display()))?;
+    std::fs::create_dir_all(cache_dir).with_context(|| {
+        format!(
+            "failed to create content packs cache at {}",
+            cache_dir.display()
+        )
+    })?;
 
     let mc_version = &target.minecraft_version;
     let loader_str = target.mod_loader.as_modrinth_loader();
 
-    for (content_type, instance_subdir) in [
-        ("resourcepack", "resourcepacks"),
-        ("shader", "shaderpacks"),
-    ] {
+    for (content_type, instance_subdir) in
+        [("resourcepack", "resourcepacks"), ("shader", "shaderpacks")]
+    {
         let list = load_content_list(&modlist_dir, content_type).unwrap_or_else(|_| {
             crate::content_packs::ContentList {
                 content_type: content_type.to_string(),
@@ -1097,7 +3889,9 @@ async fn resolve_and_install_content_packs(
         });
 
         // Filter active entries
-        let active_entries: Vec<&ContentEntry> = list.entries.iter()
+        let active_entries: Vec<&ContentEntry> = list
+            .entries
+            .iter()
             .filter(|e| is_content_entry_active(e, mc_version, loader_str))
             .collect();
 
@@ -1107,7 +3901,9 @@ async fn resolve_and_install_content_packs(
             crate::instance_mods::clear_instance_mods_directory(&instance_dir)?;
         }
 
-        if active_entries.is_empty() { continue; }
+        if active_entries.is_empty() {
+            continue;
+        }
 
         std::fs::create_dir_all(&instance_dir)
             .with_context(|| format!("failed to create {}", instance_dir.display()))?;
@@ -1115,40 +3911,85 @@ async fn resolve_and_install_content_packs(
         for entry in &active_entries {
             if entry.source == "modrinth" {
                 // Fetch latest compatible version from Modrinth
-                match modrinth_client.fetch_content_pack_versions(&entry.id, mc_version).await {
+                match modrinth_client
+                    .fetch_content_pack_versions(&entry.id, mc_version)
+                    .await
+                {
                     Ok(versions) => {
                         // Pick the latest by date
-                        let best = versions.into_iter()
+                        let best = versions
+                            .into_iter()
                             .max_by(|a, b| a.date_published.cmp(&b.date_published));
                         if let Some(version) = best {
                             if let Some(file) = version.primary_file() {
                                 let cached_path = cache_dir.join(&file.filename);
                                 let was_cached = cached_path.exists();
                                 if !was_cached {
-                                    emit_log(app_handle, ProcessLogStream::Stdout,
-                                        format!("[Content] Downloading {} ({})", entry.id, file.filename))?;
-                                    download_file(http_client, &file.url, &cached_path).await
-                                        .with_context(|| format!("failed to download content pack '{}'", entry.id))?;
+                                    emit_log(
+                                        app_handle,
+                                        ProcessLogStream::Stdout,
+                                        format!(
+                                            "[Content] Downloading {} ({})",
+                                            entry.id, file.filename
+                                        ),
+                                    )?;
+                                    download_file(http_client, &file.url, &cached_path)
+                                        .await
+                                        .with_context(|| {
+                                            format!(
+                                                "failed to download content pack '{}'",
+                                                entry.id
+                                            )
+                                        })?;
                                 }
                                 let target_path = instance_dir.join(&file.filename);
                                 crate::instance_mods::create_file_link(&cached_path, &target_path)
-                                    .with_context(|| format!("failed to link content pack '{}' into instance", entry.id))?;
+                                    .with_context(|| {
+                                        format!(
+                                            "failed to link content pack '{}' into instance",
+                                            entry.id
+                                        )
+                                    })?;
                                 if was_cached {
-                                    emit_log(app_handle, ProcessLogStream::Stdout,
-                                        format!("[Content] {} → {} (cached)", entry.id, instance_subdir))?;
+                                    emit_log(
+                                        app_handle,
+                                        ProcessLogStream::Stdout,
+                                        format!(
+                                            "[Content] {} → {} (cached)",
+                                            entry.id, instance_subdir
+                                        ),
+                                    )?;
                                 } else {
-                                    emit_log(app_handle, ProcessLogStream::Stdout,
-                                        format!("[Content] Downloaded {} → {}", entry.id, instance_subdir))?;
+                                    emit_log(
+                                        app_handle,
+                                        ProcessLogStream::Stdout,
+                                        format!(
+                                            "[Content] Downloaded {} → {}",
+                                            entry.id, instance_subdir
+                                        ),
+                                    )?;
                                 }
                             }
                         } else {
-                            emit_log(app_handle, ProcessLogStream::Stdout,
-                                format!("[Content] No compatible version found for '{}' on {}", entry.id, mc_version))?;
+                            emit_log(
+                                app_handle,
+                                ProcessLogStream::Stdout,
+                                format!(
+                                    "[Content] No compatible version found for '{}' on {}",
+                                    entry.id, mc_version
+                                ),
+                            )?;
                         }
                     }
                     Err(e) => {
-                        emit_log(app_handle, ProcessLogStream::Stdout,
-                            format!("[Content] Failed to fetch versions for '{}': {}", entry.id, e))?;
+                        emit_log(
+                            app_handle,
+                            ProcessLogStream::Stdout,
+                            format!(
+                                "[Content] Failed to fetch versions for '{}': {}",
+                                entry.id, e
+                            ),
+                        )?;
                     }
                 }
             }
@@ -1166,7 +4007,9 @@ async fn resolve_and_install_content_packs(
                 groups: vec![],
             }
         });
-        let active_entries: Vec<&ContentEntry> = list.entries.iter()
+        let active_entries: Vec<&ContentEntry> = list
+            .entries
+            .iter()
             .filter(|e| is_content_entry_active(e, mc_version, loader_str))
             .collect();
 
@@ -1182,36 +4025,72 @@ async fn resolve_and_install_content_packs(
 
             for entry in &active_entries {
                 if entry.source == "modrinth" {
-                    match modrinth_client.fetch_content_pack_versions(&entry.id, mc_version).await {
+                    match modrinth_client
+                        .fetch_content_pack_versions(&entry.id, mc_version)
+                        .await
+                    {
                         Ok(versions) => {
-                            let best = versions.into_iter()
+                            let best = versions
+                                .into_iter()
                                 .max_by(|a, b| a.date_published.cmp(&b.date_published));
                             if let Some(version) = best {
                                 if let Some(file) = version.primary_file() {
                                     let cached_path = cache_dir.join(&file.filename);
                                     let was_cached = cached_path.exists();
                                     if !was_cached {
-                                        emit_log(app_handle, ProcessLogStream::Stdout,
-                                            format!("[Content] Downloading {} ({})", entry.id, file.filename))?;
-                                        download_file(http_client, &file.url, &cached_path).await
-                                            .with_context(|| format!("failed to download data pack '{}'", entry.id))?;
+                                        emit_log(
+                                            app_handle,
+                                            ProcessLogStream::Stdout,
+                                            format!(
+                                                "[Content] Downloading {} ({})",
+                                                entry.id, file.filename
+                                            ),
+                                        )?;
+                                        download_file(http_client, &file.url, &cached_path)
+                                            .await
+                                            .with_context(|| {
+                                            format!("failed to download data pack '{}'", entry.id)
+                                        })?;
                                     }
                                     let target_path = instance_dir.join(&file.filename);
-                                    crate::instance_mods::create_file_link(&cached_path, &target_path)
-                                        .with_context(|| format!("failed to link data pack '{}' into instance", entry.id))?;
+                                    crate::instance_mods::create_file_link(
+                                        &cached_path,
+                                        &target_path,
+                                    )
+                                    .with_context(|| {
+                                        format!(
+                                            "failed to link data pack '{}' into instance",
+                                            entry.id
+                                        )
+                                    })?;
                                     if was_cached {
-                                        emit_log(app_handle, ProcessLogStream::Stdout,
-                                            format!("[Content] {} → datapacks (cached)", entry.id))?;
+                                        emit_log(
+                                            app_handle,
+                                            ProcessLogStream::Stdout,
+                                            format!("[Content] {} → datapacks (cached)", entry.id),
+                                        )?;
                                     } else {
-                                        emit_log(app_handle, ProcessLogStream::Stdout,
-                                            format!("[Content] Downloaded {} → datapacks", entry.id))?;
+                                        emit_log(
+                                            app_handle,
+                                            ProcessLogStream::Stdout,
+                                            format!(
+                                                "[Content] Downloaded {} → datapacks",
+                                                entry.id
+                                            ),
+                                        )?;
                                     }
                                 }
                             }
                         }
                         Err(e) => {
-                            emit_log(app_handle, ProcessLogStream::Stdout,
-                                format!("[Content] Failed to fetch versions for '{}': {}", entry.id, e))?;
+                            emit_log(
+                                app_handle,
+                                ProcessLogStream::Stdout,
+                                format!(
+                                    "[Content] Failed to fetch versions for '{}': {}",
+                                    entry.id, e
+                                ),
+                            )?;
                         }
                     }
                 }
@@ -1223,8 +4102,10 @@ async fn resolve_and_install_content_packs(
 }
 
 fn build_cached_mod_jars(
+    app_handle: &tauri::AppHandle,
     selected_mods: &[SelectedMod],
     versions: &[ModrinthVersion],
+    cached_records: &[ModCacheRecord],
     target: &ResolutionTarget,
     launcher_paths: &LauncherPaths,
     modlist_name: &str,
@@ -1247,6 +4128,19 @@ fn build_cached_mod_jars(
         if seen.insert(file_name.clone()) {
             let source = local_jars_dir.join(&file_name);
             let dest = mods_cache_dir.join(&file_name);
+            if source.exists() && !jar_metadata_allows_target(&source, target)? {
+                emit_log(
+                    app_handle,
+                    ProcessLogStream::Stdout,
+                    format!(
+                        "[Launch] skipping local mod '{}': embedded metadata is incompatible with {} / {}",
+                        selected.mod_id,
+                        target.minecraft_version,
+                        target.mod_loader.as_modrinth_loader()
+                    ),
+                )?;
+                continue;
+            }
             if source.exists() && !dest.exists() {
                 std::fs::create_dir_all(&mods_cache_dir).ok();
                 std::fs::copy(&source, &dest).with_context(|| {
@@ -1259,6 +4153,14 @@ fn build_cached_mod_jars(
         }
     }
 
+    for record in cached_records {
+        if seen.insert(record.jar_filename.clone()) {
+            jars.push(CachedModJar {
+                jar_filename: record.jar_filename.clone(),
+            });
+        }
+    }
+
     for version in versions {
         let jar_filename = cache_record_from_version(version, target)?.jar_filename;
         if seen.insert(jar_filename.clone()) {
@@ -1267,6 +4169,728 @@ fn build_cached_mod_jars(
     }
 
     Ok(jars)
+}
+
+fn required_java_for_cached_mod_jars(mods_cache_dir: &Path, jars: &[CachedModJar]) -> Result<u32> {
+    let mut required_java = 0;
+
+    for jar in jars {
+        let jar_path = mods_cache_dir.join(&jar.jar_filename);
+        let requirements = read_embedded_fabric_requirements(&jar_path)?;
+        if let Some(min_java) = embedded_min_java_requirement(&requirements) {
+            required_java = required_java.max(min_java);
+        }
+    }
+
+    Ok(required_java)
+}
+
+fn jar_metadata_allows_target(jar_path: &Path, target: &ResolutionTarget) -> Result<bool> {
+    Ok(embedded_minecraft_requirements_match(
+        &read_embedded_fabric_requirements(jar_path)?,
+        target,
+    ))
+}
+
+fn read_embedded_fabric_requirements(jar_path: &Path) -> Result<EmbeddedFabricRequirements> {
+    let file = std::fs::File::open(jar_path)
+        .with_context(|| format!("failed to open JAR metadata from {}", jar_path.display()))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .with_context(|| format!("failed to read JAR metadata from {}", jar_path.display()))?;
+
+    read_embedded_fabric_requirements_from_archive(&mut archive, &jar_path.display().to_string())
+}
+
+fn read_embedded_fabric_mod_metadata(jar_path: &Path) -> Result<Vec<EmbeddedFabricModMetadata>> {
+    let file = std::fs::File::open(jar_path)
+        .with_context(|| format!("failed to open JAR metadata from {}", jar_path.display()))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .with_context(|| format!("failed to read JAR metadata from {}", jar_path.display()))?;
+
+    read_embedded_fabric_mod_metadata_from_archive(&mut archive, &jar_path.display().to_string())
+}
+
+fn read_root_fabric_mod_metadata(jar_path: &Path) -> Result<Option<EmbeddedFabricModMetadata>> {
+    let file = std::fs::File::open(jar_path)
+        .with_context(|| format!("failed to open JAR metadata from {}", jar_path.display()))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .with_context(|| format!("failed to read JAR metadata from {}", jar_path.display()))?;
+    let metadata = match read_embedded_fabric_metadata(&mut archive, &jar_path.display().to_string())?
+    {
+        Some(metadata) => metadata,
+        None => return Ok(None),
+    };
+
+    Ok(fabric_mod_metadata_from_json(&metadata))
+}
+
+fn read_root_fabric_provided_ids(jar_path: &Path) -> Result<HashSet<String>> {
+    let file = std::fs::File::open(jar_path)
+        .with_context(|| format!("failed to open JAR metadata from {}", jar_path.display()))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .with_context(|| format!("failed to read JAR metadata from {}", jar_path.display()))?;
+    let metadata = match read_embedded_fabric_metadata(&mut archive, &jar_path.display().to_string())? {
+        Some(metadata) => metadata,
+        None => return Ok(HashSet::new()),
+    };
+
+    Ok(fabric_mod_metadata_from_json(&metadata)
+        .map(|entry| provided_ids_for_metadata(&entry))
+        .unwrap_or_default())
+}
+
+fn read_bundled_fabric_provided_ids(jar_path: &Path) -> Result<HashSet<String>> {
+    let file = std::fs::File::open(jar_path)
+        .with_context(|| format!("failed to open JAR metadata from {}", jar_path.display()))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .with_context(|| format!("failed to read JAR metadata from {}", jar_path.display()))?;
+    let metadata = match read_embedded_fabric_metadata(&mut archive, &jar_path.display().to_string())? {
+        Some(metadata) => metadata,
+        None => return Ok(HashSet::new()),
+    };
+
+    let mut provided_ids = HashSet::new();
+    for nested_path in nested_fabric_jar_paths(&metadata) {
+        let mut nested_bytes = Vec::new();
+        let read_nested = {
+            let mut nested_file = match archive.by_name(&nested_path) {
+                Ok(file) => file,
+                Err(_) => continue,
+            };
+            nested_file.read_to_end(&mut nested_bytes).is_ok()
+        };
+        if !read_nested {
+            continue;
+        }
+
+        let mut nested_archive = match zip::ZipArchive::new(Cursor::new(nested_bytes)) {
+            Ok(archive) => archive,
+            Err(_) => continue,
+        };
+        let nested_entries = read_embedded_fabric_mod_metadata_from_archive(
+            &mut nested_archive,
+            &format!("{}!{nested_path}", jar_path.display()),
+        )?;
+        for entry in nested_entries {
+            provided_ids.extend(provided_ids_for_metadata(&entry));
+        }
+    }
+
+    Ok(provided_ids)
+}
+
+fn read_embedded_fabric_requirements_from_archive<R: Read + Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    source: &str,
+) -> Result<EmbeddedFabricRequirements> {
+    let metadata = match read_embedded_fabric_metadata(archive, source)? {
+        Some(metadata) => metadata,
+        None => return Ok(EmbeddedFabricRequirements::default()),
+    };
+
+    let mut requirements = EmbeddedFabricRequirements::default();
+    let root_requirements = requirement_set_from_metadata(&metadata);
+    requirements.root_entry = Some(root_requirements.clone());
+    requirements.entries.push(root_requirements);
+
+    for nested_path in nested_fabric_jar_paths(&metadata) {
+        let mut nested_bytes = Vec::new();
+        let read_nested = {
+            let mut nested_file = match archive.by_name(&nested_path) {
+                Ok(file) => file,
+                Err(_) => continue,
+            };
+            nested_file.read_to_end(&mut nested_bytes).is_ok()
+        };
+        if !read_nested {
+            continue;
+        }
+
+        let mut nested_archive = match zip::ZipArchive::new(Cursor::new(nested_bytes)) {
+            Ok(archive) => archive,
+            Err(_) => continue,
+        };
+        let nested_requirements = read_embedded_fabric_requirements_from_archive(
+            &mut nested_archive,
+            &format!("{source}!{nested_path}"),
+        )?;
+        requirements.entries.extend(nested_requirements.entries);
+    }
+
+    Ok(requirements)
+}
+
+fn read_embedded_fabric_mod_metadata_from_archive<R: Read + Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    source: &str,
+) -> Result<Vec<EmbeddedFabricModMetadata>> {
+    let metadata = match read_embedded_fabric_metadata(archive, source)? {
+        Some(metadata) => metadata,
+        None => return Ok(Vec::new()),
+    };
+
+    let mut entries = fabric_mod_metadata_from_json(&metadata).into_iter().collect::<Vec<_>>();
+
+    for nested_path in nested_fabric_jar_paths(&metadata) {
+        let mut nested_bytes = Vec::new();
+        let read_nested = {
+            let mut nested_file = match archive.by_name(&nested_path) {
+                Ok(file) => file,
+                Err(_) => continue,
+            };
+            nested_file.read_to_end(&mut nested_bytes).is_ok()
+        };
+        if !read_nested {
+            continue;
+        }
+
+        let mut nested_archive = match zip::ZipArchive::new(Cursor::new(nested_bytes)) {
+            Ok(archive) => archive,
+            Err(_) => continue,
+        };
+        let nested_entries = read_embedded_fabric_mod_metadata_from_archive(
+            &mut nested_archive,
+            &format!("{source}!{nested_path}"),
+        )?;
+        entries.extend(nested_entries);
+    }
+
+    Ok(entries)
+}
+
+fn read_embedded_fabric_metadata<R: Read + Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    source: &str,
+) -> Result<Option<serde_json::Value>> {
+    let mut metadata_file = match archive.by_name("fabric.mod.json") {
+        Ok(file) => file,
+        Err(_) => return Ok(None),
+    };
+
+    let mut metadata = String::new();
+    metadata_file
+        .read_to_string(&mut metadata)
+        .with_context(|| format!("failed to read fabric.mod.json from {source}"))?;
+
+    Ok(serde_json::from_str(&metadata).ok())
+}
+
+fn fabric_mod_metadata_from_json(metadata: &serde_json::Value) -> Option<EmbeddedFabricModMetadata> {
+    let mod_id = metadata
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?
+        .to_string();
+    let version = metadata
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("*")
+        .to_string();
+
+    let mut provides = metadata
+        .get("provides")
+        .map(json_predicates_to_strings)
+        .unwrap_or_default();
+    provides.retain(|value| !value.trim().is_empty() && value != &mod_id);
+    provides.sort();
+    provides.dedup();
+
+    Some(EmbeddedFabricModMetadata {
+        mod_id,
+        version,
+        provides,
+        depends: fabric_dependency_map_from_json(metadata, "depends"),
+        breaks: fabric_dependency_map_from_json(metadata, "breaks"),
+    })
+}
+
+fn provided_ids_for_metadata(metadata: &EmbeddedFabricModMetadata) -> HashSet<String> {
+    let mut provided_ids = HashSet::new();
+    if !metadata.mod_id.trim().is_empty() {
+        provided_ids.insert(metadata.mod_id.clone());
+    }
+    provided_ids.extend(metadata.provides.iter().cloned());
+    provided_ids
+}
+
+fn requirement_set_from_metadata(metadata: &serde_json::Value) -> EmbeddedFabricRequirementSet {
+    let depends = metadata
+        .get("depends")
+        .and_then(serde_json::Value::as_object);
+
+    EmbeddedFabricRequirementSet {
+        minecraft_predicates: depends
+            .and_then(|depends| depends.get("minecraft"))
+            .map(json_predicates_to_strings)
+            .unwrap_or_default(),
+        java_predicates: depends
+            .and_then(|depends| depends.get("java"))
+            .map(json_predicates_to_strings)
+            .unwrap_or_default(),
+    }
+}
+
+fn fabric_dependency_map_from_json(
+    metadata: &serde_json::Value,
+    key: &str,
+) -> HashMap<String, Vec<String>> {
+    let mut dependency_map = metadata
+        .get(key)
+        .and_then(serde_json::Value::as_object)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|(dependency_id, predicates)| {
+                    let dependency_id = dependency_id.trim();
+                    if dependency_id.is_empty() {
+                        return None;
+                    }
+
+                    Some((
+                        dependency_id.to_string(),
+                        json_predicates_to_strings(predicates),
+                    ))
+                })
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
+
+    dependency_map.retain(|dependency_id, _| !dependency_id.trim().is_empty());
+    dependency_map
+}
+
+fn nested_fabric_jar_paths(metadata: &serde_json::Value) -> Vec<String> {
+    metadata
+        .get("jars")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("file"))
+        .filter_map(serde_json::Value::as_str)
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn embedded_minecraft_requirements_match(
+    requirements: &EmbeddedFabricRequirements,
+    target: &ResolutionTarget,
+) -> bool {
+    if target.mod_loader != ModLoader::Fabric {
+        return true;
+    }
+
+    let Some(entry) = requirements.root_entry.as_ref() else {
+        return true;
+    };
+
+    entry.minecraft_predicates.is_empty()
+        || entry.minecraft_predicates.iter().any(|predicate| {
+            minecraft_version_predicate_matches(predicate, &target.minecraft_version)
+        })
+}
+
+fn embedded_min_java_requirement(requirements: &EmbeddedFabricRequirements) -> Option<u32> {
+    requirements
+        .entries
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .java_predicates
+                .iter()
+                .filter_map(|predicate| minimum_java_version_for_predicate(predicate))
+                .min()
+        })
+        .max()
+}
+
+fn json_predicates_to_strings(value: &serde_json::Value) -> Vec<String> {
+    match value {
+        serde_json::Value::String(predicate) => vec![predicate.to_string()],
+        serde_json::Value::Array(predicates) => predicates
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .map(ToString::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn minecraft_version_predicate_matches(predicate: &str, concrete: &str) -> bool {
+    let predicate = predicate.trim();
+    if predicate.is_empty() || predicate == "*" {
+        return true;
+    }
+
+    predicate
+        .split("||")
+        .map(str::trim)
+        .filter(|branch| !branch.is_empty())
+        .any(|branch| {
+            branch
+                .replace(',', " ")
+                .split_whitespace()
+                .all(|token| minecraft_version_token_matches(token, concrete))
+        })
+}
+
+fn minecraft_version_token_matches(token: &str, concrete: &str) -> bool {
+    let token = token.trim();
+    if token.is_empty() || token == "*" {
+        return true;
+    }
+
+    if let Some(expected) = token.strip_prefix('~') {
+        return tilde_minecraft_version_matches(expected.trim(), concrete);
+    }
+
+    for (prefix, ordering) in [
+        (">=", Some(std::cmp::Ordering::Greater)),
+        ("<=", Some(std::cmp::Ordering::Less)),
+        (">", Some(std::cmp::Ordering::Greater)),
+        ("<", Some(std::cmp::Ordering::Less)),
+        ("=", None),
+    ] {
+        if let Some(expected) = token.strip_prefix(prefix) {
+            let Some(actual_ordering) = compare_minecraft_versions(concrete, expected.trim())
+            else {
+                return true;
+            };
+            return match (prefix, ordering) {
+                (">=", Some(std::cmp::Ordering::Greater)) => {
+                    actual_ordering == std::cmp::Ordering::Greater
+                        || actual_ordering == std::cmp::Ordering::Equal
+                }
+                ("<=", Some(std::cmp::Ordering::Less)) => {
+                    actual_ordering == std::cmp::Ordering::Less
+                        || actual_ordering == std::cmp::Ordering::Equal
+                }
+                (">", Some(std::cmp::Ordering::Greater)) => {
+                    actual_ordering == std::cmp::Ordering::Greater
+                }
+                ("<", Some(std::cmp::Ordering::Less)) => {
+                    actual_ordering == std::cmp::Ordering::Less
+                }
+                ("=", None) => actual_ordering == std::cmp::Ordering::Equal,
+                _ => true,
+            };
+        }
+    }
+
+    crate::modrinth::mc_version_matches(token, concrete)
+        || compare_minecraft_versions(concrete, token)
+            .is_some_and(|ordering| ordering == std::cmp::Ordering::Equal)
+}
+
+fn tilde_minecraft_version_matches(expected: &str, concrete: &str) -> bool {
+    let Some(actual_ordering) = compare_minecraft_versions(concrete, expected) else {
+        return true;
+    };
+    if actual_ordering == std::cmp::Ordering::Less {
+        return false;
+    }
+
+    let Some(mut upper_parts) = parse_minecraft_version_parts(expected) else {
+        return true;
+    };
+    if upper_parts.len() >= 2 {
+        upper_parts[1] += 1;
+        if upper_parts.len() > 2 {
+            upper_parts[2..].fill(0);
+        } else {
+            upper_parts.push(0);
+        }
+    } else if let Some(last) = upper_parts.last_mut() {
+        *last += 1;
+    } else {
+        return true;
+    }
+
+    let upper_bound = upper_parts
+        .into_iter()
+        .map(|part| part.to_string())
+        .collect::<Vec<_>>()
+        .join(".");
+
+    compare_minecraft_versions(concrete, &upper_bound)
+        .is_some_and(|ordering| ordering == std::cmp::Ordering::Less)
+}
+
+fn compare_minecraft_versions(left: &str, right: &str) -> Option<std::cmp::Ordering> {
+    let mut left_parts = parse_minecraft_version_parts(left)?;
+    let mut right_parts = parse_minecraft_version_parts(right)?;
+    let max_len = left_parts.len().max(right_parts.len());
+    left_parts.resize(max_len, 0);
+    right_parts.resize(max_len, 0);
+    Some(left_parts.cmp(&right_parts))
+}
+
+fn parse_minecraft_version_parts(value: &str) -> Option<Vec<u64>> {
+    value
+        .split('.')
+        .map(|segment| {
+            let numeric = segment
+                .trim()
+                .split(|ch: char| !ch.is_ascii_digit())
+                .next()
+                .unwrap_or("");
+            if numeric.is_empty() {
+                None
+            } else {
+                numeric.parse::<u64>().ok()
+            }
+        })
+        .collect()
+}
+
+fn minimum_java_version_for_predicate(predicate: &str) -> Option<u32> {
+    predicate
+        .split("||")
+        .map(str::trim)
+        .filter(|branch| !branch.is_empty())
+        .filter_map(minimum_java_version_for_branch)
+        .min()
+}
+
+fn fabric_dependency_predicates_match(predicates: &[String], concrete: &str) -> bool {
+    predicates.is_empty()
+        || predicates
+            .iter()
+            .any(|predicate| fabric_dependency_predicate_matches(predicate, concrete))
+}
+
+fn fabric_dependency_predicate_matches(predicate: &str, concrete: &str) -> bool {
+    let predicate = predicate.trim();
+    if predicate.is_empty() || predicate == "*" {
+        return true;
+    }
+
+    predicate
+        .split("||")
+        .map(str::trim)
+        .filter(|branch| !branch.is_empty())
+        .any(|branch| {
+            branch
+                .replace(',', " ")
+                .split_whitespace()
+                .all(|token| fabric_dependency_token_matches(token, concrete))
+        })
+}
+
+fn fabric_dependency_token_matches(token: &str, concrete: &str) -> bool {
+    let token = token.trim();
+    if token.is_empty() || token == "*" {
+        return true;
+    }
+
+    for (prefix, ordering) in [
+        (">=", Some(std::cmp::Ordering::Greater)),
+        ("<=", Some(std::cmp::Ordering::Less)),
+        (">", Some(std::cmp::Ordering::Greater)),
+        ("<", Some(std::cmp::Ordering::Less)),
+        ("=", None),
+    ] {
+        if let Some(expected) = token.strip_prefix(prefix) {
+            let expected = expected.trim();
+            let Some(actual_ordering) = compare_fabric_dependency_versions(concrete, expected) else {
+                return concrete.eq_ignore_ascii_case(expected);
+            };
+            return match (prefix, ordering) {
+                (">=", Some(std::cmp::Ordering::Greater)) => {
+                    actual_ordering == std::cmp::Ordering::Greater
+                        || actual_ordering == std::cmp::Ordering::Equal
+                }
+                ("<=", Some(std::cmp::Ordering::Less)) => {
+                    actual_ordering == std::cmp::Ordering::Less
+                        || actual_ordering == std::cmp::Ordering::Equal
+                }
+                (">", Some(std::cmp::Ordering::Greater)) => {
+                    actual_ordering == std::cmp::Ordering::Greater
+                }
+                ("<", Some(std::cmp::Ordering::Less)) => {
+                    actual_ordering == std::cmp::Ordering::Less
+                }
+                ("=", None) => actual_ordering == std::cmp::Ordering::Equal,
+                _ => true,
+            };
+        }
+    }
+
+    compare_fabric_dependency_versions(concrete, token)
+        .is_some_and(|ordering| ordering == std::cmp::Ordering::Equal)
+        || concrete.eq_ignore_ascii_case(token)
+}
+
+fn compare_fabric_dependency_versions(left: &str, right: &str) -> Option<std::cmp::Ordering> {
+    if let Some(ordering) = compare_semver_like_versions(left, right) {
+        return Some(ordering);
+    }
+
+    let left = parse_fabric_dependency_version(left)?;
+    let right = parse_fabric_dependency_version(right)?;
+    let max_len = left.core.len().max(right.core.len());
+
+    for index in 0..max_len {
+        let left_part = left.core.get(index).copied().unwrap_or(0);
+        let right_part = right.core.get(index).copied().unwrap_or(0);
+        match left_part.cmp(&right_part) {
+            std::cmp::Ordering::Equal => {}
+            ordering => return Some(ordering),
+        }
+    }
+
+    match (&left.prerelease, &right.prerelease) {
+        (None, None) => Some(std::cmp::Ordering::Equal),
+        (Some(_), None) => Some(std::cmp::Ordering::Less),
+        (None, Some(_)) => Some(std::cmp::Ordering::Greater),
+        (Some(left_pre), Some(right_pre)) => Some(compare_prerelease_identifiers(left_pre, right_pre)),
+    }
+}
+
+fn compare_semver_like_versions(left: &str, right: &str) -> Option<std::cmp::Ordering> {
+    let left = normalize_semver_like_version(left)?;
+    let right = normalize_semver_like_version(right)?;
+    Some(left.cmp(&right))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedFabricDependencyVersion {
+    core: Vec<u64>,
+    prerelease: Option<Vec<String>>,
+}
+
+fn parse_fabric_dependency_version(value: &str) -> Option<ParsedFabricDependencyVersion> {
+    let mut main_and_build = value.trim().splitn(2, '+');
+    let main = main_and_build.next()?.trim();
+    if main.is_empty() {
+        return None;
+    }
+
+    let mut core_and_pre = main.splitn(2, '-');
+    let core = core_and_pre
+        .next()?
+        .split('.')
+        .map(|segment| segment.trim().parse::<u64>().ok())
+        .collect::<Option<Vec<_>>>()?;
+    if core.is_empty() {
+        return None;
+    }
+
+    let prerelease = core_and_pre.next().map(|value| {
+        value
+            .split('.')
+            .map(|segment| segment.trim().to_ascii_lowercase())
+            .filter(|segment| !segment.is_empty())
+            .collect::<Vec<_>>()
+    });
+
+    Some(ParsedFabricDependencyVersion { core, prerelease })
+}
+
+fn normalize_semver_like_version(value: &str) -> Option<semver::Version> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+
+    let (core_and_pre, build) = match value.split_once('+') {
+        Some((left, right)) => (left.trim(), Some(right.trim())),
+        None => (value, None),
+    };
+    let (core, prerelease) = match core_and_pre.split_once('-') {
+        Some((left, right)) => (left.trim(), Some(right.trim())),
+        None => (core_and_pre, None),
+    };
+
+    let mut core_parts = core
+        .split('.')
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    if core_parts.is_empty() || core_parts.len() > 3 {
+        return None;
+    }
+    if core_parts.iter().any(|segment| segment.parse::<u64>().is_err()) {
+        return None;
+    }
+    while core_parts.len() < 3 {
+        core_parts.push("0");
+    }
+
+    let mut normalized = core_parts.join(".");
+    if let Some(prerelease) = prerelease {
+        if prerelease.is_empty() {
+            return None;
+        }
+        normalized.push('-');
+        normalized.push_str(prerelease);
+    }
+    if let Some(build) = build {
+        if !build.is_empty() {
+            normalized.push('+');
+            normalized.push_str(build);
+        }
+    }
+
+    semver::Version::parse(&normalized).ok()
+}
+
+fn compare_prerelease_identifiers(left: &[String], right: &[String]) -> std::cmp::Ordering {
+    for index in 0..left.len().max(right.len()) {
+        let Some(left_part) = left.get(index) else {
+            return std::cmp::Ordering::Less;
+        };
+        let Some(right_part) = right.get(index) else {
+            return std::cmp::Ordering::Greater;
+        };
+
+        let left_numeric = left_part.parse::<u64>().ok();
+        let right_numeric = right_part.parse::<u64>().ok();
+        let ordering = match (left_numeric, right_numeric) {
+            (Some(left_numeric), Some(right_numeric)) => left_numeric.cmp(&right_numeric),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => left_part.cmp(right_part),
+        };
+        if ordering != std::cmp::Ordering::Equal {
+            return ordering;
+        }
+    }
+
+    std::cmp::Ordering::Equal
+}
+
+fn minimum_java_version_for_branch(branch: &str) -> Option<u32> {
+    let mut minimum = 0u32;
+
+    for token in branch.replace(',', " ").split_whitespace() {
+        let token = token.trim();
+        if token.is_empty() || token == "*" {
+            continue;
+        }
+
+        if let Some(value) = token.strip_prefix(">=") {
+            minimum = minimum.max(value.trim().parse::<u32>().ok()?);
+            continue;
+        }
+        if let Some(value) = token.strip_prefix('>') {
+            minimum = minimum.max(value.trim().parse::<u32>().ok()?.saturating_add(1));
+            continue;
+        }
+        if let Some(value) = token.strip_prefix('=') {
+            minimum = minimum.max(value.trim().parse::<u32>().ok()?);
+            continue;
+        }
+        if token.starts_with('<') {
+            continue;
+        }
+
+        minimum = minimum.max(token.parse::<u32>().ok()?);
+    }
+
+    Some(minimum)
 }
 
 async fn materialize_loader_libraries(
@@ -1287,7 +4911,10 @@ async fn materialize_loader_libraries(
                 download.url.clone()
             } else if let Some(base_url) = &library.url {
                 let base = base_url.trim_end_matches('/');
-                format!("{base}/{}", relative_path.to_string_lossy().replace('\\', "/"))
+                format!(
+                    "{base}/{}",
+                    relative_path.to_string_lossy().replace('\\', "/")
+                )
             } else {
                 continue; // no way to obtain this library
             };
@@ -1346,34 +4973,46 @@ async fn load_player_identity(launcher_paths: &LauncherPaths) -> Result<PlayerId
     // Extract all data from DB BEFORE any async work (Connection is not Send).
     let raw_account = {
         use crate::microsoft_auth::AccountsRepository as RawRepo;
-        RawRepo::new(&connection).load_active_account().ok().flatten()
+        RawRepo::new(&connection)
+            .load_active_account()
+            .ok()
+            .flatten()
     };
     let db_path = launcher_paths.database_path().to_path_buf();
     drop(connection); // Release connection before async work.
 
     if let Some(raw) = raw_account {
-        let profile = raw.profile_data.as_deref().and_then(|pd| {
-            serde_json::from_str::<serde_json::Value>(pd).ok()
-        });
+        let profile = raw
+            .profile_data
+            .as_deref()
+            .and_then(|pd| serde_json::from_str::<serde_json::Value>(pd).ok());
 
-        let username = profile.as_ref()
+        let username = profile
+            .as_ref()
             .and_then(|v| v.get("username").and_then(|u| u.as_str()).map(String::from))
             .or(raw.xbox_gamertag.clone())
             .unwrap_or_else(|| "CubicPlayer".to_string());
 
         let uuid = format_uuid_with_dashes(
-            &raw.minecraft_uuid.unwrap_or_else(|| deterministic_offline_uuid(&username).to_string())
+            &raw.minecraft_uuid
+                .unwrap_or_else(|| deterministic_offline_uuid(&username).to_string()),
         );
 
         let microsoft_id = raw.microsoft_id.clone();
 
         // Try to refresh the Minecraft access token using the stored MS refresh token.
-        let ms_refresh = profile.as_ref()
-            .and_then(|v| v.get("ms_refresh_token").and_then(|t| t.as_str()).map(String::from));
+        let ms_refresh = profile.as_ref().and_then(|v| {
+            v.get("ms_refresh_token")
+                .and_then(|t| t.as_str())
+                .map(String::from)
+        });
 
         if let Some(refresh_token) = ms_refresh {
             if !refresh_token.is_empty() {
-                eprintln!("[Auth] Has refresh token (len={}), attempting refresh...", refresh_token.len());
+                eprintln!(
+                    "[Auth] Has refresh token (len={}), attempting refresh...",
+                    refresh_token.len()
+                );
 
                 const DEFAULT_CLIENT_ID: &str = "00000000402b5328";
                 let env_path = launcher_paths.root_dir().join(".env");
@@ -1389,42 +5028,53 @@ async fn load_player_identity(launcher_paths: &LauncherPaths) -> Result<PlayerId
                 };
                 let oauth_client = crate::microsoft_auth::MicrosoftOAuthClient::new();
 
-                match oauth_client.refresh_access_token(&config, &refresh_token).await {
+                match oauth_client
+                    .refresh_access_token(&config, &refresh_token)
+                    .await
+                {
                     Ok(ms_tokens) => {
                         eprintln!("[Auth] MS token refresh OK, authenticating with Xbox/MC...");
                         let chain = crate::microsoft_auth::MinecraftAuthChain::new();
-                        match chain.authenticate(
-                            &ms_tokens.access_token,
-                            ms_tokens.refresh_token.as_deref(),
-                            ms_tokens.user_id.as_deref(),
-                        ).await {
+                        match chain
+                            .authenticate(
+                                &ms_tokens.access_token,
+                                ms_tokens.refresh_token.as_deref(),
+                                ms_tokens.user_id.as_deref(),
+                            )
+                            .await
+                        {
                             Ok(login) => {
-                                eprintln!("[Auth] Full auth chain OK: username={}", login.minecraft_username);
-                        // Update stored tokens in profile_data.
-                        let new_profile = serde_json::json!({
-                            "username": login.minecraft_username,
-                            "uuid": login.minecraft_uuid,
-                            "mc_access_token": login.minecraft_access_token,
-                            "ms_refresh_token": ms_tokens.refresh_token.as_deref()
-                                .unwrap_or(&refresh_token),
-                        });
-                        if let Ok(conn) = Connection::open(&db_path) {
-                            use crate::microsoft_auth::AccountsRepository as RawRepo;
-                            let _ = RawRepo::new(&conn)
-                                .update_profile_data(&microsoft_id, &new_profile.to_string());
-                        }
+                                eprintln!(
+                                    "[Auth] Full auth chain OK: username={}",
+                                    login.minecraft_username
+                                );
+                                // Update stored tokens in profile_data.
+                                let new_profile = serde_json::json!({
+                                    "username": login.minecraft_username,
+                                    "uuid": login.minecraft_uuid,
+                                    "mc_access_token": login.minecraft_access_token,
+                                    "ms_refresh_token": ms_tokens.refresh_token.as_deref()
+                                        .unwrap_or(&refresh_token),
+                                });
+                                if let Ok(conn) = Connection::open(&db_path) {
+                                    use crate::microsoft_auth::AccountsRepository as RawRepo;
+                                    let _ = RawRepo::new(&conn).update_profile_data(
+                                        &microsoft_id,
+                                        &new_profile.to_string(),
+                                    );
+                                }
 
-                        return Ok(PlayerIdentity {
-                            username: login.minecraft_username,
-                            uuid: format_uuid_with_dashes(&login.minecraft_uuid),
-                            access_token: login.minecraft_access_token,
-                            user_type: "msa".to_string(),
-                            version_type: "Cubic".to_string(),
-                        });
+                                return Ok(PlayerIdentity {
+                                    username: login.minecraft_username,
+                                    uuid: format_uuid_with_dashes(&login.minecraft_uuid),
+                                    access_token: login.minecraft_access_token,
+                                    user_type: "msa".to_string(),
+                                    version_type: "Cubic".to_string(),
+                                });
+                            }
+                            Err(e) => eprintln!("[Auth] MC auth chain failed: {e:#}"),
+                        }
                     }
-                    Err(e) => eprintln!("[Auth] MC auth chain failed: {e:#}"),
-                }
-                }
                     Err(e) => eprintln!("[Auth] MS token refresh failed: {e:#}"),
                 }
             }
@@ -1456,6 +5106,7 @@ async fn select_or_download_java(
     launcher_paths: &LauncherPaths,
     settings: &EffectiveLaunchSettings,
     target: &ResolutionTarget,
+    required_version: u32,
 ) -> Result<PathBuf> {
     if let Some(path) = &settings.java_path_override {
         let inspector = CommandJavaBinaryInspector;
@@ -1463,14 +5114,13 @@ async fn select_or_download_java(
             .inspect(path)
             .with_context(|| format!("failed to inspect Java override at {}", path.display()))?
             .with_context(|| format!("Java override '{}' is not runnable", path.display()))?;
-        let required = required_java_version_for_minecraft(&target.minecraft_version)?;
-        if probe.version < required {
+        if probe.version < required_version {
             bail!(
-                "Java override '{}' reports version {}, but Minecraft {} requires Java {} or higher",
+                "Java override '{}' reports version {}, but launch requires Java {} or higher for Minecraft {}",
                 path.display(),
                 probe.version,
-                target.minecraft_version,
-                required
+                required_version,
+                target.minecraft_version
             );
         }
 
@@ -1486,23 +5136,25 @@ async fn select_or_download_java(
     })?;
     persist_java_installations(&connection, &installations)?;
 
-    if let Some(installation) = select_java_for_minecraft(&installations, &target.minecraft_version)? {
+    if let Some(installation) = select_java_for_requirement(&installations, required_version) {
         return Ok(installation.path);
     }
 
     // No suitable Java found — auto-download via Adoptium.
-    let required = required_java_version_for_minecraft(&target.minecraft_version)?;
     emit_log(
         app_handle,
         ProcessLogStream::Stdout,
-        format!("[Java] No Java {} found, downloading from Adoptium...", required),
+        format!(
+            "[Java] No Java {} found, downloading from Adoptium...",
+            required_version
+        ),
     )?;
     emit_progress(
         app_handle,
         "resolving",
         85,
         "Downloading Java",
-        &format!("Fetching Java {} runtime from Adoptium.", required),
+        &format!("Fetching Java {} runtime from Adoptium.", required_version),
     )?;
 
     let adoptium = AdoptiumClient::new();
@@ -1510,20 +5162,27 @@ async fn select_or_download_java(
     let arch = normalize_adoptium_architecture(std::env::consts::ARCH);
 
     let package = adoptium
-        .fetch_latest_jre_package(required, os, arch)
+        .fetch_latest_jre_package(required_version, os, arch)
         .await?
-        .with_context(|| format!("Adoptium has no JRE {} for {}/{}", required, os, arch))?;
+        .with_context(|| {
+            format!(
+                "Adoptium has no JRE {} for {}/{}",
+                required_version, os, arch
+            )
+        })?;
 
     let plan = plan_runtime_download(
         launcher_paths.java_runtimes_dir(),
-        required,
+        required_version,
         package,
         os,
         arch,
     );
 
     // Download the archive.
-    adoptium.download_package(&plan.package, &plan.archive_path).await?;
+    adoptium
+        .download_package(&plan.package, &plan.archive_path)
+        .await?;
 
     // Extract the archive into the install directory.
     emit_log(
@@ -1538,8 +5197,12 @@ async fn select_or_download_java(
             .with_context(|| format!("failed to open Java archive {}", archive_path.display()))?;
         let mut archive = zip::ZipArchive::new(file)
             .with_context(|| format!("failed to read Java archive {}", archive_path.display()))?;
-        archive.extract(&install_dir)
-            .with_context(|| format!("failed to extract Java archive to {}", install_dir.display()))?;
+        archive.extract(&install_dir).with_context(|| {
+            format!(
+                "failed to extract Java archive to {}",
+                install_dir.display()
+            )
+        })?;
         // Clean up archive file.
         let _ = std::fs::remove_file(&archive_path);
         Ok(())
@@ -1551,12 +5214,12 @@ async fn select_or_download_java(
     let installations = discover_java_installations(launcher_paths.java_runtimes_dir())?;
     persist_java_installations(&connection, &installations)?;
 
-    select_java_for_minecraft(&installations, &target.minecraft_version)?
+    select_java_for_requirement(&installations, required_version)
         .map(|installation| installation.path)
         .with_context(|| {
             format!(
                 "Java {} was downloaded but could not be found after extraction. Check {}",
-                required,
+                required_version,
                 launcher_paths.java_runtimes_dir().display()
             )
         })
@@ -1565,7 +5228,14 @@ async fn select_or_download_java(
 fn format_uuid_with_dashes(uuid: &str) -> String {
     let clean = uuid.replace('-', "");
     if clean.len() == 32 {
-        format!("{}-{}-{}-{}-{}", &clean[0..8], &clean[8..12], &clean[12..16], &clean[16..20], &clean[20..32])
+        format!(
+            "{}-{}-{}-{}-{}",
+            &clean[0..8],
+            &clean[8..12],
+            &clean[12..16],
+            &clean[16..20],
+            &clean[20..32]
+        )
     } else {
         uuid.to_string()
     }
@@ -1652,17 +5322,28 @@ fn emit_progress(
 }
 
 fn emit_log(app_handle: &tauri::AppHandle, stream: ProcessLogStream, line: String) -> Result<()> {
+    if let Some(session) = current_launch_log_session() {
+        let _ = session.append_launcher_line(stream, &line);
+    }
     app_handle
         .emit(MINECRAFT_LOG_EVENT, ProcessLogEvent { stream, line })
         .map_err(|error| anyhow::anyhow!(error.to_string()))
 }
 
-fn emit_launcher_error(
+fn emit_launcher_issue(
     app_handle: &tauri::AppHandle,
     title: &str,
     message: &str,
     detail: &str,
+    severity: &str,
+    scope: &str,
 ) -> Result<()> {
+    if let Some(session) = current_launch_log_session() {
+        let _ = session.append_line(
+            "issues.log",
+            &format!("[{severity}] {title} | {message} | {detail}"),
+        );
+    }
     app_handle
         .emit(
             LAUNCHER_ERROR_EVENT,
@@ -1671,8 +5352,8 @@ fn emit_launcher_error(
                 title: title.to_string(),
                 message: message.to_string(),
                 detail: detail.to_string(),
-                severity: "error".to_string(),
-                scope: "launch".to_string(),
+                severity: severity.to_string(),
+                scope: scope.to_string(),
             },
         )
         .map_err(|error| anyhow::anyhow!(error.to_string()))
@@ -1688,14 +5369,22 @@ fn unique_error_id() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
 
     use crate::app_shell::{ShellGlobalSettings, ShellModListOverrides};
+    use crate::modrinth::{DependencyType, ModrinthDependency, ModrinthVersion};
     use crate::resolver::{ModLoader, ResolutionTarget};
 
     use super::{
-        build_instance_root, maven_artifact_relative_path, parse_mod_loader,
-        substitute_known_placeholders, EffectiveLaunchSettings, LaunchPlaceholders, PlayerIdentity,
+        build_instance_root, build_top_level_owner_map, collect_selected_project_ids,
+        embedded_min_java_requirement, fabric_dependency_predicates_match,
+        maven_artifact_relative_path, minecraft_version_predicate_matches,
+        minimum_java_version_for_predicate, parse_mod_loader, substitute_known_placeholders,
+        validate_final_fabric_runtime, validate_selected_parent_dependencies,
+        DependencyLink, EffectiveLaunchSettings, EmbeddedFabricModMetadata,
+        EmbeddedFabricRequirementSet, EmbeddedFabricRequirements, LaunchPlaceholders,
+        OwnedEmbeddedFabricModMetadata, PlayerIdentity,
     };
 
     fn global_settings() -> ShellGlobalSettings {
@@ -1704,6 +5393,7 @@ mod tests {
             max_ram_mb: 4096,
             custom_jvm_args: "-Dglobal=true".into(),
             profiler_enabled: false,
+            cache_only_mode: true,
             wrapper_command: "gamemoderun".into(),
             java_path_override: "/custom/java".into(),
         }
@@ -1738,6 +5428,7 @@ mod tests {
         assert_eq!(settings.min_ram_mb, 8192);
         assert_eq!(settings.max_ram_mb, 4096);
         assert_eq!(settings.custom_jvm_args, "-Dmodlist=true");
+        assert!(settings.cache_only_mode);
         assert_eq!(settings.wrapper_command, Some("mangohud".into()));
         assert_eq!(
             settings.java_path_override,
@@ -1805,6 +5496,228 @@ mod tests {
         assert_eq!(
             substituted,
             "PlayerOne:uuid-123:game-dir:Pack-1.21.1-fabric"
+        );
+    }
+
+    fn sample_version(project_id: &str, version_id: &str) -> ModrinthVersion {
+        ModrinthVersion {
+            id: version_id.into(),
+            project_id: project_id.into(),
+            version_number: "1.0.0".into(),
+            name: format!("{project_id} {version_id}"),
+            game_versions: vec!["1.21.5".into()],
+            loaders: vec!["fabric".into()],
+            dependencies: Vec::new(),
+            files: Vec::new(),
+            date_published: "2024-08-15T10:00:00.000Z".into(),
+        }
+    }
+
+    fn metadata_entry(
+        owner_project_id: &str,
+        mod_id: &str,
+        version: &str,
+    ) -> OwnedEmbeddedFabricModMetadata {
+        OwnedEmbeddedFabricModMetadata {
+            owner_project_id: owner_project_id.into(),
+            metadata: EmbeddedFabricModMetadata {
+                mod_id: mod_id.into(),
+                version: version.into(),
+                provides: Vec::new(),
+                depends: HashMap::new(),
+                breaks: HashMap::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn java_predicates_extract_minimum_requirement() {
+        assert_eq!(minimum_java_version_for_predicate(">=22"), Some(22));
+        assert_eq!(minimum_java_version_for_predicate(">21"), Some(22));
+        assert_eq!(minimum_java_version_for_predicate("21"), Some(21));
+        assert_eq!(
+            embedded_min_java_requirement(&EmbeddedFabricRequirements {
+                root_entry: None,
+                entries: vec![
+                    EmbeddedFabricRequirementSet {
+                        minecraft_predicates: Vec::new(),
+                        java_predicates: vec![">=21".into()],
+                    },
+                    EmbeddedFabricRequirementSet {
+                        minecraft_predicates: Vec::new(),
+                        java_predicates: vec![">=22".into(), ">=23".into()],
+                    },
+                ],
+            }),
+            Some(22)
+        );
+    }
+
+    #[test]
+    fn tilde_minecraft_predicates_match_target_patch_line() {
+        assert!(minecraft_version_predicate_matches("~1.21.6", "1.21.6"));
+        assert!(minecraft_version_predicate_matches("~1.21.6", "1.21.9"));
+        assert!(!minecraft_version_predicate_matches("~1.21.6", "1.22.0"));
+    }
+
+    #[test]
+    fn fabric_dependency_predicates_match_semver_ranges() {
+        assert!(fabric_dependency_predicates_match(&["<7.0.0".into()], "6.2.9"));
+        assert!(fabric_dependency_predicates_match(&[">=17.0.6".into()], "17.0.6"));
+        assert!(!fabric_dependency_predicates_match(&["<3.0.0".into()], "3.0.0"));
+        assert!(fabric_dependency_predicates_match(
+            &["<1.8.0".into()],
+            "1.8.0-beta.4+mc1.21.1"
+        ));
+        assert!(!fabric_dependency_predicates_match(
+            &[">=1.8.0".into()],
+            "1.8.0-beta.4+mc1.21.1"
+        ));
+    }
+
+    #[test]
+    fn exact_parent_dependency_check_uses_project_ids() {
+        let mut iris = sample_version("YL57xq9U", "iris-1");
+        iris.dependencies.push(ModrinthDependency {
+            version_id: Some("sodium-0.6.12".into()),
+            project_id: Some("AANobbMI".into()),
+            dependency_type: DependencyType::Required,
+            file_name: None,
+        });
+        let sodium = ModrinthVersion {
+            id: "sodium-0.6.13".into(),
+            ..sample_version("AANobbMI", "sodium-0.6.13")
+        };
+        let parent_versions = vec![iris.clone(), sodium.clone()];
+        let selected_parent_versions = HashMap::from([
+            (iris.project_id.clone(), iris),
+            (sodium.project_id.clone(), sodium),
+        ]);
+        let selected_project_ids = collect_selected_project_ids(&parent_versions);
+
+        let excluded = validate_selected_parent_dependencies(
+            &parent_versions,
+            &selected_parent_versions,
+            &selected_project_ids,
+        );
+
+        assert_eq!(
+            excluded,
+            std::collections::HashSet::from(["YL57xq9U".to_string()])
+        );
+    }
+
+    #[test]
+    fn owner_map_propagates_transitive_dependency_owners() {
+        let parent_versions = vec![sample_version("top-level", "top-level-1")];
+        let owner_map = build_top_level_owner_map(
+            &parent_versions,
+            &[
+                DependencyLink {
+                    parent_mod_id: "top-level".into(),
+                    dependency_id: "mid".into(),
+                    specific_version: None,
+                    jar_filename: "mid.jar".into(),
+                },
+                DependencyLink {
+                    parent_mod_id: "mid".into(),
+                    dependency_id: "leaf".into(),
+                    specific_version: None,
+                    jar_filename: "leaf.jar".into(),
+                },
+            ],
+        );
+
+        assert_eq!(
+            owner_map.get("leaf"),
+            Some(&HashSet::from(["top-level".to_string()]))
+        );
+    }
+
+    #[test]
+    fn final_fabric_validation_excludes_top_level_on_breaks_conflict() {
+        let owner_map = HashMap::from([(
+            "puzzle-project".to_string(),
+            HashSet::from(["puzzle-project".to_string()]),
+        )]);
+        let mut puzzle = metadata_entry("puzzle-project", "puzzle", "2.3.0");
+        puzzle
+            .metadata
+            .breaks
+            .insert("entity_model_features".into(), vec!["<3.0.0".into()]);
+        let emf = metadata_entry("emf-project", "entity_model_features", "2.4.1");
+
+        let issues = validate_final_fabric_runtime(&[puzzle, emf], &owner_map);
+
+        assert_eq!(
+            issues.get("puzzle-project").map(|issue| issue.reason_code),
+            Some("breaks_conflict")
+        );
+    }
+
+    #[test]
+    fn final_fabric_validation_excludes_top_level_on_prerelease_breaks_conflict() {
+        let owner_map = HashMap::from([
+            (
+                "sodium-project".to_string(),
+                HashSet::from(["sodium-project".to_string()]),
+            ),
+            (
+                "reeses-project".to_string(),
+                HashSet::from(["sodiumoptionsapi-project".to_string()]),
+            ),
+        ]);
+        let mut sodium = metadata_entry("sodium-project", "sodium", "0.6.13+mc1.21.1");
+        sodium
+            .metadata
+            .breaks
+            .insert("reeses-sodium-options".into(), vec!["<1.8.0".into()]);
+        let reeses = metadata_entry(
+            "reeses-project",
+            "reeses-sodium-options",
+            "1.8.0-beta.4+mc1.21.1",
+        );
+
+        let issues = validate_final_fabric_runtime(&[sodium, reeses], &owner_map);
+
+        assert_eq!(
+            issues.get("sodium-project").map(|issue| issue.reason_code),
+            Some("breaks_conflict")
+        );
+    }
+
+    #[test]
+    fn final_fabric_validation_excludes_top_level_on_missing_dependency() {
+        let owner_map = HashMap::from([
+            (
+                "sodiumoptionsapi-project".to_string(),
+                HashSet::from(["sodiumoptionsapi-project".to_string()]),
+            ),
+            (
+                "embedded-helper-project".to_string(),
+                HashSet::from(["sodiumoptionsapi-project".to_string()]),
+            ),
+        ]);
+        let mut sodium_options_api =
+            metadata_entry("sodiumoptionsapi-project", "sodiumoptionsapi", "1.0.10");
+        sodium_options_api
+            .metadata
+            .depends
+            .insert("reeses-sodium-options".into(), vec!["*".into()]);
+
+        let issues = validate_final_fabric_runtime(&[sodium_options_api], &owner_map);
+
+        assert_eq!(
+            issues
+                .get("sodiumoptionsapi-project")
+                .and_then(|issue| issue.dependency_id.as_deref()),
+            Some("reeses-sodium-options")
+        );
+        assert_eq!(
+            issues
+                .get("sodiumoptionsapi-project")
+                .map(|issue| issue.reason_code),
+            Some("missing_dependency")
         );
     }
 }

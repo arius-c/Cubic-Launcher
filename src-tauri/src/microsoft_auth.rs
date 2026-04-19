@@ -483,10 +483,18 @@ impl MinecraftAuthChain {
         }
     }
 
-    pub async fn authenticate(&self, ms_access_token: &str, ms_refresh_token: Option<&str>, ms_user_id: Option<&str>) -> Result<MinecraftLoginResult> {
+    pub async fn authenticate(
+        &self,
+        ms_access_token: &str,
+        ms_refresh_token: Option<&str>,
+        ms_user_id: Option<&str>,
+    ) -> Result<MinecraftLoginResult> {
         // Step 1: Xbox Live
         let xbox = self.authenticate_xbox_live(ms_access_token).await?;
-        let uhs = xbox.display_claims.xui.first()
+        let uhs = xbox
+            .display_claims
+            .xui
+            .first()
             .context("Xbox Live response missing user hash")?;
         let gamertag = uhs.gtg.clone();
         let user_hash = uhs.uhs.clone();
@@ -562,7 +570,11 @@ impl MinecraftAuthChain {
             .context("failed to parse XSTS response")
     }
 
-    async fn authenticate_minecraft(&self, user_hash: &str, xsts_token: &str) -> Result<MinecraftAuthResponse> {
+    async fn authenticate_minecraft(
+        &self,
+        user_hash: &str,
+        xsts_token: &str,
+    ) -> Result<MinecraftAuthResponse> {
         let body = serde_json::json!({
             "identityToken": format!("XBL3.0 x={user_hash};{xsts_token}")
         });
@@ -702,13 +714,11 @@ function submit(){{
     );
 
     loop {
-        let (mut stream, _) = tokio::time::timeout(
-            std::time::Duration::from_secs(300),
-            listener.accept(),
-        )
-        .await
-        .context("Microsoft login timed out (5 minutes)")?
-        .context("failed to accept connection")?;
+        let (mut stream, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(300), listener.accept())
+                .await
+                .context("Microsoft login timed out (5 minutes)")?
+                .context("failed to accept connection")?;
 
         let mut buf = vec![0_u8; 16384];
         let n = stream.read(&mut buf).await.unwrap_or(0);

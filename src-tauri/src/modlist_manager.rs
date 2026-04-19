@@ -64,7 +64,10 @@ pub fn create_modlist_from_root(
 
     // Create subdirectories
     std::fs::create_dir_all(modlist_dir.join("local-jars")).with_context(|| {
-        format!("failed to create local-jars directory for modlist '{}'", name)
+        format!(
+            "failed to create local-jars directory for modlist '{}'",
+            name
+        )
     })?;
     std::fs::create_dir_all(modlist_dir.join("custom_configs")).with_context(|| {
         format!(
@@ -104,8 +107,7 @@ pub fn delete_modlist_command(
     launcher_paths: State<'_, LauncherPaths>,
     modlist_name: String,
 ) -> Result<(), String> {
-    delete_modlist_from_root(launcher_paths.root_dir(), &modlist_name)
-        .map_err(|e| e.to_string())
+    delete_modlist_from_root(launcher_paths.root_dir(), &modlist_name).map_err(|e| e.to_string())
 }
 
 pub fn delete_modlist_from_root(root_dir: &Path, modlist_name: &str) -> Result<()> {
@@ -148,8 +150,7 @@ pub fn import_modlist_command(
     launcher_paths: State<'_, LauncherPaths>,
     source_path: String,
 ) -> Result<String, String> {
-    import_modlist_from_root(launcher_paths.root_dir(), &source_path)
-        .map_err(|e| e.to_string())
+    import_modlist_from_root(launcher_paths.root_dir(), &source_path).map_err(|e| e.to_string())
 }
 
 /// Pick a unique name: if `base` already exists, try `base (1)`, `base (2)`, etc.
@@ -197,7 +198,8 @@ fn import_modlist_from_root(root_dir: &Path, source_path: &str) -> Result<String
         };
 
         let base_name = if archive_root.is_empty() {
-            source.file_stem()
+            source
+                .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("Imported")
                 .to_string()
@@ -213,18 +215,26 @@ fn import_modlist_from_root(root_dir: &Path, source_path: &str) -> Result<String
         for i in 0..archive.len() {
             let mut entry = archive.by_index(i)?;
             let raw_name = entry.name().to_string();
-            if entry.is_dir() { continue; }
+            if entry.is_dir() {
+                continue;
+            }
 
             // Strip the archive root prefix to get relative path
             let relative = if !archive_root.is_empty() && raw_name.starts_with(&archive_root) {
-                raw_name[archive_root.len()..].trim_start_matches('/').to_string()
+                raw_name[archive_root.len()..]
+                    .trim_start_matches('/')
+                    .to_string()
             } else {
                 raw_name.clone()
             };
-            if relative.is_empty() { continue; }
+            if relative.is_empty() {
+                continue;
+            }
 
             // Skip cached mod jars — they'll be re-downloaded on launch
-            if relative.starts_with("cache/") { continue; }
+            if relative.starts_with("cache/") {
+                continue;
+            }
 
             let dest_path = modlist_dir.join(&relative);
             if let Some(parent) = dest_path.parent() {
@@ -248,10 +258,10 @@ fn import_modlist_from_root(root_dir: &Path, source_path: &str) -> Result<String
         Ok(modlist_name)
     } else {
         // Legacy: plain rules.json import — use filename as base name
-        let mut modlist = ModList::read_from_file(source)
-            .with_context(|| "invalid rules file")?;
+        let mut modlist = ModList::read_from_file(source).with_context(|| "invalid rules file")?;
 
-        let base_name = source.file_stem()
+        let base_name = source
+            .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("Imported")
             .to_string();
@@ -395,11 +405,18 @@ mod tests {
         )
         .unwrap();
 
-        let rules_path = root.join("mod-lists").join("My New Pack").join("rules.json");
+        let rules_path = root
+            .join("mod-lists")
+            .join("My New Pack")
+            .join("rules.json");
         assert!(rules_path.exists());
 
         // local-jars and custom_configs directories should exist
-        assert!(root.join("mod-lists").join("My New Pack").join("local-jars").exists());
+        assert!(root
+            .join("mod-lists")
+            .join("My New Pack")
+            .join("local-jars")
+            .exists());
         assert!(root
             .join("mod-lists")
             .join("My New Pack")
@@ -490,7 +507,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(modlist_dir.join("local-jars").join("custom-patch-1.0.jar").exists());
+        assert!(modlist_dir
+            .join("local-jars")
+            .join("custom-patch-1.0.jar")
+            .exists());
 
         let snapshot = load_editor_snapshot_from_root(&root, "Test Pack").unwrap();
         assert_eq!(snapshot.rows.len(), 1);

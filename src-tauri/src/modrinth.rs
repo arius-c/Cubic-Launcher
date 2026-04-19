@@ -29,7 +29,146 @@ pub fn mc_version_matches(pattern: &str, concrete: &str) -> bool {
     concrete.starts_with(prefix) && concrete.as_bytes().get(prefix.len()) == Some(&b'.')
 }
 
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+fn compare_minecraft_versions(left: &str, right: &str) -> Option<std::cmp::Ordering> {
+    let parse = |value: &str| -> Option<Vec<u64>> {
+        value
+            .split('.')
+            .map(|segment| {
+                let numeric = segment
+                    .trim()
+                    .split(|ch: char| !ch.is_ascii_digit())
+                    .next()
+                    .unwrap_or("");
+                if numeric.is_empty() {
+                    None
+                } else {
+                    numeric.parse::<u64>().ok()
+                }
+            })
+            .collect()
+    };
+
+    let mut left_parts = parse(left)?;
+    let mut right_parts = parse(right)?;
+    let max_len = left_parts.len().max(right_parts.len());
+    left_parts.resize(max_len, 0);
+    right_parts.resize(max_len, 0);
+    Some(left_parts.cmp(&right_parts))
+}
+
+fn extract_embedded_minecraft_versions(text: &str) -> Vec<String> {
+    let mut versions = Vec::new();
+    let mut current = String::new();
+
+    for ch in text.chars() {
+        if ch.is_ascii_digit() || ch == '.' {
+            current.push(ch);
+            continue;
+        }
+
+        if current.starts_with("1.") && current.matches('.').count() >= 1 {
+            versions.push(current.clone());
+        }
+        current.clear();
+    }
+
+    if current.starts_with("1.") && current.matches('.').count() >= 1 {
+        versions.push(current);
+    }
+
+    versions
+}
+
+fn explicit_version_affinity(version: &ModrinthVersion, target: &ResolutionTarget) -> i32 {
+    let mut explicit_versions = extract_embedded_minecraft_versions(&version.version_number);
+    if let Some(file) = version.primary_file() {
+        explicit_versions.extend(extract_embedded_minecraft_versions(&file.filename));
+    }
+
+    if explicit_versions.is_empty() {
+        return 0;
+    }
+
+    if explicit_versions
+        .iter()
+        .any(|candidate| candidate == &target.minecraft_version)
+    {
+        return 3;
+    }
+
+    let target_prefix = format!(
+        "{}.",
+        target
+            .minecraft_version
+            .rsplit_once('.')
+            .map(|(prefix, _)| prefix)
+            .unwrap_or(&target.minecraft_version)
+    );
+
+    if explicit_versions
+        .iter()
+        .all(|candidate| candidate.starts_with(&target_prefix))
+        && explicit_versions.iter().any(|candidate| {
+            compare_minecraft_versions(candidate, &target.minecraft_version)
+                .is_some_and(|ordering| ordering != std::cmp::Ordering::Greater)
+        })
+    {
+        return 2;
+    }
+
+    0
+}
+
+fn game_version_affinity(version: &ModrinthVersion, target: &ResolutionTarget) -> i32 {
+    if version
+        .game_versions
+        .iter()
+        .any(|game_version| game_version == &target.minecraft_version)
+    {
+        return 4;
+    }
+
+    if version.game_versions.iter().any(|game_version| {
+        game_version
+            .strip_suffix(".x")
+            .or_else(|| game_version.strip_suffix(".X"))
+            .is_some_and(|prefix| target.minecraft_version.starts_with(&format!("{prefix}.")))
+    }) {
+        return 3;
+    }
+
+    if version
+        .game_versions
+        .iter()
+        .any(|game_version| mc_version_matches(game_version, &target.minecraft_version))
+    {
+        return 2;
+    }
+
+    0
+}
+
+pub fn sort_versions_by_target_preference(
+    versions: &mut [ModrinthVersion],
+    target: &ResolutionTarget,
+) {
+    versions.sort_by(|left, right| {
+        let left_key = (
+            game_version_affinity(left, target),
+            explicit_version_affinity(left, target),
+            &left.date_published,
+        );
+        let right_key = (
+            game_version_affinity(right, target),
+            explicit_version_affinity(right, target),
+            &right.date_published,
+        );
+        right_key.cmp(&left_key)
+    });
+}
+
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const MAX_REQUEST_ATTEMPTS: u32 = 4;
 
 fn build_http_client() -> reqwest::Client {
     reqwest::Client::builder()
@@ -44,18 +183,47 @@ async fn send_with_retry(
     http_client: &reqwest::Client,
     url: reqwest::Url,
 ) -> reqwest::Result<reqwest::Response> {
-    let first = http_client.get(url.clone()).send().await?;
-    if first.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
-        return Ok(first);
+    let mut backoff = Duration::from_secs(2);
+
+    for attempt in 1..=MAX_REQUEST_ATTEMPTS {
+        match http_client.get(url.clone()).send().await {
+            Ok(response) => {
+                if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    if attempt == MAX_REQUEST_ATTEMPTS {
+                        return Ok(response);
+                    }
+
+                    let retry_after_secs = response
+                        .headers()
+                        .get(reqwest::header::RETRY_AFTER)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(backoff.as_secs().max(1))
+                        .min(20);
+                    tokio::time::sleep(Duration::from_secs(retry_after_secs)).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(20));
+                    continue;
+                }
+
+                if response.status().is_server_error() && attempt < MAX_REQUEST_ATTEMPTS {
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(20));
+                    continue;
+                }
+
+                return Ok(response);
+            }
+            Err(error)
+                if (error.is_timeout() || error.is_connect() || error.is_request())
+                    && attempt < MAX_REQUEST_ATTEMPTS =>
+            {
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(20));
+            }
+            Err(error) => return Err(error),
+        }
     }
-    let retry_after_secs = first
-        .headers()
-        .get(reqwest::header::RETRY_AFTER)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(2)
-        .min(10);
-    tokio::time::sleep(std::time::Duration::from_secs(retry_after_secs)).await;
+
     http_client.get(url).send().await
 }
 
@@ -135,14 +303,30 @@ impl ModrinthClient {
         let game_versions_json = serde_json::to_string(&vec![minecraft_version])?;
         url.query_pairs_mut()
             .append_pair("game_versions", &game_versions_json);
-        let response = send_with_retry(&self.http_client, url).await
-            .with_context(|| format!("failed to query Modrinth versions for content pack '{project_id}'"))?
+        let response = send_with_retry(&self.http_client, url)
+            .await
+            .with_context(|| {
+                format!("failed to query Modrinth versions for content pack '{project_id}'")
+            })?
             .error_for_status()
-            .with_context(|| format!("Modrinth returned an error for content pack '{project_id}'"))?;
-        let versions = response.json::<Vec<ModrinthVersion>>().await
-            .with_context(|| format!("failed to deserialize Modrinth versions for content pack '{project_id}'"))?;
+            .with_context(|| {
+                format!("Modrinth returned an error for content pack '{project_id}'")
+            })?;
+        let versions = response
+            .json::<Vec<ModrinthVersion>>()
+            .await
+            .with_context(|| {
+                format!("failed to deserialize Modrinth versions for content pack '{project_id}'")
+            })?;
         // Filter to only versions matching the MC version
-        Ok(versions.into_iter().filter(|v| v.game_versions.iter().any(|gv| mc_version_matches(gv, minecraft_version))).collect())
+        Ok(versions
+            .into_iter()
+            .filter(|v| {
+                v.game_versions
+                    .iter()
+                    .any(|gv| mc_version_matches(gv, minecraft_version))
+            })
+            .collect())
     }
 
     pub async fn fetch_version(&self, version_id: &str) -> Result<Option<ModrinthVersion>> {
@@ -283,9 +467,9 @@ pub fn select_latest_compatible_version(
     versions: &[ModrinthVersion],
     target: &ResolutionTarget,
 ) -> Option<ModrinthVersion> {
-    filter_compatible_versions(versions, target)
-        .into_iter()
-        .max_by(|left, right| left.date_published.cmp(&right.date_published))
+    let mut compatible = filter_compatible_versions(versions, target);
+    sort_versions_by_target_preference(&mut compatible, target);
+    compatible.into_iter().next()
 }
 
 impl ModLoader {
@@ -302,9 +486,12 @@ impl ModLoader {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::{
         build_project_versions_url, build_version_url, filter_compatible_versions,
-        select_latest_compatible_version, DependencyType, ModrinthVersion,
+        select_latest_compatible_version, sort_versions_by_target_preference, DependencyType,
+        ModrinthVersion,
     };
     use crate::resolver::{ModLoader, ResolutionTarget};
 
@@ -445,5 +632,53 @@ mod tests {
                 .filename,
             "sodium-new-primary.jar"
         );
+    }
+
+    #[test]
+    fn prefers_exact_target_line_over_newer_patch_line() {
+        let target = ResolutionTarget {
+            minecraft_version: "1.21.6".into(),
+            mod_loader: ModLoader::Fabric,
+        };
+        let mut versions = vec![
+            ModrinthVersion {
+                id: "future".into(),
+                project_id: "c2me-fabric".into(),
+                version_number: "0.3.4.0.0+1.21.8".into(),
+                name: "Future line".into(),
+                game_versions: vec!["1.21.x".into()],
+                loaders: vec!["fabric".into()],
+                dependencies: Vec::new(),
+                files: vec![super::ModrinthFile {
+                    hashes: HashMap::new(),
+                    url: "https://example.invalid/future.jar".into(),
+                    filename: "c2me-fabric-mc1.21.8-0.3.4.0.0.jar".into(),
+                    primary: true,
+                    size: 1,
+                }],
+                date_published: "2026-04-01T10:00:00.000Z".into(),
+            },
+            ModrinthVersion {
+                id: "target".into(),
+                project_id: "c2me-fabric".into(),
+                version_number: "0.3.4+alpha.0.19+1.21.6".into(),
+                name: "Target line".into(),
+                game_versions: vec!["1.21.x".into()],
+                loaders: vec!["fabric".into()],
+                dependencies: Vec::new(),
+                files: vec![super::ModrinthFile {
+                    hashes: HashMap::new(),
+                    url: "https://example.invalid/target.jar".into(),
+                    filename: "c2me-fabric-mc1.21.6-0.3.4.jar".into(),
+                    primary: true,
+                    size: 1,
+                }],
+                date_published: "2026-03-01T10:00:00.000Z".into(),
+            },
+        ];
+
+        sort_versions_by_target_preference(&mut versions, &target);
+
+        assert_eq!(versions[0].id, "target");
     }
 }

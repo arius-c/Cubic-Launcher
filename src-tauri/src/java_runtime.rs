@@ -175,9 +175,16 @@ pub fn select_java_for_minecraft(
 ) -> Result<Option<JavaInstallation>> {
     let required_version = required_java_version_for_minecraft(minecraft_version)?;
 
+    Ok(select_java_for_requirement(installations, required_version))
+}
+
+pub fn select_java_for_requirement(
+    installations: &[JavaInstallation],
+    required_version: u32,
+) -> Option<JavaInstallation> {
     // Prefer exact match, but accept any version >= required (Java is backward compatible).
     // Among compatible versions, prefer the closest to the required version.
-    Ok(installations
+    installations
         .iter()
         .filter(|installation| installation.version >= required_version)
         .cloned()
@@ -190,7 +197,7 @@ pub fn select_java_for_minecraft(
                 .then(left.version.cmp(&right.version))
                 .then(left.source.cmp(&right.source))
                 .then(left.path.cmp(&right.path))
-        }))
+        })
 }
 
 pub fn required_java_version_for_minecraft(minecraft_version: &str) -> Result<u32> {
@@ -398,8 +405,8 @@ mod tests {
         candidates_from_java_home_root, candidates_from_path_entries,
         inspect_java_binary_candidates, parse_java_architecture, parse_java_major_version,
         persist_java_installations, required_java_version_for_minecraft, select_java_for_minecraft,
-        JavaBinaryCandidate, JavaBinaryInspector, JavaInstallation, JavaInstallationSource,
-        JavaProbe,
+        select_java_for_requirement, JavaBinaryCandidate, JavaBinaryInspector, JavaInstallation,
+        JavaInstallationSource, JavaProbe,
     };
 
     fn unique_test_root() -> PathBuf {
@@ -551,6 +558,31 @@ mod tests {
 
         assert_eq!(selected.path, system_path);
         assert_eq!(selected.version, 17);
+    }
+
+    #[test]
+    fn explicit_java_requirement_prefers_matching_runtime() {
+        let installations = vec![
+            JavaInstallation {
+                path: PathBuf::from("C:/Java/jdk-21/bin/java.exe"),
+                version: 21,
+                auto_detected: true,
+                architecture: "x64".into(),
+                source: JavaInstallationSource::SystemPath,
+            },
+            JavaInstallation {
+                path: PathBuf::from("C:/Launcher/java-runtimes/java-22/bin/java.exe"),
+                version: 22,
+                auto_detected: true,
+                architecture: "x64".into(),
+                source: JavaInstallationSource::LauncherManaged,
+            },
+        ];
+
+        let selected =
+            select_java_for_requirement(&installations, 22).expect("Java 22 should be selected");
+
+        assert_eq!(selected.version, 22);
     }
 
     #[test]

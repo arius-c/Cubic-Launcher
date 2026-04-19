@@ -38,8 +38,12 @@ pub struct CustomConfig {
     pub files: Vec<String>,
 }
 
-fn default_true() -> bool { true }
-fn is_true(v: &bool) -> bool { *v }
+fn default_true() -> bool {
+    true
+}
+fn is_true(v: &bool) -> bool {
+    *v
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rule {
@@ -108,18 +112,17 @@ impl ModList {
             rules: file.rules,
         };
 
-        modlist.validate().with_context(|| {
-            format!("validation failed for rules file at {}", path.display())
-        })?;
+        modlist
+            .validate()
+            .with_context(|| format!("validation failed for rules file at {}", path.display()))?;
 
         Ok(modlist)
     }
 
     pub fn write_to_file(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!("failed to create directory {}", parent.display())
-            })?;
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create directory {}", parent.display()))?;
         }
 
         let file = ModListFileV4 {
@@ -130,8 +133,8 @@ impl ModList {
             rules: self.rules.clone(),
         };
 
-        let json = serde_json::to_string_pretty(&file)
-            .context("failed to serialize modlist to JSON")?;
+        let json =
+            serde_json::to_string_pretty(&file).context("failed to serialize modlist to JSON")?;
 
         fs::write(path, format!("{json}\n"))
             .with_context(|| format!("failed to write rules file at {}", path.display()))?;

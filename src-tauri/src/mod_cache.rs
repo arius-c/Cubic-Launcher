@@ -95,6 +95,60 @@ impl<'connection> SqliteModCacheRepository<'connection> {
 
         Ok(record)
     }
+
+    pub fn find_compatible_by_project(
+        &self,
+        project_id: &str,
+        target: &ResolutionTarget,
+    ) -> Result<Option<ModCacheRecord>> {
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT
+                modrinth_project_id,
+                modrinth_version_id,
+                jar_filename,
+                mc_version,
+                mod_loader,
+                file_hash,
+                download_url,
+                is_local
+            FROM mod_cache
+            WHERE modrinth_project_id = ?1
+              AND mc_version = ?2
+              AND mod_loader = ?3
+            ORDER BY rowid DESC
+            "#,
+        )?;
+
+        let rows = statement.query_map(
+            params![
+                project_id,
+                &target.minecraft_version,
+                target.mod_loader.as_modrinth_loader(),
+            ],
+            |row| {
+                Ok(ModCacheRecord {
+                    modrinth_project_id: row.get(0)?,
+                    modrinth_version_id: row.get(1)?,
+                    jar_filename: row.get(2)?,
+                    mc_version: row.get(3)?,
+                    mod_loader: row.get(4)?,
+                    file_hash: row.get(5)?,
+                    download_url: row.get(6)?,
+                    is_local: row.get(7)?,
+                })
+            },
+        )?;
+
+        for row in rows {
+            let record = row?;
+            if self.mods_cache_dir.join(&record.jar_filename).exists() {
+                return Ok(Some(record));
+            }
+        }
+
+        Ok(None)
+    }
 }
 
 impl ModCacheLookup for SqliteModCacheRepository<'_> {
@@ -332,6 +386,42 @@ mod tests {
 
         assert_eq!(record.modrinth_project_id, "sodium");
         assert_eq!(record.jar_filename, "sodium.jar");
+
+        drop(connection);
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    #[test]
+    fn repository_finds_compatible_project_record_for_target() {
+        let root_dir = unique_test_root();
+        let database_path = root_dir.join("launcher_data.db");
+        let mods_cache_dir = root_dir.join("cache").join("mods");
+
+        fs::create_dir_all(&mods_cache_dir).expect("mods cache directory should be created");
+        initialize_database(&database_path).expect("database should initialize");
+
+        let connection = Connection::open(&database_path).expect("database should open");
+        let repository = SqliteModCacheRepository::new(&connection, &mods_cache_dir);
+        let old_version = version("sodium", "version-older", "sodium-old.jar");
+        let new_version = version("sodium", "version-newer", "sodium-new.jar");
+
+        repository
+            .upsert_modrinth_version(&old_version, &target())
+            .expect("older cache record should insert");
+        repository
+            .upsert_modrinth_version(&new_version, &target())
+            .expect("newer cache record should insert");
+
+        fs::write(mods_cache_dir.join("sodium-old.jar"), b"old").expect("old jar should exist");
+        fs::write(mods_cache_dir.join("sodium-new.jar"), b"new").expect("new jar should exist");
+
+        let record = repository
+            .find_compatible_by_project("sodium", &target())
+            .expect("compatible lookup should succeed")
+            .expect("compatible record should exist");
+
+        assert_eq!(record.modrinth_project_id, "sodium");
+        assert_eq!(record.modrinth_version_id, "version-newer");
 
         drop(connection);
         fs::remove_dir_all(&root_dir).expect("temporary root should be removable");

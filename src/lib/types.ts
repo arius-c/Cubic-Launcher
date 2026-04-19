@@ -137,6 +137,7 @@ export type ShellSnapshot = {
     max_ram_mb: number;
     custom_jvm_args: string;
     profiler_enabled: boolean;
+    cache_only_mode: boolean;
     wrapper_command: string;
     java_path_override: string;
   };

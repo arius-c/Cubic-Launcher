@@ -1,13 +1,13 @@
 use tauri::Manager;
 
 pub mod account_manager;
-pub mod content_packs;
 pub mod adoptium;
 pub mod app_shell;
 pub mod config_attribution;
+pub mod content_packs;
 mod database;
-pub mod dependencies;
 pub mod debug_trace;
+pub mod dependencies;
 pub mod editor_data;
 pub mod instance_configs;
 pub mod instance_mods;
@@ -17,9 +17,9 @@ pub mod launch_preview;
 mod launcher_paths;
 pub mod loader_metadata;
 pub mod microsoft_auth;
+pub mod minecraft_downloader;
 pub mod mod_cache;
 pub mod modlist_assets;
-pub mod minecraft_downloader;
 pub mod modlist_manager;
 pub mod modrinth;
 pub mod offline_account;
@@ -45,7 +45,16 @@ pub fn run() {
             database::initialize_database(launcher_paths.database_path())
                 .map_err(|error| std::io::Error::other(error.to_string()))?;
 
-            app.manage(launcher_paths);
+            app.manage(launcher_paths.clone());
+
+            if launch_preview::automation_mode_enabled() {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.hide();
+                }
+            }
+
+            launch_preview::maybe_start_automation_verifier(app.handle().clone(), launcher_paths)
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
 
             Ok(())
         })
@@ -95,6 +104,7 @@ pub fn run() {
             content_packs::save_content_groups_command,
             content_packs::save_content_version_rules_command,
             launch_preview::start_launch_command,
+            launch_preview::verify_launch_command,
             launch_preview::stop_minecraft_command
         ])
         .run(tauri::generate_context!())

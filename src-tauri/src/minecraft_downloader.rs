@@ -92,10 +92,7 @@ struct VersionArguments {
 #[serde(untagged)]
 enum ArgEntry {
     Simple(String),
-    Conditional {
-        rules: Vec<OsRule>,
-        value: ArgValue,
-    },
+    Conditional { rules: Vec<OsRule>, value: ArgValue },
 }
 
 #[derive(Deserialize)]
@@ -259,8 +256,7 @@ pub(crate) async fn download_file_verified(
         .await
         .with_context(|| format!("failed to read response body from {url}"))?;
 
-    std::fs::write(dest, &bytes)
-        .with_context(|| format!("failed to write {}", dest.display()))?;
+    std::fs::write(dest, &bytes).with_context(|| format!("failed to write {}", dest.display()))?;
 
     // Verify after write
     let actual = {
@@ -298,8 +294,7 @@ async fn download_file(client: &reqwest::Client, url: &str, dest: &Path) -> Resu
         .bytes()
         .await
         .with_context(|| format!("failed to read response body from {url}"))?;
-    std::fs::write(dest, &bytes)
-        .with_context(|| format!("failed to write {}", dest.display()))?;
+    std::fs::write(dest, &bytes).with_context(|| format!("failed to write {}", dest.display()))?;
     Ok(())
 }
 
@@ -318,11 +313,7 @@ pub async fn fetch_all_versions(http_client: &reqwest::Client) -> Result<Vec<Str
         .await
         .context("failed to deserialize Minecraft version manifest")?;
 
-    Ok(manifest
-        .versions
-        .into_iter()
-        .map(|v| v.id)
-        .collect())
+    Ok(manifest.versions.into_iter().map(|v| v.id).collect())
 }
 
 /// Returns `true` if `client.jar` for the given version is already in the cache.
@@ -436,8 +427,7 @@ pub fn start_minecraft_predownload_command(
                 },
             );
 
-            match ensure_minecraft_version(&http_client, version, &launcher_paths, |_, _| {})
-                .await
+            match ensure_minecraft_version(&http_client, version, &launcher_paths, |_, _| {}).await
             {
                 Ok(_) => completed += 1,
                 Err(e) => {
@@ -496,8 +486,7 @@ pub async fn ensure_minecraft_version(
 
     // 3. Ensure client JAR.
     on_progress("Ensure client JAR", minecraft_version);
-    let client_jar_path =
-        ensure_client_jar(http_client, &version_json, &version_dir).await?;
+    let client_jar_path = ensure_client_jar(http_client, &version_json, &version_dir).await?;
 
     // 4. Ensure libraries.
     on_progress("Ensure libraries", minecraft_version);
@@ -732,10 +721,7 @@ fn extract_arguments(version_json: &VersionJson) -> (Vec<String>, Vec<String>) {
         (game, jvm)
     } else if let Some(mc_args) = &version_json.minecraft_arguments {
         // Old pre-1.13 format: a single space-separated string.
-        let game = mc_args
-            .split_whitespace()
-            .map(|s| s.to_string())
-            .collect();
+        let game = mc_args.split_whitespace().map(|s| s.to_string()).collect();
         (game, Vec::new())
     } else {
         (Vec::new(), Vec::new())

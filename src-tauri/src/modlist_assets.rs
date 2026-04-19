@@ -4,7 +4,7 @@ use std::io::{Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result};
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::{Deserialize, Serialize};
 use tauri::State;
 use zip::write::FileOptions;
@@ -163,17 +163,23 @@ pub struct InstanceFileNode {
 pub fn list_instance_files_command(
     launcher_paths: State<'_, LauncherPaths>,
     modlist_name: String,
-    #[allow(unused_variables)]
-    relative_path: Option<String>,
+    #[allow(unused_variables)] relative_path: Option<String>,
 ) -> Result<Vec<InstanceFileNode>, String> {
-    let instances_dir = launcher_paths.modlists_dir().join(&modlist_name).join("instances");
-    if !instances_dir.exists() { return Ok(vec![]); }
+    let instances_dir = launcher_paths
+        .modlists_dir()
+        .join(&modlist_name)
+        .join("instances");
+    if !instances_dir.exists() {
+        return Ok(vec![]);
+    }
 
     let target = match &relative_path {
         Some(rel) if !rel.is_empty() => instances_dir.join(rel),
         _ => instances_dir.clone(),
     };
-    if !target.exists() { return Ok(vec![]); }
+    if !target.exists() {
+        return Ok(vec![]);
+    }
 
     // Determine depth for filtering (0 = listing instance roots, 1 = inside an instance)
     let depth = match &relative_path {
@@ -191,18 +197,29 @@ pub fn list_instance_files_command(
     let mut nodes = Vec::new();
     for entry in sorted {
         let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') { continue; }
+        if name.starts_with('.') {
+            continue;
+        }
         // Skip launcher-managed dirs at instance root level
-        if depth == 1 && matches!(name.as_str(),
-            "mods" | "libraries" | "natives" | "assets" | "logs" | "data" |
-            "downloads"
-        ) { continue; }
+        if depth == 1
+            && matches!(
+                name.as_str(),
+                "mods" | "libraries" | "natives" | "assets" | "logs" | "data" | "downloads"
+            )
+        {
+            continue;
+        }
         let path = entry.path();
         let relative = path.strip_prefix(&instances_dir).unwrap_or(&path);
         let rel_str = relative.to_string_lossy().replace('\\', "/");
         let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
         // Children are NOT loaded here — frontend requests them on expand
-        nodes.push(InstanceFileNode { name, path: rel_str, is_dir, children: vec![] });
+        nodes.push(InstanceFileNode {
+            name,
+            path: rel_str,
+            is_dir,
+            children: vec![],
+        });
     }
     Ok(nodes)
 }
@@ -261,7 +278,11 @@ pub fn save_modlist_presentation_from_root(
     input: &SaveModlistPresentationInput,
 ) -> Result<()> {
     let presentation = ModlistPresentation {
-        display_name: input.display_name.clone().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+        display_name: input
+            .display_name
+            .clone()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
         icon_label: normalize_icon_label(&input.icon_label, &input.modlist_name),
         icon_accent: input.icon_accent.trim().to_string(),
         notes: input.notes.trim().to_string(),
@@ -444,13 +465,20 @@ pub fn export_modlist_from_root(root_dir: &Path, input: &ExportModlistInput) -> 
         (input.data_packs, "datapacks"),
         (input.shaders, "shaderpacks"),
     ] {
-        if !flag { continue; }
+        if !flag {
+            continue;
+        }
         for path in collect_files_recursive(&modlist_dir)? {
-            if !path_contains_component(&path, dir_name) { continue; }
-            let relative = path.strip_prefix(&modlist_dir)
+            if !path_contains_component(&path, dir_name) {
+                continue;
+            }
+            let relative = path
+                .strip_prefix(&modlist_dir)
                 .with_context(|| format!("failed to make {} relative", path.display()))?;
             add_file_to_zip(
-                &mut archive, &mut added_paths, &path,
+                &mut archive,
+                &mut added_paths,
+                &path,
                 &format!("{archive_root}/{}", path_to_archive_string(relative)),
             )?;
         }
@@ -462,16 +490,35 @@ pub fn export_modlist_from_root(root_dir: &Path, input: &ExportModlistInput) -> 
             if input.selected_other_paths.is_empty() {
                 // Legacy: export everything except well-known dirs
                 for path in collect_files_recursive(&modlist_dir)? {
-                    let relative = path.strip_prefix(&modlist_dir)
+                    let relative = path
+                        .strip_prefix(&modlist_dir)
                         .with_context(|| format!("failed to make {} relative", path.display()))?;
                     let relative_string = path_to_archive_string(relative);
-                    if relative_string == RULES_FILENAME || relative_string == MODLIST_PRESENTATION_FILENAME { continue; }
-                    if path_contains_any_component(&path, &[
-                        "mods", "config", "resourcepacks", "datapacks", "shaderpacks",
-                        "libraries", "assets", "natives", "minecraft",
-                    ]) { continue; }
+                    if relative_string == RULES_FILENAME
+                        || relative_string == MODLIST_PRESENTATION_FILENAME
+                    {
+                        continue;
+                    }
+                    if path_contains_any_component(
+                        &path,
+                        &[
+                            "mods",
+                            "config",
+                            "resourcepacks",
+                            "datapacks",
+                            "shaderpacks",
+                            "libraries",
+                            "assets",
+                            "natives",
+                            "minecraft",
+                        ],
+                    ) {
+                        continue;
+                    }
                     add_file_to_zip(
-                        &mut archive, &mut added_paths, &path,
+                        &mut archive,
+                        &mut added_paths,
+                        &path,
                         &format!("{archive_root}/{relative_string}"),
                     )?;
                 }
@@ -481,16 +528,25 @@ pub fn export_modlist_from_root(root_dir: &Path, input: &ExportModlistInput) -> 
                     let full_path = instances_dir.join(sel_path);
                     if full_path.is_file() {
                         add_file_if_exists(
-                            &mut archive, &mut added_paths, &full_path,
+                            &mut archive,
+                            &mut added_paths,
+                            &full_path,
                             &format!("{archive_root}/instances/{}", sel_path.replace('\\', "/")),
                         )?;
                     } else if full_path.is_dir() {
                         for path in collect_files_recursive(&full_path)? {
-                            let relative = path.strip_prefix(&instances_dir)
-                                .with_context(|| format!("failed to make {} relative", path.display()))?;
+                            let relative =
+                                path.strip_prefix(&instances_dir).with_context(|| {
+                                    format!("failed to make {} relative", path.display())
+                                })?;
                             add_file_to_zip(
-                                &mut archive, &mut added_paths, &path,
-                                &format!("{archive_root}/instances/{}", path_to_archive_string(relative)),
+                                &mut archive,
+                                &mut added_paths,
+                                &path,
+                                &format!(
+                                    "{archive_root}/instances/{}",
+                                    path_to_archive_string(relative)
+                                ),
                             )?;
                         }
                     }
@@ -707,8 +763,7 @@ mod tests {
     use super::{
         export_modlist_from_root, load_modlist_groups_from_root,
         load_modlist_presentation_from_root, save_modlist_groups_from_root,
-        save_modlist_presentation_from_root, ExportModlistInput, ModlistGroupLayout,
-        PersistedTag,
+        save_modlist_presentation_from_root, ExportModlistInput, ModlistGroupLayout, PersistedTag,
         SaveModlistGroupsInput, SaveModlistPresentationInput, MODLIST_GROUP_LAYOUT_FILENAME,
         MODLIST_PRESENTATION_FILENAME,
     };
@@ -776,12 +831,7 @@ mod tests {
 
         let layout = load_modlist_groups_from_root(&root_dir, "My Pack").expect("should load");
 
-        assert_eq!(
-            layout,
-            ModlistGroupLayout {
-                tags: Vec::new(),
-            }
-        );
+        assert_eq!(layout, ModlistGroupLayout { tags: Vec::new() });
 
         fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
     }
@@ -802,12 +852,7 @@ mod tests {
         save_modlist_groups_from_root(&root_dir, &input).expect("groups should save");
         let reloaded = load_modlist_groups_from_root(&root_dir, "Sky Pack").expect("should load");
 
-        assert_eq!(
-            reloaded,
-            ModlistGroupLayout {
-                tags: input.tags,
-            }
-        );
+        assert_eq!(reloaded, ModlistGroupLayout { tags: input.tags });
 
         fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
     }

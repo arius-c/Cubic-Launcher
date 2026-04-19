@@ -92,7 +92,8 @@ pub fn spawn_and_stream_process(
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
 
-    let mut child = cmd.spawn()
+    let mut child = cmd
+        .spawn()
         .with_context(|| format!("failed to spawn process '{}'", command.program.display()))?;
 
     let pid = child.id();

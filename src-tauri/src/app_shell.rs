@@ -49,6 +49,7 @@ pub struct ShellGlobalSettings {
     pub max_ram_mb: u32,
     pub custom_jvm_args: String,
     pub profiler_enabled: bool,
+    pub cache_only_mode: bool,
     pub wrapper_command: String,
     pub java_path_override: String,
 }
@@ -72,6 +73,7 @@ pub struct ShellGlobalSettingsInput {
     pub max_ram_mb: u32,
     pub custom_jvm_args: String,
     pub profiler_enabled: bool,
+    pub cache_only_mode: bool,
     pub wrapper_command: String,
     pub java_path_override: String,
 }
@@ -357,6 +359,7 @@ fn load_global_settings(connection: &Connection) -> Result<ShellGlobalSettings> 
             .cloned()
             .unwrap_or_else(|| "-XX:+UseG1GC -XX:+ParallelRefProcEnabled".to_string()),
         profiler_enabled: parse_bool_setting(&values, "profiler_enabled").unwrap_or(false),
+        cache_only_mode: parse_bool_setting(&values, "cache_only_mode").unwrap_or(false),
         wrapper_command: values.get("wrapper_command").cloned().unwrap_or_default(),
         java_path_override: values
             .get("java_path_override")
@@ -394,6 +397,15 @@ pub fn save_global_settings(
         (
             "profiler_enabled",
             if settings.profiler_enabled {
+                "true"
+            } else {
+                "false"
+            }
+            .to_string(),
+        ),
+        (
+            "cache_only_mode",
+            if settings.cache_only_mode {
                 "true"
             } else {
                 "false"
@@ -623,6 +635,12 @@ mod tests {
             .expect("global setting should insert");
         connection
             .execute(
+                "INSERT INTO global_settings (key, value) VALUES (?1, ?2)",
+                params!["cache_only_mode", "true"],
+            )
+            .expect("global setting should insert");
+        connection
+            .execute(
                 "INSERT INTO modlist_settings (modlist_name, key, value) VALUES (?1, ?2, ?3)",
                 params!["Cubic Vanilla+", "custom_jvm_args", "-Dpack.profile=test"],
             )
@@ -660,6 +678,7 @@ mod tests {
         );
         assert_eq!(snapshot.global_settings.min_ram_mb, 3072);
         assert_eq!(snapshot.global_settings.max_ram_mb, 5120);
+        assert!(snapshot.global_settings.cache_only_mode);
         assert_eq!(snapshot.global_settings.wrapper_command, "gamemoderun");
         assert_eq!(
             snapshot
@@ -708,6 +727,7 @@ mod tests {
                 max_ram_mb: 6144,
                 custom_jvm_args: "-Dglobal=true".into(),
                 profiler_enabled: true,
+                cache_only_mode: true,
                 wrapper_command: "gamemoderun".into(),
                 java_path_override: "/custom/java".into(),
             },
@@ -737,6 +757,7 @@ mod tests {
         assert_eq!(snapshot.global_settings.max_ram_mb, 6144);
         assert_eq!(snapshot.global_settings.custom_jvm_args, "-Dglobal=true");
         assert!(snapshot.global_settings.profiler_enabled);
+        assert!(snapshot.global_settings.cache_only_mode);
         assert_eq!(snapshot.global_settings.wrapper_command, "gamemoderun");
         assert_eq!(snapshot.global_settings.java_path_override, "/custom/java");
         assert_eq!(

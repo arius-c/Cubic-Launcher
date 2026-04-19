@@ -19,7 +19,9 @@ fn db_availability_get(
     mc_version: &str,
     loader: &str,
 ) -> Vec<(String, bool)> {
-    let Ok(conn) = Connection::open(db_path) else { return vec![] };
+    let Ok(conn) = Connection::open(db_path) else {
+        return vec![];
+    };
     let mut results = Vec::new();
     for mod_id in mod_ids {
         let row: Option<bool> = conn
@@ -39,8 +41,12 @@ fn db_availability_get(
 
 /// Persist Modrinth availability results to the database.
 fn db_availability_set(db_path: &Path, entries: &[(String, String, String, bool)]) {
-    let Ok(conn) = Connection::open(db_path) else { return };
-    let Ok(tx) = conn.unchecked_transaction() else { return };
+    let Ok(conn) = Connection::open(db_path) else {
+        return;
+    };
+    let Ok(tx) = conn.unchecked_transaction() else {
+        return;
+    };
     for (mod_id, mc_version, loader, available) in entries {
         let _ = tx.execute(
             r#"INSERT INTO modrinth_availability (project_id, mc_version, mod_loader, available)
@@ -176,7 +182,8 @@ fn strip_mutual_requires(rules: &mut Vec<Rule>) {
     // Recursively remove mutual requires from all rules.
     fn remove_mutual(rules: &mut Vec<Rule>, pairs: &HashSet<(String, String)>) {
         for rule in rules.iter_mut() {
-            rule.requires.retain(|req| !pairs.contains(&(rule.mod_id.clone(), req.clone())));
+            rule.requires
+                .retain(|req| !pairs.contains(&(rule.mod_id.clone(), req.clone())));
             remove_mutual(&mut rule.alternatives, pairs);
         }
     }
@@ -190,12 +197,22 @@ fn try_resolve(
 ) -> RuleOutcome {
     // 0. Disabled mods are treated as if they don't exist — skip to alternatives.
     if !rule.enabled {
-        return try_alternatives(rule, active_mods, target, FailureReason::ExcludedByActiveMod);
+        return try_alternatives(
+            rule,
+            active_mods,
+            target,
+            FailureReason::ExcludedByActiveMod,
+        );
     }
 
     // 1. Check exclude_if
     if rule.exclude_if.iter().any(|id| active_mods.contains(id)) {
-        return try_alternatives(rule, active_mods, target, FailureReason::ExcludedByActiveMod);
+        return try_alternatives(
+            rule,
+            active_mods,
+            target,
+            FailureReason::ExcludedByActiveMod,
+        );
     }
 
     // 2. Check requires
@@ -205,7 +222,12 @@ fn try_resolve(
 
     // 3. Check version_rules
     if version_rules_conflict(&rule.version_rules, target) {
-        return try_alternatives(rule, active_mods, target, FailureReason::IncompatibleVersion);
+        return try_alternatives(
+            rule,
+            active_mods,
+            target,
+            FailureReason::IncompatibleVersion,
+        );
     }
 
     RuleOutcome::Resolved {
@@ -231,7 +253,10 @@ fn try_alternatives(
 /// Returns true if the version rules exclude this mod for the given target.
 fn version_rules_conflict(version_rules: &[VersionRule], target: &ResolutionTarget) -> bool {
     for vr in version_rules {
-        let version_matches = vr.mc_versions.iter().any(|v| crate::modrinth::mc_version_matches(v, &target.minecraft_version));
+        let version_matches = vr
+            .mc_versions
+            .iter()
+            .any(|v| crate::modrinth::mc_version_matches(v, &target.minecraft_version));
         let vr_loader = vr.loader.to_ascii_lowercase();
         let loader_matches =
             vr_loader == "any" || vr_loader == target.mod_loader.as_modrinth_loader();
@@ -329,7 +354,12 @@ pub async fn resolve_modlist_command(
         let loader_str = mod_loader.clone();
 
         // Check database cache first
-        let cached = db_availability_get(&db_path, &modrinth_ids, &target.minecraft_version, &loader_str);
+        let cached = db_availability_get(
+            &db_path,
+            &modrinth_ids,
+            &target.minecraft_version,
+            &loader_str,
+        );
         let cached_ids: HashSet<String> = cached.iter().map(|(id, _)| id.clone()).collect();
         for (mod_id, available) in &cached {
             if !available {
@@ -354,9 +384,7 @@ pub async fn resolve_modlist_command(
                 let permit_source = semaphore.clone();
                 tasks.spawn(async move {
                     let _permit = permit_source.acquire_owned().await.ok()?;
-                    let result = client
-                        .fetch_project_versions(&mod_id, &target)
-                        .await;
+                    let result = client.fetch_project_versions(&mod_id, &target).await;
                     match result {
                         Ok(v) => Some((mod_id, !v.is_empty())),
                         Err(_) => None, // on network error, skip — don't cache failures
@@ -370,7 +398,12 @@ pub async fn resolve_modlist_command(
                     if !available {
                         ids.remove(&mod_id);
                     }
-                    to_persist.push((mod_id, target.minecraft_version.clone(), loader_str.clone(), available));
+                    to_persist.push((
+                        mod_id,
+                        target.minecraft_version.clone(),
+                        loader_str.clone(),
+                        available,
+                    ));
                 }
             }
 
@@ -534,11 +567,7 @@ pub async fn backfill_availability_command(
 /// Recursively check every alternative in the tree and add viable ones to `ids`.
 /// Only recurses into an alt's children when the alt itself is NOT viable
 /// (its sub-alternatives are only relevant as fallbacks when it fails).
-fn check_viable_alts(
-    rule: &Rule,
-    ids: &mut HashSet<String>,
-    target: &ResolutionTarget,
-) {
+fn check_viable_alts(rule: &Rule, ids: &mut HashSet<String>, target: &ResolutionTarget) {
     for alt in &rule.alternatives {
         if ids.contains(&alt.mod_id) {
             continue;
@@ -615,7 +644,9 @@ mod tests {
         assert_eq!(result.resolved_rules.len(), 2);
         assert_eq!(
             result.resolved_rules[0].outcome,
-            RuleOutcome::Resolved { resolved_id: "sodium".into() }
+            RuleOutcome::Resolved {
+                resolved_id: "sodium".into()
+            }
         );
     }
 
@@ -641,7 +672,9 @@ mod tests {
         assert!(result.active_mods.contains("iris"));
         assert_eq!(
             result.resolved_rules[1].outcome,
-            RuleOutcome::Resolved { resolved_id: "iris".into() }
+            RuleOutcome::Resolved {
+                resolved_id: "iris".into()
+            }
         );
     }
 
@@ -800,7 +833,9 @@ mod tests {
         assert!(result.active_mods.contains("c"));
         assert_eq!(
             result.resolved_rules[0].outcome,
-            RuleOutcome::Resolved { resolved_id: "c".into() }
+            RuleOutcome::Resolved {
+                resolved_id: "c".into()
+            }
         );
     }
 

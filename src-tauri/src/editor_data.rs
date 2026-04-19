@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use crate::launcher_paths::LauncherPaths;
-use crate::rules::{CustomConfig, ModList, ModSource, Rule, VersionRule, VersionRuleKind, RULES_FILENAME};
+use crate::rules::{
+    CustomConfig, ModList, ModSource, Rule, VersionRule, VersionRuleKind, RULES_FILENAME,
+};
 
 // ── Snapshot types (sent to frontend) ────────────────────────────────────────
 
@@ -242,8 +244,7 @@ pub fn save_alternative_order_command(
     launcher_paths: State<'_, LauncherPaths>,
     input: SaveAlternativeOrderInput,
 ) -> Result<(), String> {
-    save_alternative_order_from_root(launcher_paths.root_dir(), &input)
-        .map_err(|e| e.to_string())
+    save_alternative_order_from_root(launcher_paths.root_dir(), &input).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -259,8 +260,7 @@ pub fn add_nested_alternative_command(
     launcher_paths: State<'_, LauncherPaths>,
     input: AddNestedAlternativeInput,
 ) -> Result<(), String> {
-    add_nested_alternative_from_root(launcher_paths.root_dir(), &input)
-        .map_err(|e| e.to_string())
+    add_nested_alternative_from_root(launcher_paths.root_dir(), &input).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -276,8 +276,7 @@ pub fn save_incompatibilities_command(
     launcher_paths: State<'_, LauncherPaths>,
     input: SaveIncompatibilitiesInput,
 ) -> Result<(), String> {
-    save_incompatibilities_from_root(launcher_paths.root_dir(), &input)
-        .map_err(|e| e.to_string())
+    save_incompatibilities_from_root(launcher_paths.root_dir(), &input).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -392,14 +391,16 @@ pub fn add_mod_rule_from_root(root_dir: &Path, input: &AddModRuleInput) -> Resul
                 .join(&input.modlist_name)
                 .join("local-jars");
             std::fs::create_dir_all(&local_jars_dir).with_context(|| {
-                format!("failed to create local-jars directory at {}", local_jars_dir.display())
+                format!(
+                    "failed to create local-jars directory at {}",
+                    local_jars_dir.display()
+                )
             })?;
             let source_path = Path::new(file_name);
             if source_path.exists() {
                 let dest = local_jars_dir.join(format!("{}.jar", input.mod_id));
-                std::fs::copy(source_path, &dest).with_context(|| {
-                    format!("failed to copy JAR to {}", dest.display())
-                })?;
+                std::fs::copy(source_path, &dest)
+                    .with_context(|| format!("failed to copy JAR to {}", dest.display()))?;
             }
         }
     }
@@ -425,7 +426,9 @@ pub fn delete_rules_from_root(root_dir: &Path, input: &DeleteRulesInput) -> Resu
         input.mod_ids.iter().map(|s| s.as_str()).collect();
 
     // Remove from top-level
-    modlist.rules.retain(|r| !ids_to_remove.contains(r.mod_id.as_str()));
+    modlist
+        .rules
+        .retain(|r| !ids_to_remove.contains(r.mod_id.as_str()));
 
     // Remove from alternatives recursively
     for rule in &mut modlist.rules {
@@ -436,7 +439,8 @@ pub fn delete_rules_from_root(root_dir: &Path, input: &DeleteRulesInput) -> Resu
 }
 
 fn remove_from_alternatives(rule: &mut Rule, ids: &std::collections::HashSet<&str>) {
-    rule.alternatives.retain(|alt| !ids.contains(alt.mod_id.as_str()));
+    rule.alternatives
+        .retain(|alt| !ids.contains(alt.mod_id.as_str()));
     for alt in &mut rule.alternatives {
         remove_from_alternatives(alt, ids);
     }
@@ -450,10 +454,7 @@ pub fn rename_rule_from_root(root_dir: &Path, input: &RenameRuleInput) -> Result
     }
 
     if input.mod_id != input.new_mod_id && modlist.contains_mod_id(&input.new_mod_id) {
-        bail!(
-            "a rule with mod_id '{}' already exists",
-            input.new_mod_id
-        );
+        bail!("a rule with mod_id '{}' already exists", input.new_mod_id);
     }
 
     // Update the rule's own mod_id
@@ -563,12 +564,7 @@ pub fn add_alternative_from_root(root_dir: &Path, input: &AddAlternativeInput) -
         .rules
         .iter_mut()
         .find(|r| r.mod_id == input.parent_mod_id)
-        .with_context(|| {
-            format!(
-                "top-level rule '{}' not found",
-                input.parent_mod_id
-            )
-        })?;
+        .with_context(|| format!("top-level rule '{}' not found", input.parent_mod_id))?;
 
     parent.alternatives.push(rule_to_add);
 
@@ -614,7 +610,11 @@ pub fn remove_alternative_from_root(root_dir: &Path, input: &RemoveAlternativeIn
     let extracted = extract_alternative(&mut modlist, &input.parent_mod_id, &input.alt_mod_id)?;
 
     // Promote: insert the extracted rule at the same level as the parent.
-    if let Some(pos) = modlist.rules.iter().position(|r| r.mod_id == input.parent_mod_id) {
+    if let Some(pos) = modlist
+        .rules
+        .iter()
+        .position(|r| r.mod_id == input.parent_mod_id)
+    {
         // Parent is a top-level rule → insert the alt as a new top-level rule right after it.
         modlist.rules.insert(pos + 1, extracted);
     } else {

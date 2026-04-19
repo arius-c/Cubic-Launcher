@@ -9,6 +9,8 @@
 - **Parallel mod downloads** — `download_pending_artifacts` in `launch_preview.rs` now runs downloads concurrently via `JoinSet` + `Semaphore(10)`
 - **SHA1 verification of mod downloads** — `DownloadArtifact` now carries `file_hash: Option<String>`; downloads with a hash reuse `minecraft_downloader::download_file_verified` (delete + error on mismatch)
 - **Aggregate download progress** — each completed download bumps `launch-progress` linearly from 42→58 with `"Downloading Mods"` / `"Downloaded N of M mods."` (per-file `download-progress` event removed — nothing listened to it)
+- **300+ mods launch warning** — the launch pipeline now emits a frontend warning before large launches; it suggests enabling cache-only mode when appropriate
+- **Cache-only mode** — added global setting `cache_only_mode`; when enabled the launcher prefers compatible cached mod/dependency artifacts and stored dependency links before calling Modrinth, with API fallback only on cache misses
 
 ---
 
@@ -40,33 +42,11 @@
 
 ## Suggested improvements (from Claude browser, not yet implemented)
 
-### 1. Parallel mod downloads
-- Refactor `download_pending_artifacts` to use `tokio::task::JoinSet`
-- Download all pending JARs in parallel instead of sequentially
-- Do NOT touch the Modrinth API calls (version resolution) — only the download phase
-
-### 2. SHA1 verification of downloads
-- After each JAR download, verify the SHA1 hash against `PendingDownload.file_hash`
-- If the hash doesn't match: delete the file and return a clear error
-- Follow the `download_file_verified` pattern already present in `minecraft_downloader.rs`
-
 ### 3. Granular download progress
 - Replace the current 0%/100% progress with real byte-level progress
 - Use `response.bytes_stream()` and `tokio::io`
 - Emit progress events as chunks get written
 - The frontend receives continuous updates during each download
-
-### 4. Warning for 300+ mods
-- Before starting the launch, count the mods in the resolved modlist
-- If > 300: emit a warning to the frontend like:
-  "You have more than 300 mods. The first launch may take 1-2 minutes due to API rate limits. You can enable 'Use local cache only' in settings to skip API checks on future launches."
-
-### 5. Cache-only mode (do last)
-- Add a boolean setting `cache_only_mode` (follow the existing naming convention)
-- **Default: OFF** — current behavior unchanged for anyone who doesn't touch settings
-- When enabled: skip Modrinth API calls for mods that already have a valid cache entry (version_id present in mod_cache AND file exists on disk)
-- Fall back to the API only for mods without a cache entry
-- Wire it into the existing settings system and expose it to the frontend
 
 ---
 

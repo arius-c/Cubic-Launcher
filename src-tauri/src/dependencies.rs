@@ -49,6 +49,7 @@ struct DependencyCandidate {
     parent_mod_id: String,
     selector: DependencySelector,
     resolved_dependency: ResolvedDependency,
+    version: ModrinthVersion,
 }
 
 pub fn collect_required_dependency_requests(
@@ -143,68 +144,83 @@ pub async fn resolve_required_dependencies_with_client(
     client: &ModrinthClient,
     selected_mod_ids: &HashSet<String>,
 ) -> Result<DependencyResolution> {
-    let requests = collect_required_dependency_requests(parent_versions)?;
-    let mut candidates = Vec::with_capacity(requests.len());
     let mut excluded_parents: HashSet<String> = HashSet::new();
+    let mut candidates = Vec::new();
+    let mut frontier = parent_versions.to_vec();
+    let mut processed_version_ids = HashSet::new();
 
-    for request in &requests {
-        // Skip dependencies that are already explicitly selected in the mod
-        // list — those are managed by the user and will be fetched (or
-        // gracefully skipped) as parent mods, not as auto-resolved deps.
-        if let DependencySelector::ProjectId { project_id } = &request.selector {
-            if selected_mod_ids.contains(project_id) {
-                continue;
-            }
-        }
+    while !frontier.is_empty() {
+        let requests = collect_required_dependency_requests(&frontier)?;
+        frontier.clear();
 
-        // If this parent was already excluded due to a previous missing
-        // dependency, skip all its remaining requests.
-        if excluded_parents.contains(&request.parent_mod_id) {
-            continue;
-        }
-
-        let version = match &request.selector {
-            DependencySelector::ProjectId { project_id } => {
-                match client
-                    .fetch_latest_compatible_version(project_id, target)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "failed to resolve compatible dependency version for project '{}'",
-                            project_id
-                        )
-                    })? {
-                    Some(v) => v,
-                    None => {
-                        excluded_parents.insert(request.parent_mod_id.clone());
-                        continue;
-                    }
+        for request in &requests {
+            // Skip dependencies that are already explicitly selected in the mod
+            // list — those are managed by the user and will be fetched (or
+            // gracefully skipped) as parent mods, not as auto-resolved deps.
+            if let DependencySelector::ProjectId { project_id } = &request.selector {
+                if selected_mod_ids.contains(project_id) {
+                    continue;
                 }
             }
-            DependencySelector::VersionId { version_id } => {
-                match client
-                    .fetch_version(version_id)
-                    .await
-                    .with_context(|| {
+
+            // If this parent was already excluded due to a previous missing
+            // dependency, skip all its remaining requests.
+            if excluded_parents.contains(&request.parent_mod_id) {
+                continue;
+            }
+
+            let version = match &request.selector {
+                DependencySelector::ProjectId { project_id } => {
+                    match client
+                        .fetch_latest_compatible_version(project_id, target)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed to resolve compatible dependency version for project '{}'",
+                                project_id
+                            )
+                        })? {
+                        Some(v) => v,
+                        None => {
+                            excluded_parents.insert(request.parent_mod_id.clone());
+                            continue;
+                        }
+                    }
+                }
+                DependencySelector::VersionId { version_id } => {
+                    match client.fetch_version(version_id).await.with_context(|| {
                         format!(
                             "failed to resolve exact dependency version '{}'",
                             version_id
                         )
                     })? {
-                    Some(v) => v,
-                    None => {
-                        excluded_parents.insert(request.parent_mod_id.clone());
-                        continue;
+                        Some(v) => v,
+                        None => {
+                            excluded_parents.insert(request.parent_mod_id.clone());
+                            continue;
+                        }
                     }
                 }
-            }
-        };
+            };
 
-        candidates.push(build_dependency_candidate(request, version)?);
+            candidates.push(build_dependency_candidate(request, version)?);
+        }
+
+        let (selected_candidates, next_excluded_parents) =
+            finalize_dependency_candidates(&candidates, excluded_parents.clone());
+        excluded_parents = next_excluded_parents;
+
+        frontier = selected_candidates
+            .values()
+            .filter(|candidate| processed_version_ids.insert(candidate.version.id.clone()))
+            .map(|candidate| candidate.version.clone())
+            .collect::<Vec<_>>();
     }
 
-    let mut resolution = finalize_dependency_resolution(candidates)?;
-    resolution.excluded_parents = excluded_parents;
+    let selected_candidates = finalize_dependency_candidates(&candidates, excluded_parents.clone()).0;
+    let mut resolution =
+        build_dependency_resolution(candidates, selected_candidates, excluded_parents.clone())?;
+    resolution.excluded_parents.extend(excluded_parents);
     Ok(resolution)
 }
 
@@ -230,45 +246,150 @@ fn build_dependency_candidate(
             file_hash: primary_file.hashes.get("sha1").cloned(),
             date_published: version.date_published.clone(),
         },
+        version,
     })
 }
 
 fn finalize_dependency_resolution(
     candidates: Vec<DependencyCandidate>,
 ) -> Result<DependencyResolution> {
-    let mut newest_by_dependency: HashMap<String, ResolvedDependency> = HashMap::new();
+    let (selected_candidates, excluded_parents) =
+        finalize_dependency_candidates(&candidates, HashSet::new());
+    build_dependency_resolution(candidates, selected_candidates, excluded_parents)
+}
 
-    for candidate in &candidates {
-        let dependency_id = candidate.resolved_dependency.dependency_id.clone();
+fn finalize_dependency_candidates(
+    candidates: &[DependencyCandidate],
+    initial_excluded_parents: HashSet<String>,
+) -> (HashMap<String, DependencyCandidate>, HashSet<String>) {
+    let mut excluded_parents = initial_excluded_parents;
 
-        match newest_by_dependency.get(&dependency_id) {
-            Some(existing)
-                if existing.date_published >= candidate.resolved_dependency.date_published => {}
-            _ => {
-                newest_by_dependency.insert(dependency_id, candidate.resolved_dependency.clone());
+    loop {
+        let valid_candidates = candidates
+            .iter()
+            .filter(|candidate| !excluded_parents.contains(&candidate.parent_mod_id))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let (selected_candidates, mut newly_excluded_parents) =
+            select_dependency_candidates(&valid_candidates);
+
+        // If a dependency itself is excluded because one of its own required
+        // dependencies is missing, exclude every parent that depends on it.
+        for candidate in &valid_candidates {
+            if excluded_parents.contains(&candidate.resolved_dependency.dependency_id) {
+                newly_excluded_parents.insert(candidate.parent_mod_id.clone());
             }
+        }
+
+        if newly_excluded_parents.is_empty() {
+            return (selected_candidates, excluded_parents);
+        }
+
+        excluded_parents.extend(newly_excluded_parents);
+    }
+}
+
+fn select_dependency_candidates(
+    candidates: &[DependencyCandidate],
+) -> (HashMap<String, DependencyCandidate>, HashSet<String>) {
+    let mut groups: HashMap<String, Vec<&DependencyCandidate>> = HashMap::new();
+    for candidate in candidates {
+        groups
+            .entry(candidate.resolved_dependency.dependency_id.clone())
+            .or_default()
+            .push(candidate);
+    }
+
+    let mut selected_by_dependency = HashMap::new();
+    let mut excluded_parents = HashSet::new();
+
+    for (dependency_id, group) in groups {
+        let exact_candidates = group
+            .iter()
+            .copied()
+            .filter(|candidate| matches!(candidate.selector, DependencySelector::VersionId { .. }))
+            .collect::<Vec<_>>();
+
+        let selected = if exact_candidates.is_empty() {
+            group.into_iter().max_by(|left, right| {
+                left.resolved_dependency
+                    .date_published
+                    .cmp(&right.resolved_dependency.date_published)
+            })
+        } else {
+            let distinct_exact_versions = exact_candidates
+                .iter()
+                .map(|candidate| candidate.resolved_dependency.version_id.as_str())
+                .collect::<HashSet<_>>();
+
+            if distinct_exact_versions.len() > 1 {
+                for candidate in exact_candidates {
+                    excluded_parents.insert(candidate.parent_mod_id.clone());
+                }
+                None
+            } else {
+                exact_candidates.into_iter().max_by(|left, right| {
+                    left.resolved_dependency
+                        .date_published
+                        .cmp(&right.resolved_dependency.date_published)
+                })
+            }
+        };
+
+        if let Some(selected) = selected {
+            selected_by_dependency.insert(dependency_id, selected.clone());
         }
     }
 
-    let mut resolved_dependencies = newest_by_dependency.into_values().collect::<Vec<_>>();
-    resolved_dependencies.sort_by(|left, right| left.dependency_id.cmp(&right.dependency_id));
+    for candidate in candidates {
+        let Some(selected) =
+            selected_by_dependency.get(&candidate.resolved_dependency.dependency_id)
+        else {
+            continue;
+        };
 
-    let selected_by_dependency = resolved_dependencies
-        .iter()
-        .map(|dependency| (dependency.dependency_id.clone(), dependency.clone()))
-        .collect::<HashMap<_, _>>();
+        if matches!(candidate.selector, DependencySelector::VersionId { .. })
+            && selected.resolved_dependency.version_id != candidate.resolved_dependency.version_id
+        {
+            excluded_parents.insert(candidate.parent_mod_id.clone());
+        }
+    }
+
+    (selected_by_dependency, excluded_parents)
+}
+
+fn build_dependency_resolution(
+    candidates: Vec<DependencyCandidate>,
+    selected_by_dependency: HashMap<String, DependencyCandidate>,
+    excluded_parents: HashSet<String>,
+) -> Result<DependencyResolution> {
+    let mut resolved_dependencies = selected_by_dependency
+        .values()
+        .map(|candidate| candidate.resolved_dependency.clone())
+        .collect::<Vec<_>>();
+    resolved_dependencies.sort_by(|left, right| left.dependency_id.cmp(&right.dependency_id));
 
     let mut deduplicated_links = HashMap::new();
     for candidate in candidates {
-        let selected_dependency = selected_by_dependency
-            .get(&candidate.resolved_dependency.dependency_id)
-            .with_context(|| {
-                format!(
-                    "selected dependency '{}' missing from finalized resolution",
-                    candidate.resolved_dependency.dependency_id
-                )
-            })?;
+        if excluded_parents.contains(&candidate.parent_mod_id) {
+            continue;
+        }
 
+        let Some(selected_candidate) =
+            selected_by_dependency.get(&candidate.resolved_dependency.dependency_id)
+        else {
+            continue;
+        };
+
+        if matches!(candidate.selector, DependencySelector::VersionId { .. })
+            && selected_candidate.resolved_dependency.version_id
+                != candidate.resolved_dependency.version_id
+        {
+            continue;
+        }
+
+        let selected_dependency = &selected_candidate.resolved_dependency;
         let specific_version = match candidate.selector {
             DependencySelector::ProjectId { .. } => None,
             DependencySelector::VersionId { .. } => Some(selected_dependency.version_id.clone()),
@@ -298,7 +419,7 @@ fn finalize_dependency_resolution(
     Ok(DependencyResolution {
         resolved_dependencies,
         links,
-        excluded_parents: HashSet::new(),
+        excluded_parents,
     })
 }
 
@@ -397,6 +518,43 @@ mod tests {
         ))
     }
 
+    fn dependency_version_with_required_project_dependency(
+        project_id: &str,
+        version_id: &str,
+        published_at: &str,
+        filename: &str,
+        dependency_project_id: &str,
+    ) -> ModrinthVersion {
+        version_from_json(&format!(
+            r#"{{
+              "id": "{version_id}",
+              "project_id": "{project_id}",
+              "version_number": "1.0.0",
+              "name": "{project_id}",
+              "game_versions": ["1.21.1"],
+              "loaders": ["fabric"],
+              "date_published": "{published_at}",
+              "dependencies": [
+                {{
+                  "version_id": null,
+                  "project_id": "{dependency_project_id}",
+                  "dependency_type": "required",
+                  "file_name": null
+                }}
+              ],
+              "files": [
+                {{
+                  "hashes": {{ "sha1": "{version_id}-sha1" }},
+                  "url": "https://cdn.modrinth.com/data/{project_id}/{filename}",
+                  "filename": "{filename}",
+                  "primary": true,
+                  "size": 100
+                }}
+              ]
+            }}"#
+        ))
+    }
+
     #[test]
     fn collects_only_required_dependencies() {
         let requests =
@@ -468,7 +626,7 @@ mod tests {
     }
 
     #[test]
-    fn keeps_only_the_newest_duplicate_dependency_version() {
+    fn conflicting_exact_dependency_versions_exclude_their_parents() {
         let requests = vec![
             DependencyRequest {
                 parent_mod_id: "mod-a".into(),
@@ -512,28 +670,71 @@ mod tests {
         )
         .expect("dependency resolution should succeed");
 
-        assert_eq!(resolution.resolved_dependencies.len(), 1);
+        assert!(resolution.resolved_dependencies.is_empty());
+        assert!(resolution.links.is_empty());
         assert_eq!(
-            resolution.resolved_dependencies[0].version_id,
-            "geckolib-4-2"
+            resolution.excluded_parents,
+            HashSet::from(["mod-a".to_string(), "mod-b".to_string()])
         );
+    }
+
+    #[test]
+    fn exact_dependency_version_wins_over_newer_generic_candidate() {
+        let requests = vec![
+            DependencyRequest {
+                parent_mod_id: "mod-a".into(),
+                selector: DependencySelector::VersionId {
+                    version_id: "sodium-1".into(),
+                },
+            },
+            DependencyRequest {
+                parent_mod_id: "mod-b".into(),
+                selector: DependencySelector::ProjectId {
+                    project_id: "sodium".into(),
+                },
+            },
+        ];
+
+        let exact = dependency_version(
+            "sodium",
+            "sodium-1",
+            "2024-06-01T10:00:00.000Z",
+            "sodium-1.jar",
+        );
+        let newer_generic = dependency_version(
+            "sodium",
+            "sodium-2",
+            "2024-09-01T10:00:00.000Z",
+            "sodium-2.jar",
+        );
+
+        let resolution = resolve_dependency_requests(
+            &requests,
+            |project_id| Ok((project_id == "sodium").then(|| newer_generic.clone())),
+            |version_id| Ok((version_id == "sodium-1").then(|| exact.clone())),
+        )
+        .expect("dependency resolution should succeed");
+
+        assert_eq!(resolution.resolved_dependencies.len(), 1);
+        assert_eq!(resolution.resolved_dependencies[0].version_id, "sodium-1");
         assert_eq!(
             resolution.links,
             vec![
                 DependencyLink {
                     parent_mod_id: "mod-a".into(),
-                    dependency_id: "geckolib".into(),
-                    specific_version: Some("geckolib-4-2".into()),
-                    jar_filename: "geckolib-4.2.jar".into(),
+                    dependency_id: "sodium".into(),
+                    specific_version: Some("sodium-1".into()),
+                    jar_filename: "sodium-1.jar".into(),
                 },
                 DependencyLink {
                     parent_mod_id: "mod-b".into(),
-                    dependency_id: "geckolib".into(),
-                    specific_version: Some("geckolib-4-2".into()),
-                    jar_filename: "geckolib-4.2.jar".into(),
+                    dependency_id: "sodium".into(),
+                    specific_version: None,
+                    jar_filename: "sodium-1.jar".into(),
                 },
             ]
         );
+        assert!(resolution.excluded_parents.is_empty());
     }
 
     #[test]
@@ -582,5 +783,51 @@ mod tests {
                 excluded_parents: HashSet::new(),
             }
         );
+    }
+
+    #[test]
+    fn transitive_missing_dependency_excludes_top_level_parent() {
+        let draggable_request = DependencyRequest {
+            parent_mod_id: "draggable_lists".into(),
+            selector: DependencySelector::ProjectId {
+                project_id: "architectury".into(),
+            },
+        };
+        let architectury_request = DependencyRequest {
+            parent_mod_id: "architectury".into(),
+            selector: DependencySelector::ProjectId {
+                project_id: "fabric-api".into(),
+            },
+        };
+
+        let draggable_candidate = build_dependency_candidate(
+            &draggable_request,
+            dependency_version_with_required_project_dependency(
+                "architectury",
+                "architectury-version",
+                "2024-08-10T10:00:00.000Z",
+                "architectury.jar",
+                "fabric-api",
+            ),
+        )
+        .expect("architectury candidate should build");
+        let fabric_api_candidate = build_dependency_candidate(
+            &architectury_request,
+            dependency_version(
+                "fabric-api",
+                "fabric-api-version",
+                "2024-08-11T10:00:00.000Z",
+                "fabric-api.jar",
+            ),
+        )
+        .expect("fabric-api candidate should build");
+
+        let (selected, excluded) = finalize_dependency_candidates(
+            &[draggable_candidate, fabric_api_candidate],
+            HashSet::from(["architectury".to_string()]),
+        );
+
+        assert!(excluded.contains("draggable_lists"));
+        assert!(!selected.contains_key("architectury"));
     }
 }

@@ -10,7 +10,7 @@ import {
   modRowsState, setModRowsState, setAccounts, setActiveAccountId,
   setLaunchState, setLaunchProgress, setLaunchStageLabel, setLaunchStageDetail,
   setLaunchLogs,
-  globalSettings, modlistOverrides, selectedMcVersion, setSelectedMcVersion, selectedModLoader, setSelectedModLoader,
+  modlistOverrides, selectedMcVersion, setSelectedMcVersion, selectedModLoader, setSelectedModLoader,
   createModlistName, createModlistDescription, setCreateModlistModalOpen,
   setCreateModlistBusy, createModlistBusy,
   renameRuleDraft, renameRuleTargetId, setRenameRuleModalOpen,
@@ -33,6 +33,7 @@ import {
   setResolvedModIds,
 } from "./store";
 import type { AestheticGroup, FunctionalGroup, LinkRule, ModRow, VersionRule, CustomConfig } from "./lib/types";
+import type { GlobalSettingsState, ModlistOverridesState } from "./store";
 
 // ── Row state helpers ─────────────────────────────────────────────────────────
 
@@ -364,6 +365,7 @@ async function loadShellSnapshot(preferredName?: string | null) {
         maxRamMb: gs.max_ram_mb ?? 4096,
         customJvmArgs: gs.custom_jvm_args ?? "",
         profilerEnabled: gs.profiler_enabled ?? false,
+        cacheOnlyMode: gs.cache_only_mode ?? false,
         wrapperCommand: gs.wrapper_command ?? "",
         javaPathOverride: gs.java_path_override ?? "",
       });
@@ -915,8 +917,14 @@ export default function App() {
           setLaunchLogs(cur => [...cur, event.payload.line]);
         }));
 
-        unlisteners.push(await listen<{ title: string; message: string; detail: string }>("launcher-error", (event) => {
-          pushUiError({ title: event.payload.title, message: event.payload.message, detail: event.payload.detail, severity: "error", scope: "launch" });
+        unlisteners.push(await listen<{ title: string; message: string; detail: string; severity?: "warning" | "error"; scope?: "launch" | "download" | "account" }>("launcher-error", (event) => {
+          pushUiError({
+            title: event.payload.title,
+            message: event.payload.message,
+            detail: event.payload.detail,
+            severity: event.payload.severity ?? "error",
+            scope: event.payload.scope ?? "launch",
+          });
         }));
 
         unlisteners.push(await listen<{ success: boolean; exitCode: number | null }>("minecraft-exit", (event) => {
@@ -1374,29 +1382,43 @@ export default function App() {
     }
   };
 
-  const handleSaveSettings = async () => {
+  const handleSaveSettings = async (globalDraft: GlobalSettingsState, modlistDraft: ModlistOverridesState) => {
     logger.info("App", "handleSaveSettings started");
-    if (!isTauri()) { logger.warn("App", "handleSaveSettings skipped — no backend"); setSettingsModalOpen(false); return; }
+    if (!isTauri()) {
+      logger.warn("App", "handleSaveSettings skipped — no backend");
+      setGlobalSettings({ ...globalDraft });
+      setModlistOverrides({ ...modlistDraft });
+      setSettingsModalOpen(false);
+      return;
+    }
     try {
-      const g = globalSettings();
       await invoke("save_global_settings_command", {
-        settings: { minRamMb: g.minRamMb, maxRamMb: g.maxRamMb, customJvmArgs: g.customJvmArgs, profilerEnabled: g.profilerEnabled, wrapperCommand: g.wrapperCommand, javaPathOverride: g.javaPathOverride },
+        settings: {
+          minRamMb: globalDraft.minRamMb,
+          maxRamMb: globalDraft.maxRamMb,
+          customJvmArgs: globalDraft.customJvmArgs,
+          profilerEnabled: globalDraft.profilerEnabled,
+          cacheOnlyMode: globalDraft.cacheOnlyMode,
+          wrapperCommand: globalDraft.wrapperCommand,
+          javaPathOverride: globalDraft.javaPathOverride,
+        },
       });
       if (selectedModListName()) {
-        const ov = modlistOverrides();
         await invoke("save_modlist_overrides_command", {
           overrides: {
             modlistName: selectedModListName(),
-            minRamMb: ov.minRamEnabled ? ov.minRamMb : null,
-            maxRamMb: ov.maxRamEnabled ? ov.maxRamMb : null,
-            customJvmArgs: ov.customArgsEnabled ? ov.customJvmArgs : null,
-            profilerEnabled: ov.profilerEnabled ? ov.profilerActive : null,
-            wrapperCommand: ov.wrapperEnabled ? ov.wrapperCommand : null,
+            minRamMb: modlistDraft.minRamEnabled ? modlistDraft.minRamMb : null,
+            maxRamMb: modlistDraft.maxRamEnabled ? modlistDraft.maxRamMb : null,
+            customJvmArgs: modlistDraft.customArgsEnabled ? modlistDraft.customJvmArgs : null,
+            profilerEnabled: modlistDraft.profilerEnabled ? modlistDraft.profilerActive : null,
+            wrapperCommand: modlistDraft.wrapperEnabled ? modlistDraft.wrapperCommand : null,
             minecraftVersion: selectedMcVersion() || null,
             modLoader: selectedModLoader() || null,
           },
         });
       }
+      setGlobalSettings({ ...globalDraft });
+      setModlistOverrides({ ...modlistDraft });
       setSettingsModalOpen(false);
       await loadShellSnapshot(selectedModListName() || null);
       logger.debug("App", "handleSaveSettings completed");
