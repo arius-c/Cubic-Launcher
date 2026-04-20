@@ -13,11 +13,17 @@ The app is not a generic CRUD shell. It has a few core product flows that should
 ## Project Structure & Module Organization
 ### Frontend (`src/`)
 - `src/App.tsx`: root orchestrator. It wires `invoke()` calls, Tauri event listeners, optimistic UI updates, resolution reruns, and modal actions.
-- `src/store.ts`: central SolidJS signals/memos. Treat this as the UI source of truth.
+- `src/store.ts`: store barrel/export surface. Import from here at call sites, but keep raw signal declarations out of it.
+- `src/store-state.ts`: central SolidJS signals/state declarations. Treat this as the base UI source of truth.
+- `src/store-selectors.ts` and `src/store-actions.ts`: derived UI state and store mutations. Keep selectors pure and keep mutating helpers here instead of growing `store-state.ts` again.
+- `src/app/`: app-level orchestration helpers such as backend loading, row remapping, persistence effects, and bootstrap logic. If `App.tsx` grows, extract logic here first.
 - `src/components/ModListEditor.tsx`: main rules editor.
+- `src/components/mod-list-editor/`: extracted editor-specific hooks and subcomponents. Keep content-tab state, drag logic, and small presentational pieces here instead of re-inlining them into `ModListEditor.tsx`.
 - `src/components/ModRuleItem.tsx`: single mod row rendering and interaction.
 - `src/components/AltSection.tsx`: nested alternatives UI.
+- `src/components/alt-section/`: extracted alternatives drag helpers and local types for the alternatives subtree.
 - `src/components/Modals.tsx`: create/settings/accounts/links/export and other modal flows.
+- `src/components/modals/`: focused modal implementations. Treat `Modals.tsx` as a thin export surface, not a bucket file.
 - `src/components/LaunchPanel.tsx`: launch controls, version/loader selection, progress UI.
 - `src/components/Sidebar.tsx`: mod-list switching and launcher shell navigation.
 - `src/components/AdvancedModPanel.tsx`: advanced per-mod editing.
@@ -82,7 +88,14 @@ Important implementation detail:
 
 ## Project-Specific Working Rules
 - Preserve SolidJS identity where possible. `App.tsx` contains logic such as smart row merging and row ID rebuilding specifically to avoid destructive rerenders and drag flicker.
-- Treat `src/store.ts` as the central UI state container. Avoid scattering duplicate state into individual components unless it is truly local/transient.
+- Treat the `src/store-state.ts` + `src/store.ts` split as intentional. Keep signal declarations in `src/store-state.ts`, use `src/store.ts` as the public store surface, and avoid reintroducing selector/action imports back through the state file.
+- Keep the current split architecture intact. Do not merge extracted hooks/components back into `App.tsx`, `ModListEditor.tsx`, `Modals.tsx`, or `store.ts` just for convenience.
+- When adding new frontend files, prefer colocated feature folders (`src/app/`, `src/components/mod-list-editor/`, `src/components/modals/`, `src/components/alt-section/`, `src/components/advanced-mod-panel/`) over dumping more logic into top-level component files.
+- Keep selectors pure. `src/store-selectors.ts` should not mutate signals or call persistence. Put writes in `src/store-actions.ts` or feature-local handlers.
+- Keep `App.tsx` focused on orchestration. Startup/event wiring belongs in `src/app/`, and isolated persistence side effects belong in extracted app helpers when practical.
+- Keep `Modals.tsx` as a barrel/composition layer. New modal families should live under `src/components/modals/` in focused files.
+- Keep editor drag logic in extracted hooks. Top-level mod drag behavior belongs in `src/components/mod-list-editor/use-mod-list-editor-drag.ts`; alternatives drag behavior belongs in `src/components/alt-section/use-alt-section-drag.ts`.
+- For future refactors, prefer “one responsibility per file” over arbitrary line-count targets. Files in the `300-600` line range are acceptable when cohesion is high; avoid reintroducing `1000+` line mixed-responsibility frontend files.
 - Do not mutate launcher persistence formats casually. Changes touching `rules.rs`, `database.rs`, exported archives, or on-disk config handling should be reviewed for backward compatibility.
 - Keep launch work backend-driven. The frontend should request a launch and render streamed progress, not reimplement launch steps.
 - Keep resolution semantics stable. Changes in `resolver.rs`, incompatibility handling, links/dependencies, or version rule evaluation can cause silent correctness regressions.
