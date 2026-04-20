@@ -172,14 +172,17 @@ pub async fn resolve_required_dependencies_with_client(
             let version = match &request.selector {
                 DependencySelector::ProjectId { project_id } => {
                     match client
-                        .fetch_latest_compatible_version(project_id, target)
+                        .fetch_project_versions(project_id, target)
                         .await
                         .with_context(|| {
                             format!(
                                 "failed to resolve compatible dependency version for project '{}'",
                                 project_id
                             )
-                        })? {
+                        })?
+                        .into_iter()
+                        .next()
+                    {
                         Some(v) => v,
                         None => {
                             excluded_parents.insert(request.parent_mod_id.clone());

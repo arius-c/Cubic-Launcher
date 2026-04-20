@@ -1,8 +1,11 @@
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::fs;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
+use sha1::{Digest, Sha1};
 
 use crate::modrinth::ModrinthVersion;
 use crate::resolver::ResolutionTarget;
@@ -34,6 +37,55 @@ pub struct PendingDownload {
 pub struct ModAcquisitionPlan {
     pub cached: Vec<ModCacheRecord>,
     pub to_download: Vec<PendingDownload>,
+}
+
+pub fn cached_remote_artifact_path(
+    mods_cache_dir: &Path,
+    mod_loader: &str,
+    version_id: &str,
+    jar_filename: &str,
+) -> PathBuf {
+    mods_cache_dir
+        .join(mod_loader)
+        .join(version_id)
+        .join(jar_filename)
+}
+
+pub fn cached_local_artifact_path(
+    mods_cache_dir: &Path,
+    mod_loader: &str,
+    jar_filename: &str,
+) -> PathBuf {
+    mods_cache_dir.join(mod_loader).join("local").join(jar_filename)
+}
+
+pub fn legacy_cached_artifact_path(mods_cache_dir: &Path, jar_filename: &str) -> PathBuf {
+    mods_cache_dir.join(jar_filename)
+}
+
+pub fn cached_artifact_path_for_record(mods_cache_dir: &Path, record: &ModCacheRecord) -> PathBuf {
+    if record.is_local {
+        cached_local_artifact_path(mods_cache_dir, &record.mod_loader, &record.jar_filename)
+    } else {
+        cached_remote_artifact_path(
+            mods_cache_dir,
+            &record.mod_loader,
+            &record.modrinth_version_id,
+            &record.jar_filename,
+        )
+    }
+}
+
+pub fn cached_artifact_path_for_pending_download(
+    mods_cache_dir: &Path,
+    pending: &PendingDownload,
+) -> PathBuf {
+    cached_remote_artifact_path(
+        mods_cache_dir,
+        &pending.mod_loader,
+        &pending.modrinth_version_id,
+        &pending.jar_filename,
+    )
 }
 
 pub trait ModCacheLookup {
@@ -142,7 +194,7 @@ impl<'connection> SqliteModCacheRepository<'connection> {
 
         for row in rows {
             let record = row?;
-            if self.mods_cache_dir.join(&record.jar_filename).exists() {
+            if let Some(record) = self.ensure_record_file_available(record)? {
                 return Ok(Some(record));
             }
         }
@@ -185,13 +237,94 @@ impl ModCacheLookup for SqliteModCacheRepository<'_> {
             .optional()?;
 
         match record {
-            Some(record) if self.mods_cache_dir.join(&record.jar_filename).exists() => {
-                Ok(Some(record))
-            }
-            Some(_) => Ok(None),
+            Some(record) => self.ensure_record_file_available(record),
             None => Ok(None),
         }
     }
+}
+
+impl SqliteModCacheRepository<'_> {
+    fn ensure_record_file_available(&self, record: ModCacheRecord) -> Result<Option<ModCacheRecord>> {
+        let artifact_path = cached_artifact_path_for_record(&self.mods_cache_dir, &record);
+        if artifact_path.exists() {
+            return Ok(Some(record));
+        }
+
+        let legacy_path = legacy_cached_artifact_path(&self.mods_cache_dir, &record.jar_filename);
+        if !legacy_path.exists() {
+            return Ok(None);
+        }
+
+        if !legacy_file_matches_record(&legacy_path, &record)? {
+            return Ok(None);
+        }
+
+        if let Some(parent) = artifact_path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create artifact cache directory {}",
+                    parent.display()
+                )
+            })?;
+        }
+
+        move_or_copy_file(&legacy_path, &artifact_path)?;
+        Ok(Some(record))
+    }
+}
+
+fn legacy_file_matches_record(path: &Path, record: &ModCacheRecord) -> Result<bool> {
+    if record.is_local {
+        return Ok(true);
+    }
+
+    let Some(expected_sha1) = record.file_hash.as_deref() else {
+        return Ok(false);
+    };
+
+    Ok(sha1_of_file(path)?.eq_ignore_ascii_case(expected_sha1))
+}
+
+fn move_or_copy_file(source: &Path, destination: &Path) -> Result<()> {
+    match fs::rename(source, destination) {
+        Ok(()) => Ok(()),
+        Err(rename_error) => {
+            fs::copy(source, destination).with_context(|| {
+                format!(
+                    "failed to copy {} to {} after rename failure: {rename_error}",
+                    source.display(),
+                    destination.display()
+                )
+            })?;
+            fs::remove_file(source).with_context(|| {
+                format!(
+                    "failed to remove legacy cached artifact {} after copying to {}",
+                    source.display(),
+                    destination.display()
+                )
+            })?;
+            Ok(())
+        }
+    }
+}
+
+fn sha1_of_file(path: &Path) -> Result<String> {
+    let mut file =
+        fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let mut hasher = Sha1::new();
+    let mut buffer = [0u8; 8192];
+
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 pub fn build_mod_acquisition_plan(
@@ -274,14 +407,16 @@ mod tests {
 
     use anyhow::Result;
     use rusqlite::Connection;
+    use sha1::{Digest, Sha1};
 
     use crate::database::initialize_database;
     use crate::modrinth::ModrinthVersion;
     use crate::resolver::{ModLoader, ResolutionTarget};
 
     use super::{
-        build_mod_acquisition_plan, cache_record_from_version, pending_download_from_version,
-        ModCacheLookup, SqliteModCacheRepository,
+        build_mod_acquisition_plan, cache_record_from_version, cached_artifact_path_for_record,
+        pending_download_from_version, legacy_cached_artifact_path, ModCacheLookup,
+        ModCacheRecord, SqliteModCacheRepository,
     };
 
     fn unique_test_root() -> PathBuf {
@@ -377,7 +512,15 @@ mod tests {
             .expect("lookup should succeed")
             .is_none());
 
-        fs::write(mods_cache_dir.join("sodium.jar"), b"jar").expect("jar should be written");
+        let record = cache_record_from_version(&version, &target()).expect("record should build");
+        let artifact_path = cached_artifact_path_for_record(&mods_cache_dir, &record);
+        fs::create_dir_all(
+            artifact_path
+                .parent()
+                .expect("artifact parent directory should exist"),
+        )
+        .expect("artifact parent directory should be created");
+        fs::write(&artifact_path, b"jar").expect("jar should be written");
 
         let record = repository
             .find_by_version_id("version-1")
@@ -412,8 +555,18 @@ mod tests {
             .upsert_modrinth_version(&new_version, &target())
             .expect("newer cache record should insert");
 
-        fs::write(mods_cache_dir.join("sodium-old.jar"), b"old").expect("old jar should exist");
-        fs::write(mods_cache_dir.join("sodium-new.jar"), b"new").expect("new jar should exist");
+        let old_record =
+            cache_record_from_version(&old_version, &target()).expect("old record should build");
+        let new_record =
+            cache_record_from_version(&new_version, &target()).expect("new record should build");
+        let old_path = cached_artifact_path_for_record(&mods_cache_dir, &old_record);
+        let new_path = cached_artifact_path_for_record(&mods_cache_dir, &new_record);
+        fs::create_dir_all(old_path.parent().expect("old parent should exist"))
+            .expect("old artifact parent should be created");
+        fs::create_dir_all(new_path.parent().expect("new parent should exist"))
+            .expect("new artifact parent should be created");
+        fs::write(old_path, b"old").expect("old jar should exist");
+        fs::write(new_path, b"new").expect("new jar should exist");
 
         let record = repository
             .find_compatible_by_project("sodium", &target())
@@ -425,6 +578,89 @@ mod tests {
 
         drop(connection);
         fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    #[test]
+    fn repository_migrates_matching_legacy_flat_cache_file() {
+        let root_dir = unique_test_root();
+        let database_path = root_dir.join("launcher_data.db");
+        let mods_cache_dir = root_dir.join("cache").join("mods");
+
+        fs::create_dir_all(&mods_cache_dir).expect("mods cache directory should be created");
+        initialize_database(&database_path).expect("database should initialize");
+
+        let connection = Connection::open(&database_path).expect("database should open");
+        let repository = SqliteModCacheRepository::new(&connection, &mods_cache_dir);
+        let version = version("sodium", "version-1", "sodium.jar");
+        let record = repository
+            .upsert_modrinth_version(&version, &target())
+            .expect("cache record should insert");
+        let legacy_bytes = b"legacy-jar";
+        let legacy_sha1 = format!("{:x}", Sha1::digest(legacy_bytes));
+        connection
+            .execute(
+                "UPDATE mod_cache SET file_hash = ?1 WHERE modrinth_version_id = ?2",
+                [legacy_sha1.as_str(), "version-1"],
+            )
+            .expect("test record hash should be updated");
+
+        let legacy_path = legacy_cached_artifact_path(&mods_cache_dir, &record.jar_filename);
+        fs::write(&legacy_path, legacy_bytes)
+            .expect("legacy file should be written for migration");
+
+        let migrated = repository
+            .find_by_version_id("version-1")
+            .expect("lookup should succeed")
+            .expect("record should be returned after migration");
+
+        let artifact_path = cached_artifact_path_for_record(&mods_cache_dir, &migrated);
+        assert!(artifact_path.exists(), "artifact should be moved to new cache path");
+        assert!(
+            !legacy_path.exists(),
+            "legacy flat cache file should be removed after migration"
+        );
+
+        drop(connection);
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    #[test]
+    fn artifact_paths_differ_for_same_filename_across_loaders() {
+        let mods_cache_dir = unique_test_root().join("cache").join("mods");
+
+        let fabric_record = ModCacheRecord {
+            modrinth_project_id: "cloth-config".into(),
+            modrinth_version_id: "fabric-version".into(),
+            jar_filename: "cloth-config-26.1.154.jar".into(),
+            mc_version: "26.1.2".into(),
+            mod_loader: "fabric".into(),
+            file_hash: Some("fabric-sha1".into()),
+            download_url: Some("https://example.invalid/fabric".into()),
+            is_local: false,
+        };
+        let neoforge_record = ModCacheRecord {
+            modrinth_project_id: "cloth-config".into(),
+            modrinth_version_id: "neoforge-version".into(),
+            jar_filename: "cloth-config-26.1.154.jar".into(),
+            mc_version: "26.1.2".into(),
+            mod_loader: "neoforge".into(),
+            file_hash: Some("neoforge-sha1".into()),
+            download_url: Some("https://example.invalid/neoforge".into()),
+            is_local: false,
+        };
+
+        let fabric_path = cached_artifact_path_for_record(&mods_cache_dir, &fabric_record);
+        let neoforge_path = cached_artifact_path_for_record(&mods_cache_dir, &neoforge_record);
+
+        assert_ne!(fabric_path, neoforge_path);
+        assert!(
+            fabric_path.to_string_lossy().contains("fabric-version"),
+            "fabric path should be keyed by version id"
+        );
+        assert!(
+            neoforge_path.to_string_lossy().contains("neoforge-version"),
+            "neoforge path should be keyed by version id"
+        );
     }
 
     #[test]

@@ -62,6 +62,31 @@ impl LauncherPaths {
         &self.mods_cache_dir
     }
 
+    pub fn mods_cache_loader_dir(&self, mod_loader: &str) -> PathBuf {
+        self.mods_cache_dir.join(mod_loader)
+    }
+
+    pub fn remote_mod_artifact_path(
+        &self,
+        mod_loader: &str,
+        version_id: &str,
+        jar_filename: &str,
+    ) -> PathBuf {
+        self.mods_cache_loader_dir(mod_loader)
+            .join(version_id)
+            .join(jar_filename)
+    }
+
+    pub fn local_mod_artifact_path(&self, mod_loader: &str, jar_filename: &str) -> PathBuf {
+        self.mods_cache_loader_dir(mod_loader)
+            .join("local")
+            .join(jar_filename)
+    }
+
+    pub fn legacy_mod_artifact_path(&self, jar_filename: &str) -> PathBuf {
+        self.mods_cache_dir.join(jar_filename)
+    }
+
     pub fn logs_dir(&self) -> &std::path::Path {
         &self.logs_dir
     }

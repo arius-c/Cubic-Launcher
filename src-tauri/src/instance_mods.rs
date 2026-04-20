@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CachedModJar {
     pub jar_filename: String,
+    pub cache_path: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15,7 +16,7 @@ pub struct PreparedInstanceMods {
 }
 
 pub fn prepare_instance_mods_directory(
-    mods_cache_dir: &Path,
+    _mods_cache_dir: &Path,
     instance_mods_dir: &Path,
     jars: &[CachedModJar],
 ) -> Result<PreparedInstanceMods> {
@@ -36,18 +37,18 @@ pub fn prepare_instance_mods_directory(
             continue;
         }
 
-        let source_path = mods_cache_dir.join(&jar.jar_filename);
+        let source_path = &jar.cache_path;
         let target_path = instance_mods_dir.join(&jar.jar_filename);
 
         if !source_path.exists() {
             anyhow::bail!(
                 "required cached mod JAR '{}' is missing from {}",
                 jar.jar_filename,
-                mods_cache_dir.display()
+                source_path.display()
             );
         }
 
-        create_file_link(&source_path, &target_path)?;
+        create_file_link(source_path, &target_path)?;
         linked_files.push(target_path);
     }
 
@@ -200,12 +201,15 @@ mod tests {
             &[
                 CachedModJar {
                     jar_filename: "sodium.jar".into(),
+                    cache_path: mods_cache_dir.join("sodium.jar"),
                 },
                 CachedModJar {
                     jar_filename: "fabric-api.jar".into(),
+                    cache_path: mods_cache_dir.join("fabric-api.jar"),
                 },
                 CachedModJar {
                     jar_filename: "fabric-api.jar".into(),
+                    cache_path: mods_cache_dir.join("fabric-api.jar"),
                 },
             ],
         )
@@ -236,6 +240,7 @@ mod tests {
             &instance_mods_dir,
             &[CachedModJar {
                 jar_filename: "missing.jar".into(),
+                cache_path: mods_cache_dir.join("missing.jar"),
             }],
         )
         .expect_err("preparation should fail for missing cache file");

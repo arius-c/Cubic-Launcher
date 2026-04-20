@@ -30,7 +30,8 @@ use crate::launcher_paths::LauncherPaths;
 use crate::loader_metadata::{LoaderLibrary, LoaderMetadata, LoaderMetadataClient};
 use crate::minecraft_downloader::{ensure_minecraft_version, extract_natives};
 use crate::mod_cache::{
-    build_mod_acquisition_plan, cache_record_from_version, pending_download_from_version,
+    build_mod_acquisition_plan, cache_record_from_version, cached_artifact_path_for_pending_download,
+    cached_artifact_path_for_record, cached_local_artifact_path, pending_download_from_version,
     ModAcquisitionPlan, ModCacheLookup, ModCacheRecord, SqliteModCacheRepository,
 };
 use crate::modrinth::{DependencyType, ModrinthClient, ModrinthVersion};
@@ -1356,360 +1357,74 @@ async fn run_launch_pipeline(
             required_java_version_for_minecraft(&target.minecraft_version)?,
         )
     } else {
-        let compatible_versions = prefetch_ranked_versions_for_selected(
+        let compatible_versions = prefetch_compatible_versions_for_selected(
             &app_handle,
+            &launcher_paths,
+            &http_client,
             &selected_mods,
             &modrinth_client,
             &target,
         )
         .await?;
-        let top_level_candidates =
-            collect_top_level_version_candidates(&selected_mods, &compatible_versions);
-        let mut current_candidate_indexes = top_level_candidates
+        let parent_versions = selected_mods
             .iter()
-            .map(|entry| (entry.project_id.clone(), 0usize))
-            .collect::<HashMap<_, _>>();
-        let selected_mod_ids_by_project = top_level_candidates
-            .iter()
-            .map(|entry| (entry.project_id.clone(), entry.selected_mod_id.clone()))
-            .collect::<HashMap<_, _>>();
-        let mut excluded_parent_ids = HashSet::new();
-        let mut exclusion_reasons = HashMap::new();
-        let mut retry_states = HashMap::<String, FabricIssueRetryState>::new();
-        let max_same_issue_retries = 2usize;
-        let (
-            mut dependency_resolution,
-            final_parent_versions,
-            mut final_dependency_versions,
-            metadata_required_java,
-            excluded_parent_ids,
-            excluded_dependency_ids,
-            fabric_validation_issues,
-        ) = loop {
-            let parent_versions = top_level_candidates
-                .iter()
-                .filter(|entry| !excluded_parent_ids.contains(&entry.project_id))
-                .filter_map(|entry| {
-                    entry.candidates.get(
-                        *current_candidate_indexes
-                            .get(&entry.project_id)
-                            .unwrap_or(&0usize),
-                    )
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            let selected_parent_versions = parent_versions
-                .iter()
-                .map(|version| (version.project_id.clone(), version.clone()))
-                .collect::<HashMap<_, _>>();
-            let selected_project_ids = collect_selected_project_ids(&parent_versions);
-            let exact_conflict_excluded = validate_selected_parent_dependencies(
-                &parent_versions,
-                &selected_parent_versions,
-                &selected_project_ids,
-            );
-            let resolved_dependencies = resolve_required_dependencies_with_client(
-                &parent_versions,
-                &target,
-                &modrinth_client,
-                &selected_project_ids,
-            )
-            .await?;
-            let mut dependency_versions = fetch_dependency_versions(
-                &resolved_dependencies.resolved_dependencies,
-                &modrinth_client,
-            )
-            .await?;
-            let mut resolved_dependencies = resolved_dependencies;
-            resolve_embedded_metadata_dependencies(
+            .filter(|selected| matches!(selected.source, ModSource::Modrinth))
+            .filter_map(|selected| compatible_versions.get(&selected.mod_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let selected_project_ids = collect_selected_project_ids(&parent_versions);
+        let mut dependency_resolution = resolve_required_dependencies_with_client(
+            &parent_versions,
+            &target,
+            &modrinth_client,
+            &selected_project_ids,
+        )
+        .await?;
+        for excluded_id in &dependency_resolution.excluded_parents {
+            emit_log(
                 &app_handle,
-                &launcher_paths,
-                &http_client,
-                &modrinth_client,
-                &target,
-                &parent_versions,
-                &mut dependency_versions,
-                &mut resolved_dependencies,
-            )
-            .await?;
-            suppress_redundant_bundled_dependencies(
-                &app_handle,
-                &launcher_paths,
-                &http_client,
-                &target,
-                &parent_versions,
-                &mut dependency_versions,
-                &mut resolved_dependencies,
-            )
-            .await?;
-            let (incompatible_parent_projects, parent_required_java) =
-                inspect_remote_versions_for_launch(
-                    &launcher_paths,
-                    &http_client,
-                    &parent_versions,
-                    &target,
-                )
-                .await?;
-            let (incompatible_dependency_projects, dependency_required_java) =
-                inspect_remote_versions_for_launch(
-                    &launcher_paths,
-                    &http_client,
-                    &dependency_versions,
-                    &target,
-                )
-                .await?;
-            let owner_map =
-                build_top_level_owner_map(&parent_versions, &resolved_dependencies.links);
-            let mut fabric_validation_issues = if target.mod_loader == ModLoader::Fabric {
-                let all_versions =
-                    deduplicate_versions(parent_versions.clone(), dependency_versions.clone());
-                let metadata_entries = load_embedded_fabric_metadata_for_versions(
-                    &launcher_paths,
-                    &http_client,
-                    &all_versions,
-                    &target,
-                )
-                .await?;
-                let parent_root_metadata = load_root_fabric_metadata_for_versions(
-                    &launcher_paths,
-                    &http_client,
-                    &parent_versions,
-                    &target,
-                )
-                .await?;
-                let mut issues = validate_root_parent_fabric_runtime(
-                    &parent_root_metadata,
-                    &metadata_entries,
-                );
-                issues.extend(validate_final_fabric_runtime(&metadata_entries, &owner_map));
-                issues
-            } else {
-                HashMap::new()
-            };
-            for project_id in &incompatible_parent_projects {
-                fabric_validation_issues
-                    .entry(project_id.clone())
-                    .or_insert_with(|| FabricValidationIssue {
-                        reason_code: "embedded_version_incompatible",
-                        owner_project_id: project_id.clone(),
-                        mod_id: project_id.clone(),
-                        dependency_id: None,
-                        detail: format!(
-                            "the selected jar is incompatible with {} / {}",
-                            target.minecraft_version,
-                            target.mod_loader.as_modrinth_loader()
-                        ),
-                    });
-            }
-            for project_id in &resolved_dependencies.excluded_parents {
-                if let Some(top_level_owners) = owner_map.get(project_id) {
-                    for top_level_owner in top_level_owners {
-                        fabric_validation_issues
-                            .entry(top_level_owner.clone())
-                            .or_insert_with(|| FabricValidationIssue {
-                                reason_code: "missing_dependency",
-                                owner_project_id: project_id.clone(),
-                                mod_id: project_id.clone(),
-                                dependency_id: None,
-                                detail:
-                                    "a required dependency has no compatible version for this target"
-                                        .into(),
-                            });
-                    }
-                }
-            }
-            for project_id in &exact_conflict_excluded {
-                fabric_validation_issues
-                    .entry(project_id.clone())
-                    .or_insert_with(|| FabricValidationIssue {
-                        reason_code: "exact_dependency_conflict",
-                        owner_project_id: project_id.clone(),
-                        mod_id: project_id.clone(),
-                        dependency_id: None,
-                        detail: "an exact dependency version conflicts with an already-selected mod"
-                            .into(),
-                    });
-            }
-            for dependency_id in &incompatible_dependency_projects {
-                if let Some(top_level_owners) = owner_map.get(dependency_id) {
-                    for top_level_owner in top_level_owners {
-                        fabric_validation_issues
-                            .entry(top_level_owner.clone())
-                            .or_insert_with(|| FabricValidationIssue {
-                                reason_code: "embedded_version_incompatible",
-                                owner_project_id: dependency_id.clone(),
-                                mod_id: dependency_id.clone(),
-                                dependency_id: Some(dependency_id.clone()),
-                                detail: format!(
-                                    "a required dependency jar is incompatible with {} / {}",
-                                    target.minecraft_version,
-                                    target.mod_loader.as_modrinth_loader()
-                                ),
-                            });
-                    }
-                }
-            }
-            let mut advanced_parent_ids = HashSet::new();
-            let mut next_excluded_parent_ids = excluded_parent_ids.clone();
-
-            if let Some((project_id, issue)) = choose_primary_fabric_issue(&fabric_validation_issues)
-            {
-                let issue_signature = fabric_issue_signature(issue);
-                let retry_state = retry_states
-                    .entry(project_id.clone())
-                    .or_insert_with(|| FabricIssueRetryState {
-                        signature: issue_signature.clone(),
-                        consecutive_attempts: 0,
-                    });
-                if retry_state.signature == issue_signature {
-                    retry_state.consecutive_attempts += 1;
-                } else {
-                    retry_state.signature = issue_signature.clone();
-                    retry_state.consecutive_attempts = 1;
-                }
-
-                let should_retry_older_version =
-                    retry_state.consecutive_attempts <= max_same_issue_retries;
-
-                if should_retry_older_version {
-                    if let Some(candidate_entry) = top_level_candidates
-                        .iter()
-                        .find(|entry| entry.project_id == *project_id)
-                    {
-                        let current_index = current_candidate_indexes
-                            .entry(project_id.clone())
-                            .or_insert(0usize);
-                        if *current_index + 1 < candidate_entry.candidates.len() {
-                            *current_index += 1;
-                            advanced_parent_ids.insert(project_id.clone());
-                            let selected_mod_id = selected_mod_ids_by_project
-                                .get(project_id)
-                                .cloned()
-                                .unwrap_or_else(|| project_id.clone());
-                            let next_version = &candidate_entry.candidates[*current_index];
-                            emit_log(
-                                &app_handle,
-                                ProcessLogStream::Stdout,
-                                format!(
-                                    "[Launch] retrying mod '{}' with older compatible version '{}'",
-                                    selected_mod_id, next_version.version_number
-                                ),
-                            )?;
-                        }
-                    }
-                }
-
-                if advanced_parent_ids.is_empty() {
-                    next_excluded_parent_ids.insert(project_id.clone());
-                    exclusion_reasons
-                        .entry(project_id.clone())
-                        .or_insert_with(|| issue.clone());
-
-                    if retry_state.consecutive_attempts > max_same_issue_retries {
-                        emit_log(
-                            &app_handle,
-                            ProcessLogStream::Stdout,
-                            format!(
-                                "[Launch] excluding mod '{}': the same Fabric compatibility issue persisted across older versions ({})",
-                                selected_mod_ids_by_project
-                                    .get(project_id)
-                                    .cloned()
-                                    .unwrap_or_else(|| project_id.clone()),
-                                issue.reason_code
-                            ),
-                        )?;
-                    }
-                }
-            }
-
-            if advanced_parent_ids.is_empty() && next_excluded_parent_ids == excluded_parent_ids {
-                break (
-                    resolved_dependencies,
-                    parent_versions,
-                    dependency_versions,
-                    parent_required_java.max(dependency_required_java),
-                    next_excluded_parent_ids,
-                    incompatible_dependency_projects,
-                    exclusion_reasons.clone(),
-                );
-            }
-
-            excluded_parent_ids = next_excluded_parent_ids;
-        };
-
-        final_dependency_versions.retain(|version| {
-            !excluded_dependency_ids.contains(&version.project_id)
-                && !dependency_resolution
-                    .excluded_parents
-                    .contains(&version.project_id)
-        });
-        let allowed_dependency_ids = final_dependency_versions
+                ProcessLogStream::Stdout,
+                format!(
+                    "[Launch] skipping mod '{}': a required dependency has no compatible version for this target",
+                    excluded_id
+                ),
+            )?;
+        }
+        let final_parent_versions = parent_versions
+            .into_iter()
+            .filter(|version| !dependency_resolution.excluded_parents.contains(&version.project_id))
+            .collect::<Vec<_>>();
+        let allowed_parent_ids = final_parent_versions
             .iter()
             .map(|version| version.project_id.clone())
             .collect::<HashSet<_>>();
         dependency_resolution
+            .links
+            .retain(|link| allowed_parent_ids.contains(&link.parent_mod_id));
+        let allowed_dependency_ids = dependency_resolution
+            .links
+            .iter()
+            .map(|link| link.dependency_id.clone())
+            .collect::<HashSet<_>>();
+        dependency_resolution
             .resolved_dependencies
             .retain(|dependency| allowed_dependency_ids.contains(&dependency.dependency_id));
-        dependency_resolution.links.retain(|link| {
-            !excluded_parent_ids.contains(&link.parent_mod_id)
-                && allowed_dependency_ids.contains(&link.dependency_id)
-        });
-
-        for excluded_id in &excluded_parent_ids {
-            if let Some(issue) = fabric_validation_issues.get(excluded_id) {
-                emit_log(
-                    &app_handle,
-                    ProcessLogStream::Stdout,
-                    format!(
-                        "[Launch] skipping mod '{}': {} ({})",
-                        excluded_id, issue.detail, issue.reason_code
-                    ),
-                )?;
-            } else if dependency_resolution.excluded_parents.contains(excluded_id) {
-                emit_log(
-                    &app_handle,
-                    ProcessLogStream::Stdout,
-                    format!(
-                        "[Launch] skipping mod '{}': a required dependency has no compatible version for this target",
-                        excluded_id
-                    ),
-                )?;
-            } else {
-                emit_log(
-                    &app_handle,
-                    ProcessLogStream::Stdout,
-                    format!(
-                        "[Launch] skipping mod '{}': embedded metadata is incompatible with {} / {}",
-                        excluded_id,
-                        target.minecraft_version,
-                        target.mod_loader.as_modrinth_loader()
-                    ),
-                )?;
-            }
-        }
+        let mut final_dependency_versions = fetch_dependency_versions(
+            &dependency_resolution.resolved_dependencies,
+            &modrinth_client,
+        )
+        .await?;
+        final_dependency_versions
+            .retain(|version| allowed_dependency_ids.contains(&version.project_id));
         launch_log_session.append_summary_line(&format!(
             "excluded_top_level_mods={}",
-            excluded_parent_ids.len()
+            dependency_resolution.excluded_parents.len()
         ))?;
-        let mut excluded_with_reasons = fabric_validation_issues
-            .iter()
-            .map(|(project_id, issue)| {
-                format!(
-                    "excluded_mod={} reason={} detail={}",
-                    project_id, issue.reason_code, issue.detail
-                )
-            })
-            .collect::<Vec<_>>();
-        excluded_with_reasons.sort();
-        for line in excluded_with_reasons {
-            launch_log_session.append_summary_line(&line)?;
-        }
-
         (
             deduplicate_versions(final_parent_versions, final_dependency_versions),
             Vec::new(),
             dependency_resolution,
-            metadata_required_java,
+            required_java_version_for_minecraft(&target.minecraft_version)?,
         )
     };
     launch_log_session.write_dependency_summary(&dependency_resolution)?;
@@ -1771,7 +1486,10 @@ async fn run_launch_pipeline(
             .map(|download| DownloadArtifact {
                 filename: download.jar_filename.clone(),
                 url: download.download_url.clone(),
-                destination_path: launcher_paths.mods_cache_dir().join(&download.jar_filename),
+                destination_path: cached_artifact_path_for_pending_download(
+                    launcher_paths.mods_cache_dir(),
+                    download,
+                ),
                 file_hash: download.file_hash.clone(),
             })
             .collect::<Vec<_>>(),
@@ -1923,10 +1641,8 @@ async fn run_launch_pipeline(
     );
     substitute_loader_placeholders(&mut loader_metadata, &placeholders);
 
-    let effective_required_java = effective_required_java.max(required_java_for_cached_mod_jars(
-        launcher_paths.mods_cache_dir(),
-        &cached_mod_jars,
-    )?);
+    let effective_required_java =
+        effective_required_java.max(required_java_for_cached_mod_jars(&cached_mod_jars)?);
     let effective_required_java = effective_required_java.max(
         loader_metadata
             .min_java_version
@@ -2182,8 +1898,8 @@ fn load_modlist(launcher_paths: &LauncherPaths, modlist_name: &str) -> Result<Mo
 /// so that the re-resolution pass can disable them and try alternatives.
 async fn prefetch_compatible_versions_for_selected(
     app_handle: &tauri::AppHandle,
-    launcher_paths: &LauncherPaths,
-    http_client: &reqwest::Client,
+    _launcher_paths: &LauncherPaths,
+    _http_client: &reqwest::Client,
     selected_mods: &[SelectedMod],
     client: &ModrinthClient,
     target: &ResolutionTarget,
@@ -2197,20 +1913,12 @@ async fn prefetch_compatible_versions_for_selected(
         if versions.contains_key(&selected.mod_id) {
             continue;
         }
-        match select_latest_launch_compatible_version(
-            app_handle,
-            launcher_paths,
-            http_client,
-            client,
-            &selected.mod_id,
-            target,
-        )
-        .await
-        {
-            Ok(Some(version)) => {
+        match client.fetch_project_versions(&selected.mod_id, target).await {
+            Ok(candidate_versions) => {
+                if let Some(version) = candidate_versions.into_iter().next() {
                 versions.insert(selected.mod_id.clone(), version);
+                }
             }
-            Ok(None) => {}
             Err(err) => {
                 let _ = emit_log(
                     app_handle,
@@ -2339,7 +2047,8 @@ async fn ensure_remote_version_cached(
     target: &ResolutionTarget,
 ) -> Result<PathBuf> {
     let record = cache_record_from_version(version, target)?;
-    let destination_path = launcher_paths.mods_cache_dir().join(&record.jar_filename);
+    let destination_path =
+        cached_artifact_path_for_record(launcher_paths.mods_cache_dir(), &record);
     if destination_path.exists() {
         return Ok(destination_path);
     }
@@ -4112,11 +3821,11 @@ fn build_cached_mod_jars(
 ) -> Result<Vec<CachedModJar>> {
     let mut jars = Vec::new();
     let mut seen = HashSet::new();
-    let mods_cache_dir = launcher_paths.mods_cache_dir();
     let local_jars_dir = launcher_paths
         .modlists_dir()
         .join(modlist_name)
         .join("local-jars");
+    let mod_loader = target.mod_loader.as_modrinth_loader();
 
     // Local mods: JAR lives at local-jars/{mod_id}.jar — copy to cache/mods/
     for selected in selected_mods {
@@ -4127,7 +3836,8 @@ fn build_cached_mod_jars(
         let file_name = format!("{}.jar", selected.mod_id);
         if seen.insert(file_name.clone()) {
             let source = local_jars_dir.join(&file_name);
-            let dest = mods_cache_dir.join(&file_name);
+            let dest =
+                cached_local_artifact_path(launcher_paths.mods_cache_dir(), mod_loader, &file_name);
             if source.exists() && !jar_metadata_allows_target(&source, target)? {
                 emit_log(
                     app_handle,
@@ -4142,13 +3852,16 @@ fn build_cached_mod_jars(
                 continue;
             }
             if source.exists() && !dest.exists() {
-                std::fs::create_dir_all(&mods_cache_dir).ok();
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent).ok();
+                }
                 std::fs::copy(&source, &dest).with_context(|| {
                     format!("failed to copy local JAR '{}' to mod cache", file_name)
                 })?;
             }
             jars.push(CachedModJar {
                 jar_filename: file_name,
+                cache_path: dest,
             });
         }
     }
@@ -4157,26 +3870,36 @@ fn build_cached_mod_jars(
         if seen.insert(record.jar_filename.clone()) {
             jars.push(CachedModJar {
                 jar_filename: record.jar_filename.clone(),
+                cache_path: cached_artifact_path_for_record(
+                    launcher_paths.mods_cache_dir(),
+                    record,
+                ),
             });
         }
     }
 
     for version in versions {
-        let jar_filename = cache_record_from_version(version, target)?.jar_filename;
+        let record = cache_record_from_version(version, target)?;
+        let jar_filename = record.jar_filename.clone();
         if seen.insert(jar_filename.clone()) {
-            jars.push(CachedModJar { jar_filename });
+            jars.push(CachedModJar {
+                jar_filename,
+                cache_path: cached_artifact_path_for_record(
+                    launcher_paths.mods_cache_dir(),
+                    &record,
+                ),
+            });
         }
     }
 
     Ok(jars)
 }
 
-fn required_java_for_cached_mod_jars(mods_cache_dir: &Path, jars: &[CachedModJar]) -> Result<u32> {
+fn required_java_for_cached_mod_jars(jars: &[CachedModJar]) -> Result<u32> {
     let mut required_java = 0;
 
     for jar in jars {
-        let jar_path = mods_cache_dir.join(&jar.jar_filename);
-        let requirements = read_embedded_fabric_requirements(&jar_path)?;
+        let requirements = read_embedded_fabric_requirements(&jar.cache_path)?;
         if let Some(min_java) = embedded_min_java_requirement(&requirements) {
             required_java = required_java.max(min_java);
         }
