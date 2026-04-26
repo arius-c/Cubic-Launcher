@@ -1,3 +1,9 @@
+// Pure derived state for the UI.
+//
+// Selectors should not mutate signals, call Tauri commands, or perform
+// persistence. If a computed value needs side effects, keep the read here and
+// put the write path in `store-actions.ts` or a feature-level handler.
+
 import { createMemo } from "solid-js";
 import type { FunctionalGroup, IncompatibilityRule, ModRow } from "./lib/types";
 import {

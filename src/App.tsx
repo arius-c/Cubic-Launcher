@@ -1,3 +1,10 @@
+// Frontend orchestration root.
+//
+// This file wires backend commands, Tauri events, optimistic UI updates, and
+// top-level modal actions. Feature-specific state and rendering should stay in
+// `src/app/`, `src/store-*`, or colocated component folders instead of growing
+// this file again.
+
 import { batch } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { appendDebugTrace } from "./lib/debugTrace";

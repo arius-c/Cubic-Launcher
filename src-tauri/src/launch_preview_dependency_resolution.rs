@@ -1,5 +1,13 @@
 use std::collections::{HashMap, HashSet};
 
+// Dependency resolution shared by online and cache-only launch paths.
+//
+// Online resolution can ask Modrinth for current compatible versions. Cache-only
+// resolution cannot use the network, so it must resolve from cached records and
+// persisted dependency links. Keep those paths semantically aligned: a fully
+// cached online launch should produce the same mod set when repeated in
+// cache-only mode.
+
 use anyhow::{Context, Result};
 
 use crate::dependencies::{

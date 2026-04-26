@@ -5,6 +5,13 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use tauri::State;
 
+// Launch orchestration entry point.
+//
+// The sibling `launch_preview_*` files are focused slices of the launch
+// pipeline: cache handling, dependency resolution, loader metadata, logging,
+// runtime setup, and verification. Keeping this file as the command-facing
+// orchestrator makes launch behavior easier to audit without returning to one
+// very large mixed-responsibility file.
 use crate::app_shell::load_shell_snapshot_from_root;
 use crate::dependencies::{
     collect_required_dependency_requests, resolve_required_dependencies_with_client,
@@ -315,6 +322,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         cached_remote_records,
         dependency_resolution,
         effective_required_java,
+        project_aliases,
     ) = if effective_settings.cache_only_mode {
         emit_log(
             &app_handle,
@@ -328,7 +336,12 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         let parent_artifact_values = parent_artifacts.into_values().collect::<Vec<_>>();
         let (parent_versions, cached_parent_records) =
             split_remote_artifacts(&parent_artifact_values);
-        let selected_project_ids = collect_selected_project_ids(&parent_versions);
+        let mut selected_project_ids = collect_selected_project_ids(&parent_versions);
+        selected_project_ids.extend(
+            cached_parent_records
+                .iter()
+                .map(|record| record.modrinth_project_id.clone()),
+        );
 
         let mut dependency_requests = collect_required_dependency_requests(&parent_versions)?;
         let cached_parent_ids = cached_parent_records
@@ -378,6 +391,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
             cached_records,
             dependency_resolution,
             required_java_version_for_minecraft(&target.minecraft_version)?,
+            Vec::new(),
         )
     } else {
         let compatible_versions = prefetch_compatible_versions_for_selected(
@@ -394,6 +408,15 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
             .filter(|selected| matches!(selected.source, ModSource::Modrinth))
             .filter_map(|selected| compatible_versions.get(&selected.mod_id))
             .cloned()
+            .collect::<Vec<_>>();
+        let project_aliases = selected_mods
+            .iter()
+            .filter(|selected| matches!(selected.source, ModSource::Modrinth))
+            .filter_map(|selected| {
+                compatible_versions
+                    .get(&selected.mod_id)
+                    .map(|version| (selected.mod_id.clone(), version.project_id.clone()))
+            })
             .collect::<Vec<_>>();
         let selected_project_ids = collect_selected_project_ids(&parent_versions);
         let mut dependency_resolution = resolve_required_dependencies_with_client(
@@ -452,6 +475,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
             Vec::new(),
             dependency_resolution,
             required_java_version_for_minecraft(&target.minecraft_version)?,
+            project_aliases,
         )
     };
     launch_log_session.write_dependency_summary(&dependency_resolution)?;
@@ -527,6 +551,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         &all_remote_versions,
         &target,
         &dependency_resolution.links,
+        &project_aliases,
     )?;
 
     emit_progress(

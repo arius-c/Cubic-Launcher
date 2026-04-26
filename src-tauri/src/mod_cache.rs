@@ -7,6 +7,12 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use sha1::{Digest, Sha1};
 
+// Mod artifact cache and lookup helpers.
+//
+// Cache records are keyed by canonical Modrinth project/version ids, while
+// user rules can be stored as Modrinth slugs. The project alias table bridges
+// those identifiers so cache-only launch can reuse the same artifacts selected
+// by an online launch.
 use crate::modrinth::ModrinthVersion;
 use crate::resolver::ResolutionTarget;
 
@@ -203,6 +209,62 @@ impl<'connection> SqliteModCacheRepository<'connection> {
         }
 
         Ok(None)
+    }
+
+    pub fn upsert_project_alias(&self, alias: &str, canonical_project_id: &str) -> Result<()> {
+        let alias = alias.trim();
+        let canonical_project_id = canonical_project_id.trim();
+        if alias.is_empty() || canonical_project_id.is_empty() || alias == canonical_project_id {
+            return Ok(());
+        }
+
+        self.connection.execute(
+            r#"
+            INSERT INTO modrinth_project_aliases (alias, canonical_project_id)
+            VALUES (?1, ?2)
+            ON CONFLICT(alias) DO UPDATE SET
+                canonical_project_id = excluded.canonical_project_id
+            "#,
+            params![alias, canonical_project_id],
+        )?;
+
+        Ok(())
+    }
+
+    pub fn find_canonical_project_id(&self, alias: &str) -> Result<Option<String>> {
+        self.connection
+            .query_row(
+                r#"
+                SELECT canonical_project_id
+                FROM modrinth_project_aliases
+                WHERE alias = ?1
+                "#,
+                [alias.trim()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn find_compatible_by_project_or_alias(
+        &self,
+        project_id_or_alias: &str,
+        target: &ResolutionTarget,
+    ) -> Result<Option<ModCacheRecord>> {
+        if let Some(record) = self.find_compatible_by_project(project_id_or_alias, target)? {
+            return Ok(Some(record));
+        }
+
+        let Some(canonical_project_id) = self.find_canonical_project_id(project_id_or_alias)?
+        else {
+            return Ok(None);
+        };
+
+        if canonical_project_id == project_id_or_alias.trim() {
+            return Ok(None);
+        }
+
+        self.find_compatible_by_project(&canonical_project_id, target)
     }
 }
 
@@ -581,6 +643,49 @@ mod tests {
 
         assert_eq!(record.modrinth_project_id, "sodium");
         assert_eq!(record.modrinth_version_id, "version-newer");
+
+        drop(connection);
+        fs::remove_dir_all(&root_dir).expect("temporary root should be removable");
+    }
+
+    #[test]
+    fn repository_finds_compatible_project_record_through_alias() {
+        let root_dir = unique_test_root();
+        let database_path = root_dir.join("launcher_data.db");
+        let mods_cache_dir = root_dir.join("cache").join("mods");
+
+        fs::create_dir_all(&mods_cache_dir).expect("mods cache directory should be created");
+        initialize_database(&database_path).expect("database should initialize");
+
+        let connection = Connection::open(&database_path).expect("database should open");
+        let repository = SqliteModCacheRepository::new(&connection, &mods_cache_dir);
+        let canonical_version = version("canonical-sodium", "version-1", "sodium.jar");
+
+        repository
+            .upsert_modrinth_version(&canonical_version, &target())
+            .expect("cache record should insert");
+        repository
+            .upsert_project_alias("sodium", "canonical-sodium")
+            .expect("project alias should insert");
+
+        let record = cache_record_from_version(&canonical_version, &target())
+            .expect("canonical record should build");
+        let artifact_path = cached_artifact_path_for_record(&mods_cache_dir, &record);
+        fs::create_dir_all(
+            artifact_path
+                .parent()
+                .expect("artifact parent should exist"),
+        )
+        .expect("artifact parent should be created");
+        fs::write(artifact_path, b"jar").expect("jar should exist");
+
+        let record = repository
+            .find_compatible_by_project_or_alias("sodium", &target())
+            .expect("compatible alias lookup should succeed")
+            .expect("compatible record should exist");
+
+        assert_eq!(record.modrinth_project_id, "canonical-sodium");
+        assert_eq!(record.modrinth_version_id, "version-1");
 
         drop(connection);
         fs::remove_dir_all(&root_dir).expect("temporary root should be removable");

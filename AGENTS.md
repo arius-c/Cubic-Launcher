@@ -36,12 +36,24 @@ The app is not a generic CRUD shell. It has a few core product flows that should
 - `lib.rs`: Tauri app setup, launcher path initialization, database initialization, and command registration.
 - `app_shell.rs`: shell snapshot loading, account switching, Microsoft login entry points, global settings, per-modlist overrides.
 - `editor_data.rs`: editor snapshot loading and most rule CRUD operations.
+- `editor_data_models.rs` and `editor_data_tests.rs`: extracted editor data contracts and focused tests. Keep structs/payload shapes here when they are shared by multiple editor commands, and keep `editor_data.rs` focused on command orchestration and persistence behavior.
 - `rules.rs`: rule structs, serialization, schema/version handling.
 - `resolver.rs`: mod resolution and availability backfill.
 - `modlist_manager.rs`: create/delete/import/copy-local-jar operations for mod lists.
 - `modlist_assets.rs`: presentation metadata, groups, export, file listing, image loading.
 - `content_packs.rs`: resource packs, shaders, datapacks, and other non-mod content management.
 - `launch_preview.rs` and `launch_command.rs`: launch preparation and process execution.
+- `launch_preview_models.rs`: launch request/result models and shared launch settings payloads.
+- `launch_preview_logging.rs`: launch log session management, summary files, process event logging, and launcher issue/progress emission helpers.
+- `launch_preview_artifacts.rs`: selected mod collection, Modrinth/cached artifact selection, resolution logging, and artifact grouping.
+- `launch_preview_cache.rs`: cached mod/dependency metadata reads, remote artifact acquisition planning, downloads, and cache persistence.
+- `launch_preview_dependency_resolution.rs`: cache-only dependency request resolution and dependency conflict selection.
+- `launch_preview_fabric.rs` and `launch_preview_fabric_versions.rs`: Fabric metadata parsing, embedded requirement checks, provided IDs, Java/version predicate helpers, and Fabric dependency version comparison.
+- `launch_preview_dependencies.rs`: dependency validation and embedded Fabric dependency handling. Some helper paths are retained for launch compatibility and may be guarded with module-level `dead_code` allowances.
+- `launch_preview_content.rs`: resource pack, shader, datapack, and other content-pack launch installation.
+- `launch_preview_runtime.rs`: launch-time account identity, Java runtime selection, loader library materialization, and placeholder substitution.
+- `launch_preview_verification.rs`: automation/verification support for launch smoke checks.
+- `launch_preview_tests.rs`: launch preview unit tests. Keep tests colocated here instead of growing `launch_preview.rs`.
 - `process_streaming.rs`: streamed launch/process events.
 - `minecraft_downloader.rs`, `java_runtime.rs`, `adoptium.rs`, `loader_metadata.rs`: runtime and Minecraft asset setup.
 - `modrinth.rs`, `dependencies.rs`, `mod_cache.rs`: mod discovery, dependency handling, caching.
@@ -98,6 +110,10 @@ Important implementation detail:
 - For future refactors, prefer “one responsibility per file” over arbitrary line-count targets. Files in the `300-600` line range are acceptable when cohesion is high; avoid reintroducing `1000+` line mixed-responsibility frontend files.
 - Do not mutate launcher persistence formats casually. Changes touching `rules.rs`, `database.rs`, exported archives, or on-disk config handling should be reviewed for backward compatibility.
 - Keep launch work backend-driven. The frontend should request a launch and render streamed progress, not reimplement launch steps.
+- Keep `launch_preview.rs` as the launch pipeline coordinator. New launch behavior should usually go into the focused `launch_preview_*` module that owns that responsibility instead of expanding the coordinator.
+- Do not merge the extracted launch preview modules back into `launch_preview.rs` for convenience. The split is intentional: models, logging, artifact/cache handling, dependency resolution, Fabric metadata, content packs, runtime setup, verification, and tests each have a separate file.
+- Treat cache-only launch behavior as its own compatibility-sensitive path. If cache-only launch fails while normal launch works, debug `launch_preview_cache.rs` and `launch_preview_dependency_resolution.rs` first, and verify cached parent/dependency records before changing normal online launch resolution.
+- Module-level `dead_code` allowances in launch preview helper modules are acceptable only for retained compatibility helpers or fallback logic. Do not use them to hide newly introduced unused code.
 - Keep resolution semantics stable. Changes in `resolver.rs`, incompatibility handling, links/dependencies, or version rule evaluation can cause silent correctness regressions.
 - Account/auth work spans multiple modules. If you touch Microsoft login, token persistence, account switching, or offline accounts, inspect the full flow before editing.
 - For UI features involving mod grouping, alternatives, links, incompatibilities, or advanced metadata, verify both the optimistic frontend path and the backend reload path.

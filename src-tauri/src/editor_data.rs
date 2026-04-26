@@ -3,6 +3,12 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 use tauri::State;
 
+// Editor command surface for mod-list rule data.
+//
+// This module owns the Tauri commands that mutate the rule tree and editor
+// snapshot. Payload structs live in `editor_data_models.rs`, and focused tests
+// live in `editor_data_tests.rs`, so new editor behavior should usually extend
+// those files instead of growing unrelated modules.
 use crate::launcher_paths::LauncherPaths;
 use crate::rules::{
     CustomConfig, ModList, ModSource, Rule, VersionRule, VersionRuleKind, RULES_FILENAME,

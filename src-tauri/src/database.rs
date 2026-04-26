@@ -39,6 +39,11 @@ CREATE TABLE IF NOT EXISTS mod_cache (
     PRIMARY KEY (modrinth_version_id)
 );
 
+CREATE TABLE IF NOT EXISTS modrinth_project_aliases (
+    alias                TEXT PRIMARY KEY,
+    canonical_project_id TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS dependencies (
     mod_parent_id    TEXT NOT NULL,
     dependency_id    TEXT NOT NULL,
@@ -204,6 +209,7 @@ mod tests {
             "accounts",
             "java_installations",
             "mod_cache",
+            "modrinth_project_aliases",
             "dependencies",
             "config_attribution",
             "global_settings",

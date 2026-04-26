@@ -1,5 +1,13 @@
 #![allow(dead_code)]
 
+// Cache and artifact helpers for the launch pipeline.
+//
+// Cache-only mode depends on this module producing the same final JAR set as
+// an online launch when artifacts are already present locally. Be careful with
+// dependency persistence: online launches refresh dependency rows for resolved
+// parents so cache-only launches do not reuse stale dependencies from another
+// Minecraft version or loader.
+
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -69,7 +77,7 @@ pub(super) fn load_cached_mod_record_for_target(
         )
     })?;
     let repository = SqliteModCacheRepository::new(&connection, launcher_paths.mods_cache_dir());
-    repository.find_compatible_by_project(project_id, target)
+    repository.find_compatible_by_project_or_alias(project_id, target)
 }
 
 pub(super) fn load_cached_mod_record_by_version(
@@ -316,6 +324,7 @@ pub(super) fn persist_remote_versions_and_dependencies(
     versions: &[ModrinthVersion],
     target: &ResolutionTarget,
     dependency_links: &[DependencyLink],
+    project_aliases: &[(String, String)],
 ) -> Result<()> {
     let connection = Connection::open(launcher_paths.database_path()).with_context(|| {
         format!(
@@ -329,14 +338,30 @@ pub(super) fn persist_remote_versions_and_dependencies(
         repository.upsert_modrinth_version(version, target)?;
     }
 
-    persist_dependency_links(&connection, dependency_links)
+    for (alias, canonical_project_id) in project_aliases {
+        repository.upsert_project_alias(alias, canonical_project_id)?;
+    }
+
+    let refreshed_parent_ids = versions
+        .iter()
+        .map(|version| version.project_id.clone())
+        .collect::<HashSet<_>>();
+    persist_dependency_links(&connection, dependency_links, &refreshed_parent_ids)
 }
 
 pub(super) fn persist_dependency_links(
     connection: &Connection,
     links: &[DependencyLink],
+    refreshed_parent_ids: &HashSet<String>,
 ) -> Result<()> {
     let transaction = connection.unchecked_transaction()?;
+
+    for parent_id in refreshed_parent_ids {
+        transaction.execute(
+            "DELETE FROM dependencies WHERE mod_parent_id = ?1",
+            [parent_id.as_str()],
+        )?;
+    }
 
     for link in links {
         transaction.execute(

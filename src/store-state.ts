@@ -1,3 +1,9 @@
+// Raw SolidJS store state.
+//
+// Keep signal declarations here and export them through `store.ts`. Derived
+// reads belong in `store-selectors.ts`; writes and reusable mutations belong in
+// `store-actions.ts`.
+
 import { createSignal } from "solid-js";
 import type {
   AccountSummary,

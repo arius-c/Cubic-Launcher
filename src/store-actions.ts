@@ -1,3 +1,9 @@
+// Reusable store mutations.
+//
+// Keep state writes here when they are shared across components. This keeps
+// `store-state.ts` limited to signal declarations and makes optimistic UI
+// updates easier to audit.
+
 import { createSignal } from "solid-js";
 import type { CustomConfig, LauncherUiError, VersionRule } from "./lib/types";
 import {
