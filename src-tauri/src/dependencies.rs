@@ -220,7 +220,8 @@ pub async fn resolve_required_dependencies_with_client(
             .collect::<Vec<_>>();
     }
 
-    let selected_candidates = finalize_dependency_candidates(&candidates, excluded_parents.clone()).0;
+    let selected_candidates =
+        finalize_dependency_candidates(&candidates, excluded_parents.clone()).0;
     let mut resolution =
         build_dependency_resolution(candidates, selected_candidates, excluded_parents.clone())?;
     resolution.excluded_parents.extend(excluded_parents);

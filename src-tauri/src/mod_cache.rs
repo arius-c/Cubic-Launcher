@@ -56,7 +56,10 @@ pub fn cached_local_artifact_path(
     mod_loader: &str,
     jar_filename: &str,
 ) -> PathBuf {
-    mods_cache_dir.join(mod_loader).join("local").join(jar_filename)
+    mods_cache_dir
+        .join(mod_loader)
+        .join("local")
+        .join(jar_filename)
 }
 
 pub fn legacy_cached_artifact_path(mods_cache_dir: &Path, jar_filename: &str) -> PathBuf {
@@ -244,7 +247,10 @@ impl ModCacheLookup for SqliteModCacheRepository<'_> {
 }
 
 impl SqliteModCacheRepository<'_> {
-    fn ensure_record_file_available(&self, record: ModCacheRecord) -> Result<Option<ModCacheRecord>> {
+    fn ensure_record_file_available(
+        &self,
+        record: ModCacheRecord,
+    ) -> Result<Option<ModCacheRecord>> {
         let artifact_path = cached_artifact_path_for_record(&self.mods_cache_dir, &record);
         if artifact_path.exists() {
             return Ok(Some(record));
@@ -415,8 +421,8 @@ mod tests {
 
     use super::{
         build_mod_acquisition_plan, cache_record_from_version, cached_artifact_path_for_record,
-        pending_download_from_version, legacy_cached_artifact_path, ModCacheLookup,
-        ModCacheRecord, SqliteModCacheRepository,
+        legacy_cached_artifact_path, pending_download_from_version, ModCacheLookup, ModCacheRecord,
+        SqliteModCacheRepository,
     };
 
     fn unique_test_root() -> PathBuf {
@@ -605,8 +611,7 @@ mod tests {
             .expect("test record hash should be updated");
 
         let legacy_path = legacy_cached_artifact_path(&mods_cache_dir, &record.jar_filename);
-        fs::write(&legacy_path, legacy_bytes)
-            .expect("legacy file should be written for migration");
+        fs::write(&legacy_path, legacy_bytes).expect("legacy file should be written for migration");
 
         let migrated = repository
             .find_by_version_id("version-1")
@@ -614,7 +619,10 @@ mod tests {
             .expect("record should be returned after migration");
 
         let artifact_path = cached_artifact_path_for_record(&mods_cache_dir, &migrated);
-        assert!(artifact_path.exists(), "artifact should be moved to new cache path");
+        assert!(
+            artifact_path.exists(),
+            "artifact should be moved to new cache path"
+        );
         assert!(
             !legacy_path.exists(),
             "legacy flat cache file should be removed after migration"

@@ -1,7 +1,6 @@
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
-use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use crate::launcher_paths::LauncherPaths;
@@ -9,194 +8,14 @@ use crate::rules::{
     CustomConfig, ModList, ModSource, Rule, VersionRule, VersionRuleKind, RULES_FILENAME,
 };
 
-// ── Snapshot types (sent to frontend) ────────────────────────────────────────
+#[path = "editor_data_models.rs"]
+mod models;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EditorSnapshot {
-    pub modlist_name: String,
-    pub rows: Vec<EditorRow>,
-    pub incompatibilities: Vec<IncompatibilityEntry>,
-}
+#[cfg(test)]
+#[path = "editor_data_tests.rs"]
+mod tests;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EditorRow {
-    pub mod_id: String,
-    pub name: String,
-    pub source: String,
-    pub enabled: bool,
-    pub exclude_if: Vec<String>,
-    pub requires: Vec<String>,
-    pub version_rules: Vec<EditorVersionRule>,
-    pub custom_configs: Vec<EditorCustomConfig>,
-    pub alternatives: Vec<EditorRow>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EditorVersionRule {
-    pub kind: String,
-    pub mc_versions: Vec<String>,
-    pub loader: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EditorCustomConfig {
-    pub mc_versions: Vec<String>,
-    pub loader: String,
-    pub target_path: String,
-    pub files: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct IncompatibilityEntry {
-    pub winner_id: String,
-    pub loser_id: String,
-}
-
-// ── Input structs ────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AddModRuleInput {
-    pub modlist_name: String,
-    pub mod_id: String,
-    pub source: String,
-    pub file_name: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DeleteRulesInput {
-    pub modlist_name: String,
-    pub mod_ids: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RenameRuleInput {
-    pub modlist_name: String,
-    pub mod_id: String,
-    pub new_mod_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ReorderRulesInput {
-    pub modlist_name: String,
-    pub ordered_mod_ids: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SaveAlternativeOrderInput {
-    pub modlist_name: String,
-    pub parent_mod_id: String,
-    pub ordered_alt_ids: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AddAlternativeInput {
-    pub modlist_name: String,
-    pub parent_mod_id: String,
-    pub mod_id: String,
-    pub source: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AddNestedAlternativeInput {
-    pub modlist_name: String,
-    pub parent_mod_id: String,
-    pub mod_id: String,
-    pub source: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RemoveAlternativeInput {
-    pub modlist_name: String,
-    pub parent_mod_id: String,
-    pub alt_mod_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SaveIncompatibilitiesInput {
-    pub modlist_name: String,
-    pub rules: Vec<IncompatibilityRuleInput>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct IncompatibilityRuleInput {
-    pub winner_id: String,
-    pub loser_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SaveRuleAdvancedInput {
-    pub modlist_name: String,
-    pub mod_id: String,
-    pub exclude_if: Vec<String>,
-    pub requires: Vec<String>,
-    pub version_rules: Vec<SaveVersionRuleInput>,
-    pub custom_configs: Vec<SaveCustomConfigInput>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SaveAdvancedBatchInput {
-    pub modlist_name: String,
-    pub requires_entries: Vec<RequiresEntry>,
-    pub version_rules_entries: Vec<VersionRulesEntry>,
-    pub custom_configs_entries: Vec<CustomConfigsEntry>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RequiresEntry {
-    pub mod_id: String,
-    pub requires: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct VersionRulesEntry {
-    pub mod_id: String,
-    pub version_rules: Vec<SaveVersionRuleInput>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CustomConfigsEntry {
-    pub mod_id: String,
-    pub custom_configs: Vec<SaveCustomConfigInput>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SaveVersionRuleInput {
-    pub kind: String,
-    pub mc_versions: Vec<String>,
-    pub loader: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SaveCustomConfigInput {
-    pub mc_versions: Vec<String>,
-    pub loader: String,
-    pub target_path: String,
-    pub files: Vec<String>,
-}
-
-// ── Tauri commands ───────────────────────────────────────────────────────────
+pub use models::*;
 
 #[tauri::command]
 pub fn load_modlist_editor_command(
@@ -295,14 +114,6 @@ pub fn save_advanced_batch_command(
     save_advanced_batch_from_root(launcher_paths.root_dir(), &input).map_err(|e| e.to_string())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ToggleRuleEnabledInput {
-    pub modlist_name: String,
-    pub mod_id: String,
-    pub enabled: bool,
-}
-
 #[tauri::command]
 pub fn toggle_rule_enabled_command(
     launcher_paths: State<'_, LauncherPaths>,
@@ -310,8 +121,6 @@ pub fn toggle_rule_enabled_command(
 ) -> Result<(), String> {
     toggle_rule_enabled_from_root(launcher_paths.root_dir(), &input).map_err(|e| e.to_string())
 }
-
-// ── Worker functions ─────────────────────────────────────────────────────────
 
 fn toggle_rule_enabled_from_root(root_dir: &Path, input: &ToggleRuleEnabledInput) -> Result<()> {
     let mut modlist = load_modlist(root_dir, &input.modlist_name)?;
@@ -382,7 +191,6 @@ pub fn add_mod_rule_from_root(root_dir: &Path, input: &AddModRuleInput) -> Resul
 
     let source = parse_mod_source(&input.source)?;
 
-    // For local source with a file_name, copy the JAR to local-jars/
     if source == ModSource::Local {
         if let Some(file_name) = &input.file_name {
             let launcher_paths = LauncherPaths::new(root_dir.to_path_buf());
@@ -425,12 +233,10 @@ pub fn delete_rules_from_root(root_dir: &Path, input: &DeleteRulesInput) -> Resu
     let ids_to_remove: std::collections::HashSet<&str> =
         input.mod_ids.iter().map(|s| s.as_str()).collect();
 
-    // Remove from top-level
     modlist
         .rules
         .retain(|r| !ids_to_remove.contains(r.mod_id.as_str()));
 
-    // Remove from alternatives recursively
     for rule in &mut modlist.rules {
         remove_from_alternatives(rule, &ids_to_remove);
     }
@@ -457,13 +263,11 @@ pub fn rename_rule_from_root(root_dir: &Path, input: &RenameRuleInput) -> Result
         bail!("a rule with mod_id '{}' already exists", input.new_mod_id);
     }
 
-    // Update the rule's own mod_id
     let rule = modlist
         .find_rule_mut(&input.mod_id)
         .with_context(|| format!("rule '{}' not found", input.mod_id))?;
     rule.mod_id = input.new_mod_id.clone();
 
-    // Update all references in exclude_if and requires across the whole tree
     let old_id = input.mod_id.clone();
     let new_id = input.new_mod_id.clone();
     for rule in &mut modlist.rules {
@@ -502,7 +306,6 @@ pub fn reorder_rules_from_root(root_dir: &Path, input: &ReorderRulesInput) -> Re
         reordered.push(modlist.rules.remove(pos));
     }
 
-    // Append any rules not mentioned in the order (shouldn't happen, but be safe)
     reordered.append(&mut modlist.rules);
     modlist.rules = reordered;
 
@@ -542,7 +345,6 @@ pub fn save_alternative_order_from_root(
 pub fn add_alternative_from_root(root_dir: &Path, input: &AddAlternativeInput) -> Result<()> {
     let mut modlist = load_modlist(root_dir, &input.modlist_name)?;
 
-    // If the mod already exists, extract it (preserving all its data) instead of rejecting.
     let rule_to_add = if modlist.contains_mod_id(&input.mod_id) {
         extract_rule_anywhere(&mut modlist, &input.mod_id)?
     } else {
@@ -559,7 +361,6 @@ pub fn add_alternative_from_root(root_dir: &Path, input: &AddAlternativeInput) -
         }
     };
 
-    // Find top-level rule
     let parent = modlist
         .rules
         .iter_mut()
@@ -577,7 +378,6 @@ pub fn add_nested_alternative_from_root(
 ) -> Result<()> {
     let mut modlist = load_modlist(root_dir, &input.modlist_name)?;
 
-    // If the mod already exists, extract it (preserving all its data) instead of rejecting.
     let rule_to_add = if modlist.contains_mod_id(&input.mod_id) {
         extract_rule_anywhere(&mut modlist, &input.mod_id)?
     } else {
@@ -606,33 +406,25 @@ pub fn add_nested_alternative_from_root(
 pub fn remove_alternative_from_root(root_dir: &Path, input: &RemoveAlternativeInput) -> Result<()> {
     let mut modlist = load_modlist(root_dir, &input.modlist_name)?;
 
-    // Extract the alternative from its parent (keeping all its data).
     let extracted = extract_alternative(&mut modlist, &input.parent_mod_id, &input.alt_mod_id)?;
 
-    // Promote: insert the extracted rule at the same level as the parent.
     if let Some(pos) = modlist
         .rules
         .iter()
         .position(|r| r.mod_id == input.parent_mod_id)
     {
-        // Parent is a top-level rule → insert the alt as a new top-level rule right after it.
         modlist.rules.insert(pos + 1, extracted);
     } else {
-        // Parent is nested → insert as a sibling alternative of the parent (under grandparent).
         insert_as_sibling(&mut modlist.rules, &input.parent_mod_id, extracted)?;
     }
 
     save_modlist(root_dir, &input.modlist_name, &modlist)
 }
 
-/// Remove a rule from anywhere in the tree (top-level or nested alternative) and return it.
-/// Preserves all rule data (exclude_if, requires, version_rules, etc.).
 fn extract_rule_anywhere(modlist: &mut ModList, mod_id: &str) -> Result<Rule> {
-    // Check top-level first
     if let Some(pos) = modlist.rules.iter().position(|r| r.mod_id == mod_id) {
         return Ok(modlist.rules.remove(pos));
     }
-    // Search in alternatives recursively
     for rule in &mut modlist.rules {
         if let Some(extracted) = extract_from_alternatives(rule, mod_id) {
             return Ok(extracted);
@@ -653,7 +445,6 @@ fn extract_from_alternatives(rule: &mut Rule, mod_id: &str) -> Option<Rule> {
     None
 }
 
-/// Remove the alternative with `alt_mod_id` from the rule with `parent_mod_id` and return it.
 fn extract_alternative(
     modlist: &mut ModList,
     parent_mod_id: &str,
@@ -677,8 +468,6 @@ fn extract_alternative(
     Ok(parent.alternatives.remove(pos))
 }
 
-/// Recursively find the rule whose alternatives contain `sibling_mod_id`,
-/// then insert `new_rule` right after that sibling in the alternatives list.
 fn insert_as_sibling(rules: &mut Vec<Rule>, sibling_mod_id: &str, new_rule: Rule) -> Result<()> {
     for rule in rules.iter_mut() {
         if let Some(pos) = rule
@@ -702,14 +491,10 @@ pub fn save_incompatibilities_from_root(
 ) -> Result<()> {
     let mut modlist = load_modlist(root_dir, &input.modlist_name)?;
 
-    // Clear all exclude_if arrays across the entire tree
     for rule in &mut modlist.rules {
         clear_exclude_if_tree(rule);
     }
 
-    // Rebuild exclude_if from the incompatibility list.
-    // Incompatibility: winner_id's presence causes loser_id to be excluded.
-    // So we add winner_id to loser_id's exclude_if.
     for incompat in &input.rules {
         if let Some(loser_rule) = modlist.find_rule_mut(&incompat.loser_id) {
             if !loser_rule.exclude_if.contains(&incompat.winner_id) {
@@ -735,7 +520,6 @@ pub fn save_rule_advanced_from_root(root_dir: &Path, input: &SaveRuleAdvancedInp
         .find_rule_mut(&input.mod_id)
         .with_context(|| format!("rule '{}' not found", input.mod_id))?;
 
-    // Note: exclude_if is NOT set here — it is managed exclusively by save_incompatibilities_command.
     rule.requires = input.requires.clone();
     rule.version_rules = input
         .version_rules
@@ -769,7 +553,6 @@ pub fn save_advanced_batch_from_root(
 ) -> Result<()> {
     let mut modlist = load_modlist(root_dir, &input.modlist_name)?;
 
-    // Clear all requires, version_rules, and custom_configs across the entire tree.
     fn clear_advanced(rule: &mut Rule) {
         rule.requires.clear();
         rule.version_rules.clear();
@@ -782,14 +565,12 @@ pub fn save_advanced_batch_from_root(
         clear_advanced(rule);
     }
 
-    // Set new requires
     for entry in &input.requires_entries {
         if let Some(rule) = modlist.find_rule_mut(&entry.mod_id) {
             rule.requires = entry.requires.clone();
         }
     }
 
-    // Set new version rules
     for entry in &input.version_rules_entries {
         if let Some(rule) = modlist.find_rule_mut(&entry.mod_id) {
             rule.version_rules = entry
@@ -807,7 +588,6 @@ pub fn save_advanced_batch_from_root(
         }
     }
 
-    // Set new custom configs
     for entry in &input.custom_configs_entries {
         if let Some(rule) = modlist.find_rule_mut(&entry.mod_id) {
             rule.custom_configs = entry
@@ -825,8 +605,6 @@ pub fn save_advanced_batch_from_root(
 
     save_modlist(root_dir, &input.modlist_name, &modlist)
 }
-
-// ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn build_editor_row(rule: &Rule) -> EditorRow {
     EditorRow {
@@ -885,345 +663,10 @@ fn collect_incompatibilities_from_tree(rule: &Rule, entries: &mut Vec<Incompatib
     }
 }
 
-fn parse_mod_source(s: &str) -> Result<ModSource> {
-    match s {
+fn parse_mod_source(source: &str) -> Result<ModSource> {
+    match source {
         "modrinth" => Ok(ModSource::Modrinth),
         "local" => Ok(ModSource::Local),
         other => bail!("unknown mod source '{}'", other),
-    }
-}
-
-// ── Tests ────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use std::env;
-    use std::fs;
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    use crate::rules::{ModList, ModSource, Rule};
-
-    use super::*;
-
-    fn unique_test_root() -> PathBuf {
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        env::temp_dir().join(format!("cubic-editor-test-{ts}"))
-    }
-
-    fn setup_modlist(root_dir: &Path, name: &str, rules: Vec<Rule>) {
-        let modlist_dir = root_dir.join("mod-lists").join(name);
-        fs::create_dir_all(&modlist_dir).unwrap();
-
-        ModList {
-            modlist_name: name.into(),
-            author: "Author".into(),
-            description: "".into(),
-            rules,
-        }
-        .write_to_file(&modlist_dir.join("rules.json"))
-        .unwrap();
-    }
-
-    fn simple_rule(mod_id: &str) -> Rule {
-        Rule {
-            mod_id: mod_id.into(),
-            source: ModSource::Modrinth,
-            enabled: true,
-            exclude_if: vec![],
-            requires: vec![],
-            version_rules: vec![],
-            custom_configs: vec![],
-            alternatives: vec![],
-        }
-    }
-
-    #[test]
-    fn load_editor_snapshot_returns_rows_and_incompatibilities() {
-        let root = unique_test_root();
-        setup_modlist(
-            &root,
-            "Test Pack",
-            vec![
-                Rule {
-                    mod_id: "sodium".into(),
-                    source: ModSource::Modrinth,
-                    enabled: true,
-                    exclude_if: vec![],
-                    requires: vec![],
-                    version_rules: vec![],
-                    custom_configs: vec![],
-                    alternatives: vec![simple_rule("rubidium")],
-                },
-                Rule {
-                    mod_id: "embeddium".into(),
-                    source: ModSource::Modrinth,
-                    enabled: true,
-                    exclude_if: vec!["sodium".into()],
-                    requires: vec![],
-                    version_rules: vec![],
-                    custom_configs: vec![],
-                    alternatives: vec![],
-                },
-            ],
-        );
-
-        let snapshot = load_editor_snapshot_from_root(&root, "Test Pack").unwrap();
-
-        assert_eq!(snapshot.modlist_name, "Test Pack");
-        assert_eq!(snapshot.rows.len(), 2);
-        assert_eq!(snapshot.rows[0].mod_id, "sodium");
-        assert_eq!(snapshot.rows[0].alternatives.len(), 1);
-        assert_eq!(snapshot.rows[0].alternatives[0].mod_id, "rubidium");
-        assert_eq!(snapshot.incompatibilities.len(), 1);
-        assert_eq!(snapshot.incompatibilities[0].winner_id, "sodium");
-        assert_eq!(snapshot.incompatibilities[0].loser_id, "embeddium");
-
-        fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
-    fn add_mod_rule_appends_rule() {
-        let root = unique_test_root();
-        setup_modlist(&root, "Pack", vec![simple_rule("sodium")]);
-
-        add_mod_rule_from_root(
-            &root,
-            &AddModRuleInput {
-                modlist_name: "Pack".into(),
-                mod_id: "lithium".into(),
-                source: "modrinth".into(),
-                file_name: None,
-            },
-        )
-        .unwrap();
-
-        let snapshot = load_editor_snapshot_from_root(&root, "Pack").unwrap();
-        assert_eq!(snapshot.rows.len(), 2);
-        assert_eq!(snapshot.rows[1].mod_id, "lithium");
-
-        fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
-    fn add_mod_rule_rejects_duplicate() {
-        let root = unique_test_root();
-        setup_modlist(&root, "Pack", vec![simple_rule("sodium")]);
-
-        let result = add_mod_rule_from_root(
-            &root,
-            &AddModRuleInput {
-                modlist_name: "Pack".into(),
-                mod_id: "sodium".into(),
-                source: "modrinth".into(),
-                file_name: None,
-            },
-        );
-        assert!(result.is_err());
-
-        fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
-    fn delete_rules_removes_from_tree() {
-        let root = unique_test_root();
-        setup_modlist(
-            &root,
-            "Pack",
-            vec![
-                Rule {
-                    mod_id: "sodium".into(),
-                    source: ModSource::Modrinth,
-                    enabled: true,
-                    exclude_if: vec![],
-                    requires: vec![],
-                    version_rules: vec![],
-                    custom_configs: vec![],
-                    alternatives: vec![simple_rule("rubidium")],
-                },
-                simple_rule("lithium"),
-            ],
-        );
-
-        delete_rules_from_root(
-            &root,
-            &DeleteRulesInput {
-                modlist_name: "Pack".into(),
-                mod_ids: vec!["rubidium".into(), "lithium".into()],
-            },
-        )
-        .unwrap();
-
-        let snapshot = load_editor_snapshot_from_root(&root, "Pack").unwrap();
-        assert_eq!(snapshot.rows.len(), 1);
-        assert_eq!(snapshot.rows[0].mod_id, "sodium");
-        assert!(snapshot.rows[0].alternatives.is_empty());
-
-        fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
-    fn rename_rule_updates_all_references() {
-        let root = unique_test_root();
-        setup_modlist(
-            &root,
-            "Pack",
-            vec![
-                simple_rule("sodium"),
-                Rule {
-                    mod_id: "embeddium".into(),
-                    source: ModSource::Modrinth,
-                    enabled: true,
-                    exclude_if: vec!["sodium".into()],
-                    requires: vec![],
-                    version_rules: vec![],
-                    custom_configs: vec![],
-                    alternatives: vec![],
-                },
-            ],
-        );
-
-        rename_rule_from_root(
-            &root,
-            &RenameRuleInput {
-                modlist_name: "Pack".into(),
-                mod_id: "sodium".into(),
-                new_mod_id: "sodium-extra".into(),
-            },
-        )
-        .unwrap();
-
-        let snapshot = load_editor_snapshot_from_root(&root, "Pack").unwrap();
-        assert_eq!(snapshot.rows[0].mod_id, "sodium-extra");
-        assert_eq!(snapshot.rows[1].exclude_if, vec!["sodium-extra"]);
-
-        fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
-    fn reorder_rules_changes_order() {
-        let root = unique_test_root();
-        setup_modlist(
-            &root,
-            "Pack",
-            vec![simple_rule("a"), simple_rule("b"), simple_rule("c")],
-        );
-
-        reorder_rules_from_root(
-            &root,
-            &ReorderRulesInput {
-                modlist_name: "Pack".into(),
-                ordered_mod_ids: vec!["c".into(), "a".into(), "b".into()],
-            },
-        )
-        .unwrap();
-
-        let snapshot = load_editor_snapshot_from_root(&root, "Pack").unwrap();
-        let ids: Vec<&str> = snapshot.rows.iter().map(|r| r.mod_id.as_str()).collect();
-        assert_eq!(ids, vec!["c", "a", "b"]);
-
-        fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
-    fn add_and_remove_alternative() {
-        let root = unique_test_root();
-        setup_modlist(&root, "Pack", vec![simple_rule("sodium")]);
-
-        add_alternative_from_root(
-            &root,
-            &AddAlternativeInput {
-                modlist_name: "Pack".into(),
-                parent_mod_id: "sodium".into(),
-                mod_id: "rubidium".into(),
-                source: "modrinth".into(),
-            },
-        )
-        .unwrap();
-
-        let snapshot = load_editor_snapshot_from_root(&root, "Pack").unwrap();
-        assert_eq!(snapshot.rows[0].alternatives.len(), 1);
-
-        remove_alternative_from_root(
-            &root,
-            &RemoveAlternativeInput {
-                modlist_name: "Pack".into(),
-                parent_mod_id: "sodium".into(),
-                alt_mod_id: "rubidium".into(),
-            },
-        )
-        .unwrap();
-
-        let snapshot = load_editor_snapshot_from_root(&root, "Pack").unwrap();
-        assert!(snapshot.rows[0].alternatives.is_empty());
-
-        fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
-    fn save_incompatibilities_rewrites_exclude_if() {
-        let root = unique_test_root();
-        setup_modlist(
-            &root,
-            "Pack",
-            vec![simple_rule("sodium"), simple_rule("embeddium")],
-        );
-
-        save_incompatibilities_from_root(
-            &root,
-            &SaveIncompatibilitiesInput {
-                modlist_name: "Pack".into(),
-                rules: vec![IncompatibilityRuleInput {
-                    winner_id: "sodium".into(),
-                    loser_id: "embeddium".into(),
-                }],
-            },
-        )
-        .unwrap();
-
-        let snapshot = load_editor_snapshot_from_root(&root, "Pack").unwrap();
-        assert_eq!(snapshot.rows[1].exclude_if, vec!["sodium"]);
-        assert_eq!(snapshot.incompatibilities.len(), 1);
-
-        fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
-    fn save_rule_advanced_updates_fields() {
-        let root = unique_test_root();
-        setup_modlist(&root, "Pack", vec![simple_rule("sodium")]);
-
-        save_rule_advanced_from_root(
-            &root,
-            &SaveRuleAdvancedInput {
-                modlist_name: "Pack".into(),
-                mod_id: "sodium".into(),
-                exclude_if: vec!["optifine".into()],
-                requires: vec!["fabric-api".into()],
-                version_rules: vec![SaveVersionRuleInput {
-                    kind: "exclude".into(),
-                    mc_versions: vec!["1.18.2".into()],
-                    loader: "forge".into(),
-                }],
-                custom_configs: vec![SaveCustomConfigInput {
-                    mc_versions: vec!["1.21.1".into()],
-                    loader: "fabric".into(),
-                    target_path: "config/sodium.json".into(),
-                    files: vec!["sodium.json".into()],
-                }],
-            },
-        )
-        .unwrap();
-
-        let snapshot = load_editor_snapshot_from_root(&root, "Pack").unwrap();
-        assert_eq!(snapshot.rows[0].exclude_if, vec!["optifine"]);
-        assert_eq!(snapshot.rows[0].requires, vec!["fabric-api"]);
-        assert_eq!(snapshot.rows[0].version_rules.len(), 1);
-        assert_eq!(snapshot.rows[0].custom_configs.len(), 1);
-
-        fs::remove_dir_all(&root).unwrap();
     }
 }

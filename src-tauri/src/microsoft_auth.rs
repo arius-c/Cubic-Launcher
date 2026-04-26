@@ -452,7 +452,6 @@ struct XboxUserInfo {
 #[derive(Debug, Clone, Deserialize)]
 struct MinecraftAuthResponse {
     access_token: String,
-    expires_in: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
