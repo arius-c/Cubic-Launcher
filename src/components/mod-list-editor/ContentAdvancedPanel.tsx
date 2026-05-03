@@ -1,0 +1,182 @@
+import { For, Show, createSignal } from "solid-js";
+import { invoke } from "@tauri-apps/api/core";
+import { MOD_LOADERS } from "../../lib/types";
+import {
+  minecraftVersions,
+  mcWithSnapshots,
+  showSnapshots,
+  setShowSnapshots,
+} from "../../store";
+import { MaterialIcon, XIcon } from "../icons";
+import type { ContentEntry } from "./content-types";
+
+interface ContentAdvancedPanelProps {
+  entry: ContentEntry;
+  name: string;
+  modlistName: string;
+  contentType: string;
+  onClose: () => void;
+  onUpdate: (entryId: string, rules: ContentEntry["versionRules"]) => void;
+}
+
+export function ContentAdvancedPanel(props: ContentAdvancedPanelProps) {
+  const allLoaders = ["any", ...MOD_LOADERS];
+  const [rules, setRules] = createSignal(props.entry.versionRules);
+  const [addingRule, setAddingRule] = createSignal(false);
+  const [draftKind, setDraftKind] = createSignal<"exclude" | "only">("exclude");
+  const [draftVersions, setDraftVersions] = createSignal<string[]>([]);
+  const [draftLoader, setDraftLoader] = createSignal("any");
+
+  const versions = () => showSnapshots() ? mcWithSnapshots() : minecraftVersions();
+
+  const save = async (versionRules: ContentEntry["versionRules"]) => {
+    try {
+      await invoke("save_content_version_rules_command", {
+        input: {
+          modlistName: props.modlistName,
+          contentType: props.contentType,
+          entryId: props.entry.id,
+          versionRules: versionRules.map(rule => ({
+            kind: rule.kind,
+            mc_versions: rule.mcVersions,
+            loader: rule.loader,
+          })),
+        },
+      });
+      props.onUpdate(props.entry.id, versionRules);
+    } catch {
+      // best effort
+    }
+  };
+
+  const commitRule = () => {
+    if (draftVersions().length === 0) return;
+    const updated = [...rules(), { kind: draftKind(), mcVersions: draftVersions(), loader: draftLoader() }];
+    setRules(updated);
+    setAddingRule(false);
+    setDraftVersions([]);
+    setDraftLoader("any");
+    setDraftKind("exclude");
+    void save(updated);
+  };
+
+  const removeRule = (index: number) => {
+    const updated = rules().filter((_, candidateIndex) => candidateIndex !== index);
+    setRules(updated);
+    void save(updated);
+  };
+
+  return (
+    <div
+      class="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/60 px-4 py-8 backdrop-blur-sm"
+      onClick={event => {
+        if (event.target === event.currentTarget) props.onClose();
+      }}
+    >
+      <div class="flex w-full max-w-2xl flex-col overflow-hidden rounded-lg border border-border bg-card shadow-xl">
+        <div class="flex shrink-0 items-center justify-between border-b border-border px-6 py-4">
+          <div>
+            <h2 class="text-lg font-semibold text-foreground">Advanced</h2>
+            <p class="max-w-md truncate text-sm text-muted-foreground">{props.name}</p>
+          </div>
+          <button onClick={props.onClose} class="flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground">
+            <XIcon class="h-4 w-4" />
+          </button>
+        </div>
+        <div class="max-h-[70vh] flex-1 overflow-y-auto">
+          <div class="border-b border-border bg-muted/30 px-5 py-2">
+            <h3 class="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Version Rules</h3>
+          </div>
+          <div class="space-y-2 p-4">
+            <For each={rules()}>
+              {(rule, index) => (
+                <div class="flex flex-wrap items-center gap-2 rounded-md border border-border bg-background p-2">
+                  <select
+                    value={rule.kind}
+                    onChange={event => {
+                      const updated = rules().map((candidate, candidateIndex) =>
+                        candidateIndex === index() ? { ...candidate, kind: event.currentTarget.value } : candidate
+                      );
+                      setRules(updated);
+                      void save(updated);
+                    }}
+                    class="rounded border border-border bg-input px-2 py-1 text-xs text-foreground"
+                  >
+                    <option value="exclude">Exclude when</option>
+                    <option value="only">Only when</option>
+                  </select>
+                  <select
+                    value={rule.mcVersions[0] ?? ""}
+                    onChange={event => {
+                      const updated = rules().map((candidate, candidateIndex) =>
+                        candidateIndex === index() ? { ...candidate, mcVersions: [event.currentTarget.value] } : candidate
+                      );
+                      setRules(updated);
+                      void save(updated);
+                    }}
+                    class="rounded border border-border bg-input px-2 py-1 text-xs text-foreground"
+                  >
+                    <option value="">Any version</option>
+                    <For each={versions()}>{version => <option value={version}>{version}</option>}</For>
+                  </select>
+                  <select
+                    value={rule.loader}
+                    onChange={event => {
+                      const updated = rules().map((candidate, candidateIndex) =>
+                        candidateIndex === index() ? { ...candidate, loader: event.currentTarget.value } : candidate
+                      );
+                      setRules(updated);
+                      void save(updated);
+                    }}
+                    class="rounded border border-border bg-input px-2 py-1 text-xs text-foreground"
+                  >
+                    <For each={allLoaders}>{loader => <option value={loader}>{loader === "any" ? "Any loader" : loader}</option>}</For>
+                  </select>
+                  <button onClick={() => removeRule(index())} class="ml-auto flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-destructive/10 hover:text-destructive">
+                    <XIcon class="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              )}
+            </For>
+
+            <Show
+              when={addingRule()}
+              fallback={
+                <button onClick={() => setAddingRule(true)} class="flex items-center gap-1.5 text-xs text-primary transition-colors hover:text-primary/80">
+                  <MaterialIcon name="add" size="sm" />
+                  Add Version Rule
+                </button>
+              }
+            >
+              <div class="space-y-2 rounded-md border border-primary/30 bg-primary/5 p-3">
+                <div class="flex flex-wrap items-center gap-2">
+                  <select value={draftKind()} onChange={event => setDraftKind(event.currentTarget.value as "exclude" | "only")} class="rounded border border-border bg-input px-2 py-1 text-xs text-foreground">
+                    <option value="exclude">Exclude when</option>
+                    <option value="only">Only when</option>
+                  </select>
+                  <select value={draftVersions()[0] ?? ""} onChange={event => setDraftVersions(event.currentTarget.value ? [event.currentTarget.value] : [])} class="rounded border border-border bg-input px-2 py-1 text-xs text-foreground">
+                    <option value="">Select version...</option>
+                    <For each={versions()}>{version => <option value={version}>{version}</option>}</For>
+                  </select>
+                  <select value={draftLoader()} onChange={event => setDraftLoader(event.currentTarget.value)} class="rounded border border-border bg-input px-2 py-1 text-xs text-foreground">
+                    <For each={allLoaders}>{loader => <option value={loader}>{loader === "any" ? "Any loader" : loader}</option>}</For>
+                  </select>
+                </div>
+                <div class="flex items-center gap-2">
+                  <label class="cursor-pointer flex items-center gap-1.5 text-xs text-muted-foreground">
+                    <input type="checkbox" checked={showSnapshots()} onChange={event => setShowSnapshots(event.currentTarget.checked)} class="rounded border-border" />
+                    Show Snapshots
+                  </label>
+                </div>
+                <div class="flex gap-2">
+                  <button onClick={commitRule} disabled={draftVersions().length === 0} class="rounded-md bg-primary px-3 py-1 text-xs text-white disabled:opacity-50">Add</button>
+                  <button onClick={() => setAddingRule(false)} class="rounded-md bg-secondary px-3 py-1 text-xs text-secondary-foreground">Cancel</button>
+                </div>
+              </div>
+            </Show>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
