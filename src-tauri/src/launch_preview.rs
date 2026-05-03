@@ -1,6 +1,4 @@
-﻿use std::collections::HashSet;
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::collections::HashSet;
 
 use anyhow::{bail, Context, Result};
 use tauri::State;
@@ -21,11 +19,10 @@ use crate::instance_mods::prepare_instance_mods_directory;
 use crate::java_runtime::required_java_version_for_minecraft;
 use crate::launch_command::{build_launch_command, JavaLaunchRequest, JavaLaunchSettings};
 use crate::launcher_paths::LauncherPaths;
-use crate::loader_metadata::LoaderMetadataClient;
 use crate::minecraft_downloader::{ensure_minecraft_version, extract_natives};
 use crate::mod_cache::cached_artifact_path_for_pending_download;
 use crate::modrinth::ModrinthClient;
-use crate::process_streaming::{spawn_and_stream_process, ProcessEventSink, ProcessLogStream};
+use crate::process_streaming::ProcessLogStream;
 use crate::resolver::{resolve_modlist, ModLoader, ResolutionTarget};
 use crate::rules::ModSource;
 
@@ -72,6 +69,10 @@ pub use verification::{automation_mode_enabled, maybe_start_automation_verifier}
 #[path = "launch_preview_content.rs"]
 mod content;
 use content::*;
+
+#[path = "launch_preview_vanilla.rs"]
+mod vanilla;
+use vanilla::*;
 
 #[path = "launch_preview_runtime.rs"]
 mod runtime;
@@ -228,7 +229,6 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         ),
     )?;
 
-    let modlist = load_modlist(&launcher_paths, &modlist_name)?;
     let shell_snapshot =
         load_shell_snapshot_from_root(launcher_paths.root_dir(), Some(&modlist_name))?;
     let effective_settings = EffectiveLaunchSettings::from_shell_settings(
@@ -236,9 +236,22 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         &shell_snapshot.selected_modlist_overrides,
     );
 
-    let modrinth_client = ModrinthClient::new();
     let http_client = reqwest::Client::new();
+    if target.mod_loader == ModLoader::Vanilla {
+        return run_vanilla_launch_pipeline(
+            app_handle,
+            launcher_paths,
+            modlist_name,
+            target,
+            launch_log_session,
+            effective_settings,
+            http_client,
+        )
+        .await;
+    }
 
+    let modlist = load_modlist(&launcher_paths, &modlist_name)?;
+    let modrinth_client = ModrinthClient::new();
     let resolution = resolve_modlist(&modlist, &target)?;
 
     // Verify Modrinth availability for resolved mods. If a resolved mod has no
@@ -466,6 +479,27 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         .await?;
         final_dependency_versions
             .retain(|version| allowed_dependency_ids.contains(&version.project_id));
+        resolve_embedded_metadata_dependencies(
+            &app_handle,
+            &launcher_paths,
+            &http_client,
+            &modrinth_client,
+            &target,
+            &final_parent_versions,
+            &mut final_dependency_versions,
+            &mut dependency_resolution,
+        )
+        .await?;
+        suppress_redundant_bundled_dependencies(
+            &app_handle,
+            &launcher_paths,
+            &http_client,
+            &target,
+            &final_parent_versions,
+            &mut final_dependency_versions,
+            &mut dependency_resolution,
+        )
+        .await?;
         launch_log_session.append_summary_line(&format!(
             "excluded_top_level_mods={}",
             dependency_resolution.excluded_parents.len()
@@ -497,7 +531,6 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         "required_java_before_loader={}",
         effective_required_java
     ))?;
-
     emit_progress(
         &app_handle,
         "resolving",
@@ -542,6 +575,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
                     download,
                 ),
                 file_hash: download.file_hash.clone(),
+                file_size: download.file_size,
             })
             .collect::<Vec<_>>(),
     )
@@ -629,11 +663,55 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
     )
     .await?;
 
-    let mut loader_metadata = LoaderMetadataClient::new()
-        .fetch_loader_metadata(&target.minecraft_version, target.mod_loader)
-        .await?;
-    let loader_library_paths =
+    let mut loader_metadata = fetch_launch_loader_metadata(&target).await?;
+    let mut loader_library_paths =
         materialize_loader_libraries(&http_client, &instance_library_dir, &loader_metadata).await?;
+    let loader_maven_file_paths =
+        materialize_loader_maven_files(&http_client, &instance_library_dir, &loader_metadata)
+            .await?;
+    if !loader_maven_file_paths.is_empty() {
+        emit_log(
+            &app_handle,
+            ProcessLogStream::Stdout,
+            format!(
+                "[Loader] Prepared {} loader Maven file(s)",
+                loader_maven_file_paths.len()
+            ),
+        )?;
+    }
+    if let Some(preparation) = prepare_forge_wrapper_launch(
+        &http_client,
+        &instance_library_dir,
+        &mc_data.client_jar_path,
+        &mut loader_metadata,
+    )
+    .await?
+    {
+        emit_log(
+            &app_handle,
+            ProcessLogStream::Stdout,
+            format!(
+                "[Loader] Prepared ForgeWrapper installer {}",
+                preparation.installer_path.display()
+            ),
+        )?;
+        if !preparation.profile_library_paths.is_empty() {
+            emit_log(
+                &app_handle,
+                ProcessLogStream::Stdout,
+                format!(
+                    "[Loader] Prepared {} Forge profile runtime librar{}",
+                    preparation.profile_library_paths.len(),
+                    if preparation.profile_library_paths.len() == 1 {
+                        "y"
+                    } else {
+                        "ies"
+                    }
+                ),
+            )?;
+            loader_library_paths.extend(preparation.profile_library_paths);
+        }
+    }
 
     extract_natives(&mc_data.native_paths, &instance_natives_dir)?;
 
@@ -645,21 +723,14 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         // For modded loaders (Fabric, Forge, etc.): prepend essential MC game
         // arguments (auth, version, directories) but skip quickPlay entries
         // which require specific values and cause conflicts.
-        let mut mc_args: Vec<String> = Vec::new();
-        let mut skip_next = false;
-        for arg in &mc_data.game_arguments {
-            if skip_next {
-                skip_next = false;
-                continue;
-            }
-            if arg.starts_with("--quickPlay") || arg.starts_with("--demo") {
-                skip_next = true; // skip the flag and its value
-                continue;
-            }
-            mc_args.push(arg.clone());
-        }
-        mc_args.extend(loader_metadata.game_arguments.drain(..));
-        loader_metadata.game_arguments = mc_args;
+        loader_metadata.game_arguments = merge_minecraft_and_loader_game_arguments(
+            &mc_data.game_arguments,
+            loader_metadata.game_arguments.drain(..).collect(),
+        );
+        loader_metadata.jvm_arguments = merge_minecraft_and_loader_jvm_arguments(
+            &mc_data.jvm_arguments,
+            loader_metadata.jvm_arguments.drain(..).collect(),
+        );
     }
 
     emit_progress(
@@ -729,36 +800,11 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
     let prepared_command = build_launch_command(&JavaLaunchRequest {
         java_binary_path: java_binary_path.clone(),
         working_directory: instance_root.clone(),
-        classpath_entries: {
-            // Loader libraries take precedence over MC libraries when they
-            // provide the same artifact (e.g. ASM). We deduplicate by jar
-            // stem prefix: "asm-9.9.jar" and "asm-9.6.jar" share stem "asm",
-            // so the loader version wins.
-            let loader_artifacts: std::collections::HashSet<String> = loader_library_paths
-                .iter()
-                .filter_map(|p| {
-                    p.file_name()
-                        .and_then(|n| n.to_str())
-                        .map(|n| extract_artifact_name(n))
-                })
-                .collect();
-            let mut entries: Vec<PathBuf> = mc_data
-                .library_paths
-                .iter()
-                .filter(|p| {
-                    let dominated = p
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .map(|n| loader_artifacts.contains(&extract_artifact_name(n)))
-                        .unwrap_or(false);
-                    !dominated
-                })
-                .cloned()
-                .collect();
-            entries.extend(loader_library_paths);
-            entries.push(mc_data.client_jar_path.clone());
-            entries
-        },
+        classpath_entries: build_modded_classpath_entries(
+            &mc_data.library_paths,
+            loader_library_paths,
+            mc_data.client_jar_path.clone(),
+        ),
         loader_metadata,
         launch_settings: JavaLaunchSettings {
             min_ram_mb: effective_settings.min_ram_mb,
@@ -771,57 +817,7 @@ pub(in crate::launch_preview) async fn run_launch_pipeline(
         config_attribution: None,
     })?;
 
-    let sink: Arc<dyn ProcessEventSink> = Arc::new(LoggingProcessEventSink::new(
-        app_handle.clone(),
-        launch_log_session.clone(),
-    ));
-    let process = spawn_and_stream_process(prepared_command, sink)?;
-
-    let pid = process.pid;
-    *ACTIVE_MC_PID.lock().unwrap() = Some(pid);
-
-    emit_progress(
-        &app_handle,
-        "running",
-        100,
-        "Launching Minecraft",
-        &format!("Minecraft process started with PID {}.", pid),
-    )?;
-    emit_log(
-        &app_handle,
-        ProcessLogStream::Stdout,
-        format!("[Launch] Spawned Minecraft process with PID {}", pid),
-    )?;
-
-    // Wait for exit in background and clear the stored PID.
-    let app_for_wait = app_handle.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        let _ = process.wait();
-        *ACTIVE_MC_PID.lock().unwrap() = None;
-        set_active_launch_log_session(None);
-        let _ = emit_progress(&app_for_wait, "idle", 0, "Ready", "Minecraft has exited.");
-    });
-
-    Ok(StartedLaunch {
-        pid,
-        launch_log_dir: launch_log_session.dir().to_path_buf(),
-    })
-}
-
-fn build_instance_root(
-    launcher_paths: &LauncherPaths,
-    modlist_name: &str,
-    target: &ResolutionTarget,
-) -> PathBuf {
-    launcher_paths
-        .modlists_dir()
-        .join(modlist_name)
-        .join("instances")
-        .join(format!(
-            "{}-{}",
-            target.minecraft_version,
-            target.mod_loader.as_modrinth_loader()
-        ))
+    spawn_minecraft_process(app_handle, launch_log_session, prepared_command)
 }
 
 #[cfg(test)]

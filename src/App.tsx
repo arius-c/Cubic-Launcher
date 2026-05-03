@@ -35,7 +35,7 @@ import {
   launchState, selectedModList,
   LAUNCH_STAGES, wait,
 } from "./store";
-import type { ModRow } from "./lib/types";
+import { normalizeModLoader, type ModRow } from "./lib/types";
 import type { GlobalSettingsState, ModlistOverridesState } from "./store";
 import {
   buildIdRemap,
@@ -119,7 +119,7 @@ export default function App() {
     }
     // Restore cached version/loader immediately — prevents bleed from previous modlist
     const cachedVL = modlistVersionLoaderCache.get(name);
-    if (cachedVL) { setSelectedMcVersion(cachedVL.version); setSelectedModLoader(cachedVL.loader); }
+    if (cachedVL) { setSelectedMcVersion(cachedVL.version); setSelectedModLoader(normalizeModLoader(cachedVL.loader)); }
     if (!isTauri()) { logger.warn("App", "handleSelectModList skipped — no backend"); return; }
     await loadShellSnapshot(name);
     await loadEditorSnapshot(name, true);
@@ -550,7 +550,7 @@ export default function App() {
             profilerEnabled: modlistDraft.profilerEnabled ? modlistDraft.profilerActive : null,
             wrapperCommand: modlistDraft.wrapperEnabled ? modlistDraft.wrapperCommand : null,
             minecraftVersion: selectedMcVersion() || null,
-            modLoader: selectedModLoader() || null,
+            modLoader: normalizeModLoader(selectedModLoader()) || null,
           },
         });
       }
@@ -577,7 +577,7 @@ export default function App() {
         profilerEnabled: ov.profilerEnabled ? ov.profilerActive : null,
         wrapperCommand: ov.wrapperEnabled ? ov.wrapperCommand : null,
         minecraftVersion: version || null,
-        modLoader: loader || null,
+        modLoader: normalizeModLoader(loader) || null,
       },
     }).catch(() => {});
   };
@@ -585,19 +585,21 @@ export default function App() {
   const handleVersionChange = (version: string) => {
     const modlistName = selectedModListName();
     setSelectedMcVersion(version);
-    modlistVersionLoaderCache.set(modlistName, { version, loader: selectedModLoader() });
+    const loader = normalizeModLoader(selectedModLoader());
+    modlistVersionLoaderCache.set(modlistName, { version, loader });
     setModListCards(cards => cards.map(c => c.name === modlistName ? { ...c, mcVersion: version } : c));
-    void saveVersionLoader(modlistName, version, selectedModLoader());
-    void runResolution(modlistName, version, selectedModLoader());
+    void saveVersionLoader(modlistName, version, loader);
+    void runResolution(modlistName, version, loader);
   };
 
   const handleLoaderChange = (loader: string) => {
     const modlistName = selectedModListName();
-    setSelectedModLoader(loader);
-    modlistVersionLoaderCache.set(modlistName, { version: selectedMcVersion(), loader });
-    setModListCards(cards => cards.map(c => c.name === modlistName ? { ...c, modLoader: loader } : c));
-    void saveVersionLoader(modlistName, selectedMcVersion(), loader);
-    void runResolution(modlistName, selectedMcVersion(), loader);
+    const normalizedLoader = normalizeModLoader(loader);
+    setSelectedModLoader(normalizedLoader);
+    modlistVersionLoaderCache.set(modlistName, { version: selectedMcVersion(), loader: normalizedLoader });
+    setModListCards(cards => cards.map(c => c.name === modlistName ? { ...c, modLoader: normalizedLoader } : c));
+    void saveVersionLoader(modlistName, selectedMcVersion(), normalizedLoader);
+    void runResolution(modlistName, selectedMcVersion(), normalizedLoader);
   };
 
   const handleSaveIncompatibilities = async () => {
@@ -793,7 +795,7 @@ export default function App() {
           request: {
             modlistName: selectedModListName(),
             minecraftVersion: selectedMcVersion(),
-            modLoader: selectedModLoader(),
+            modLoader: normalizeModLoader(selectedModLoader()),
           },
         });
         return; // backend drives the progress via events

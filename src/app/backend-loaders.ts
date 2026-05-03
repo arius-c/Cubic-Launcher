@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { logger } from "../lib/logger";
-import type { FunctionalGroup, LinkRule, ModRow, VersionRule, CustomConfig } from "../lib/types";
+import { normalizeModLoader, type FunctionalGroup, type LinkRule, type ModRow, type VersionRule, type CustomConfig } from "../lib/types";
 import {
   modListCards, setModListCards, selectedModListName, setSelectedModListName,
   setModRowsState, setAccounts, setActiveAccountId,
@@ -12,7 +12,7 @@ import {
   setModIcons, modIcons,
   minecraftVersions, setSelectedMcVersion, setSelectedModLoader, selectedMcVersion, selectedModLoader,
   setVersionRules, setCustomConfigs,
-  setResolvedModIds, setExpandedRows,
+  setResolvedModIds, setResolvedTarget, setExpandedRows,
 } from "../store";
 import { buildDefaultIconLabel, normalizeIdentifier, smartSetModRows } from "./row-state";
 
@@ -25,9 +25,12 @@ const modNameCache = new Map<string, string>();
 export async function runResolution(modlistName?: string, mcVersion?: string, modLoader?: string) {
   const name = modlistName ?? selectedModListName();
   const version = mcVersion ?? selectedMcVersion();
-  const loader = modLoader ?? selectedModLoader();
-  if (!isTauri() || !name) return;
+  const loader = normalizeModLoader(modLoader ?? selectedModLoader());
   const seq = ++resolutionSeq;
+  const target = name ? { modlistName: name, mcVersion: version, modLoader: loader } : null;
+  setResolvedTarget(target);
+  setResolvedModIds(null);
+  if (!isTauri() || !name) return;
   try {
     const activeIds: string[] = await invoke("resolve_modlist_command", {
       modlistName: name,
@@ -35,10 +38,12 @@ export async function runResolution(modlistName?: string, mcVersion?: string, mo
       modLoader: loader,
     });
     if (seq !== resolutionSeq) return;
+    setResolvedTarget(target);
     setResolvedModIds(new Set(activeIds));
   } catch (error) {
     if (seq !== resolutionSeq) return;
     logger.warn("App", "resolution failed", { error });
+    setResolvedTarget(target);
     setResolvedModIds(null);
   }
 }
@@ -62,7 +67,7 @@ export async function loadShellSnapshot(preferredName?: string | null) {
         iconAccent: prev?.iconAccent,
         displayName: prev?.displayName,
         mcVersion: modlist.minecraft_version ?? undefined,
-        modLoader: modlist.mod_loader ?? undefined,
+        modLoader: normalizeModLoader(modlist.mod_loader),
       };
     });
     setModListCards(cards);
@@ -118,7 +123,7 @@ export async function loadShellSnapshot(preferredName?: string | null) {
         wrapperCommand: overrides.wrapper_command ?? current.wrapperCommand,
       }));
       const resolvedVersion = overrides.minecraft_version ?? minecraftVersions()[0] ?? "1.21.1";
-      const resolvedLoader = overrides.mod_loader ?? "Fabric";
+      const resolvedLoader = normalizeModLoader(overrides.mod_loader);
       setSelectedMcVersion(resolvedVersion);
       setSelectedModLoader(resolvedLoader);
       if (preferredName) modlistVersionLoaderCache.set(preferredName, { version: resolvedVersion, loader: resolvedLoader });
@@ -221,7 +226,7 @@ export async function loadEditorSnapshot(modlistName: string, resetGroups = fals
     void invoke("backfill_availability_command", {
       modlistName,
       mcVersion: selectedMcVersion(),
-      modLoader: selectedModLoader(),
+      modLoader: normalizeModLoader(selectedModLoader()),
     }).catch(() => {}).then(() => runResolution(modlistName));
 
     return snap;

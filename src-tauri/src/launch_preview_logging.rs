@@ -32,6 +32,7 @@ pub(super) struct LaunchLogSession {
 pub(super) struct LoggingProcessEventSink {
     inner: TauriProcessEventSink,
     session: Arc<LaunchLogSession>,
+    ui_throttle: Arc<Mutex<LogUiThrottleState>>,
 }
 
 impl LaunchLogSession {
@@ -293,6 +294,7 @@ impl LoggingProcessEventSink {
         Self {
             inner: TauriProcessEventSink::new(app_handle),
             session,
+            ui_throttle: Arc::new(Mutex::new(LogUiThrottleState::default())),
         }
     }
 }
@@ -300,13 +302,119 @@ impl LoggingProcessEventSink {
 impl ProcessEventSink for LoggingProcessEventSink {
     fn emit_log(&self, event: ProcessLogEvent) -> Result<()> {
         let _ = self.session.append_minecraft_log(&event);
-        self.inner.emit_log(event)
+        let events = self.ui_throttle.lock().unwrap().events_for_incoming(event);
+        for event in events {
+            self.inner.emit_log(event)?;
+        }
+        Ok(())
     }
 
     fn emit_exit(&self, event: ProcessExitEvent) -> Result<()> {
+        let events = self.ui_throttle.lock().unwrap().flush();
+        for event in events {
+            self.inner.emit_log(event)?;
+        }
         let _ = self.session.append_exit_event(&event);
         self.inner.emit_exit(event)
     }
+}
+
+#[derive(Default)]
+pub(super) struct LogUiThrottleState {
+    last_emitted_line: Option<ProcessLogEvent>,
+    repeated_line_count: usize,
+    suppressed_forge_patch_count: usize,
+}
+
+impl LogUiThrottleState {
+    pub(super) fn events_for_incoming(&mut self, event: ProcessLogEvent) -> Vec<ProcessLogEvent> {
+        let mut events = Vec::new();
+
+        if is_forge_installer_patch_line(&event.line) {
+            self.flush_repeated_line(&mut events);
+            self.suppressed_forge_patch_count += 1;
+            if self.suppressed_forge_patch_count % 1000 == 0 {
+                events.push(ProcessLogEvent {
+                    stream: ProcessLogStream::Stdout,
+                    line: format!(
+                        "[Launch] Suppressed {} Forge installer patch progress lines in the UI; full output is still written to launch logs.",
+                        self.suppressed_forge_patch_count
+                    ),
+                });
+                self.suppressed_forge_patch_count = 0;
+            }
+            return events;
+        }
+
+        self.flush_forge_patch_lines(&mut events);
+
+        if self
+            .last_emitted_line
+            .as_ref()
+            .map(|last| last.stream == event.stream && last.line == event.line)
+            .unwrap_or(false)
+        {
+            self.repeated_line_count += 1;
+            return events;
+        }
+
+        self.flush_repeated_line(&mut events);
+        self.last_emitted_line = Some(event.clone());
+        events.push(event);
+        events
+    }
+
+    pub(super) fn flush(&mut self) -> Vec<ProcessLogEvent> {
+        let mut events = Vec::new();
+        self.flush_forge_patch_lines(&mut events);
+        self.flush_repeated_line(&mut events);
+        events
+    }
+
+    fn flush_forge_patch_lines(&mut self, events: &mut Vec<ProcessLogEvent>) {
+        if self.suppressed_forge_patch_count == 0 {
+            return;
+        }
+
+        events.push(ProcessLogEvent {
+            stream: ProcessLogStream::Stdout,
+            line: format!(
+                "[Launch] Suppressed {} Forge installer patch progress lines in the UI; full output is still written to launch logs.",
+                self.suppressed_forge_patch_count
+            ),
+        });
+        self.suppressed_forge_patch_count = 0;
+    }
+
+    fn flush_repeated_line(&mut self, events: &mut Vec<ProcessLogEvent>) {
+        if self.repeated_line_count == 0 {
+            return;
+        }
+
+        let Some(last) = self.last_emitted_line.as_ref() else {
+            self.repeated_line_count = 0;
+            return;
+        };
+
+        events.push(ProcessLogEvent {
+            stream: last.stream,
+            line: format!(
+                "[Launch] Previous launch log line repeated {} additional time{}.",
+                self.repeated_line_count,
+                if self.repeated_line_count == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ),
+        });
+        self.repeated_line_count = 0;
+    }
+}
+
+fn is_forge_installer_patch_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("Patching net/minecraft/") && trimmed.ends_with(" 1/1")
 }
 
 pub(super) fn set_active_launch_log_session(session: Option<Arc<LaunchLogSession>>) {
@@ -412,4 +520,55 @@ fn unique_error_id() -> String {
         .unwrap_or_default()
         .as_millis();
     format!("launch-error-{timestamp}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LogUiThrottleState, ProcessLogEvent, ProcessLogStream};
+
+    fn stdout(line: &str) -> ProcessLogEvent {
+        ProcessLogEvent {
+            stream: ProcessLogStream::Stdout,
+            line: line.to_string(),
+        }
+    }
+
+    #[test]
+    fn ui_throttle_summarizes_forge_patch_lines() {
+        let mut throttle = LogUiThrottleState::default();
+
+        assert!(throttle
+            .events_for_incoming(stdout("  Patching net/minecraft/client/Minecraft 1/1"))
+            .is_empty());
+        assert!(throttle
+            .events_for_incoming(stdout("  Patching net/minecraft/world/World 1/1"))
+            .is_empty());
+
+        let events = throttle.events_for_incoming(stdout("[22:19:36] [main/INFO] Done"));
+        assert_eq!(events.len(), 2);
+        assert!(events[0]
+            .line
+            .contains("Suppressed 2 Forge installer patch"));
+        assert_eq!(events[1].line, "[22:19:36] [main/INFO] Done");
+    }
+
+    #[test]
+    fn ui_throttle_summarizes_consecutive_repeated_lines() {
+        let mut throttle = LogUiThrottleState::default();
+
+        assert_eq!(
+            throttle.events_for_incoming(stdout("%tEx}")).len(),
+            1,
+            "first occurrence should be emitted"
+        );
+        assert!(throttle.events_for_incoming(stdout("%tEx}")).is_empty());
+        assert!(throttle.events_for_incoming(stdout("%tEx}")).is_empty());
+
+        let events = throttle.events_for_incoming(stdout("next"));
+        assert_eq!(events.len(), 2);
+        assert!(events[0]
+            .line
+            .contains("Previous launch log line repeated 2 additional times"));
+        assert_eq!(events[1].line, "next");
+    }
 }

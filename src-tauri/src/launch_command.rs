@@ -167,6 +167,7 @@ mod tests {
             loader_version: "0.16.14".into(),
             main_class: "net.fabricmc.loader.impl.launch.knot.KnotClient".into(),
             libraries: Vec::new(),
+            maven_files: Vec::new(),
             jvm_arguments: vec!["-Dfabric.example=true".into()],
             game_arguments: vec!["--launchTarget".into(), "fabric_client".into()],
             min_java_version: Some(8),

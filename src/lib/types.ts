@@ -179,7 +179,14 @@ export type ProcessExitEvent = {
 
 // ── Static constants ──────────────────────────────────────────────────────────
 
-export const MOD_LOADERS = ["Fabric", "NeoForge", "Forge", "Quilt", "Vanilla"] as const;
+export const MOD_LOADERS = ["Fabric", "NeoForge", "Forge", "Vanilla"] as const;
+export const DEFAULT_MOD_LOADER = "Fabric";
+
+export function normalizeModLoader(loader?: string | null): string {
+  return MOD_LOADERS.includes(loader as typeof MOD_LOADERS[number])
+    ? loader!
+    : DEFAULT_MOD_LOADER;
+}
 
 export const LAUNCH_STAGES: LaunchResolutionStage[] = [
   { label: "Resolve Rules",   detail: "Evaluating Mod-list rules, exclusions and fallback order.", progress: 18 },

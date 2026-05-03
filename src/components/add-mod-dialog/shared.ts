@@ -33,7 +33,7 @@ export const MOD_CATEGORIES = [
   "social", "storage", "technology", "transportation", "utility", "worldgen",
 ];
 
-export const MOD_LOADERS_SEARCH = ["fabric", "forge", "neoforge", "quilt"];
+export const MOD_LOADERS_SEARCH = ["fabric", "forge", "neoforge"];
 export const SORT_OPTIONS = [
   { value: "relevance", label: "Relevance" },
   { value: "downloads", label: "Downloads" },

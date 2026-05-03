@@ -11,7 +11,6 @@ export function VersionRulesSection(props: { modId: string }) {
   const [draftLoader, setDraftLoader] = createSignal("any");
 
   const commitRule = () => {
-    if (draftVersions().length === 0) return;
     addVersionRule({ modId: props.modId, kind: draftKind(), mcVersions: draftVersions(), loader: draftLoader() });
     setAddingRule(false);
     setDraftVersions([]);
@@ -77,7 +76,7 @@ export function VersionRulesSection(props: { modId: string }) {
                 onChange={e => setDraftVersions(e.currentTarget.value ? [e.currentTarget.value] : [])}
                 class="rounded border border-border bg-input px-2 py-1 text-xs text-foreground"
               >
-                <option value="">Select version...</option>
+                <option value="">Any version</option>
                 <For each={showSnapshots() ? mcWithSnapshots() : minecraftVersions()}>
                   {version => <option value={version}>{version}</option>}
                 </For>
@@ -93,8 +92,7 @@ export function VersionRulesSection(props: { modId: string }) {
             <div class="flex gap-2">
               <button
                 onClick={commitRule}
-                disabled={draftVersions().length === 0}
-                class="rounded-md bg-primary px-3 py-1 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+                class="rounded-md bg-primary px-3 py-1 text-xs font-medium text-primary-foreground hover:bg-primary/90"
               >
                 Add
               </button>

@@ -99,6 +99,8 @@ pub(super) struct LaunchPlaceholders {
     pub(super) launcher_name: String,
     pub(super) launcher_version: String,
     pub(super) classpath_separator: String,
+    pub(super) resolution_width: String,
+    pub(super) resolution_height: String,
 }
 
 /// A selected mod from resolution: carries mod_id + source for downstream processing.
@@ -206,6 +208,8 @@ impl LaunchPlaceholders {
             } else {
                 ":".to_string()
             },
+            resolution_width: "854".to_string(),
+            resolution_height: "480".to_string(),
         }
     }
 }

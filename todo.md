@@ -8,7 +8,7 @@
 - **User-visible errors for skipped mods** — `prefetch_compatible_versions_for_selected` in `launch_preview.rs` now takes `app_handle` and emits skip errors via `emit_log(..., Stderr, ...)` instead of `eprintln!`
 - **Parallel mod downloads** — `download_pending_artifacts` in `launch_preview.rs` now runs downloads concurrently via `JoinSet` + `Semaphore(10)`
 - **SHA1 verification of mod downloads** — `DownloadArtifact` now carries `file_hash: Option<String>`; downloads with a hash reuse `minecraft_downloader::download_file_verified` (delete + error on mismatch)
-- **Aggregate download progress** — each completed download bumps `launch-progress` linearly from 42→58 with `"Downloading Mods"` / `"Downloaded N of M mods."` (per-file `download-progress` event removed — nothing listened to it)
+- **Granular download progress** — mod downloads now stream chunks to disk and update `launch-progress` by aggregate downloaded bytes from 42→58 while preserving SHA1 verification
 - **300+ mods launch warning** — the launch pipeline now emits a frontend warning before large launches; it suggests enabling cache-only mode when appropriate
 - **Cache-only mode** — added global setting `cache_only_mode`; when enabled the launcher prefers compatible cached mod/dependency artifacts and stored dependency links before calling Modrinth, with API fallback only on cache misses
 
@@ -37,30 +37,6 @@
 - Without signing: "Unknown publisher" warning for users
 - SignPath.io offers free code signing for open source (requires a public repo)
 - To be done after the repo is public
-
----
-
-## Suggested improvements (from Claude browser, not yet implemented)
-
-### 3. Granular download progress
-- Replace the current 0%/100% progress with real byte-level progress
-- Use `response.bytes_stream()` and `tokio::io`
-- Emit progress events as chunks get written
-- The frontend receives continuous updates during each download
-
----
-
-## Decisions made (do not implement)
-
-### Incremental check of the mods folder — NO
-- Currently: full wipe + relink every launch (`instance_mods.rs:29`)
-- Considered adding a diff/check of already-present mods
-- Decision: leave as is. Too many edge cases (broken links, modified jars, manual files) for minimal gain (a few ms on SSD)
-
-### Modrinth calls API every launch for version prefetch — known, not urgent
-- `prefetch_compatible_versions_for_selected` (`launch_preview.rs:662`) calls Modrinth for every mod, every launch, even if the JAR is already in cache
-- The cache (`mod_cache`) is indexed by `modrinth_version_id`, not by `(project_id, mc, loader)` → the API is needed to know WHICH version_id to look up
-- Point 5 (cache-only mode) would solve this for users who want fast/offline launches
 
 ---
 

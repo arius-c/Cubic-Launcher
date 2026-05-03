@@ -9,8 +9,11 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const MICROSOFT_AUTHORIZE_URL: &str = "https://login.live.com/oauth20_authorize.srf";
-const MICROSOFT_TOKEN_URL: &str = "https://login.live.com/oauth20_token.srf";
+const MICROSOFT_AUTHORIZE_URL: &str =
+    "https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize";
+const MICROSOFT_TOKEN_URL: &str =
+    "https://login.microsoftonline.com/consumers/oauth2/v2.0/token";
+const BUNDLED_MICROSOFT_CLIENT_ID: &str = "7dce88aa-79b0-4b77-9666-0fdb8addd50c";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MicrosoftOAuthConfig {
@@ -117,7 +120,6 @@ impl MicrosoftOAuthClient {
             .post(&self.token_url)
             .form(&[
                 ("client_id", config.client_id.as_str()),
-                ("redirect_uri", config.redirect_uri.as_str()),
                 ("grant_type", "refresh_token"),
                 ("refresh_token", refresh_token),
                 ("scope", &join_scopes(&config.scopes)),
@@ -329,10 +331,12 @@ pub fn build_authorization_url(
         .append_pair("client_id", &config.client_id)
         .append_pair("response_type", "code")
         .append_pair("redirect_uri", &config.redirect_uri)
+        .append_pair("response_mode", "query")
         .append_pair("scope", &join_scopes(&config.scopes))
         .append_pair("code_challenge", code_challenge)
         .append_pair("code_challenge_method", "S256")
-        .append_pair("state", state);
+        .append_pair("state", state)
+        .append_pair("prompt", "select_account");
 
     Ok(url)
 }
@@ -414,7 +418,7 @@ pub fn join_scopes(scopes: &[String]) -> String {
 }
 
 pub fn default_loopback_redirect_uri(port: u16) -> String {
-    format!("http://127.0.0.1:{port}/callback")
+    format!("http://localhost:{port}{LOOPBACK_REDIRECT_PATH}")
 }
 
 pub fn default_agent_author_name(connection: &Connection) -> Result<Option<String>> {
@@ -586,8 +590,8 @@ impl MinecraftAuthChain {
             .send()
             .await
             .context("failed to contact Minecraft services")?
-            .error_for_status()
-            .context("Minecraft authentication failed")?
+            .error_for_status_with_body("Minecraft authentication failed")
+            .await?
             .json()
             .await
             .context("failed to parse Minecraft auth response")
@@ -608,63 +612,62 @@ impl MinecraftAuthChain {
     }
 }
 
+trait ResponseErrorExt {
+    async fn error_for_status_with_body(self, context: &str) -> Result<reqwest::Response>;
+}
+
+impl ResponseErrorExt for reqwest::Response {
+    async fn error_for_status_with_body(self, context: &str) -> Result<reqwest::Response> {
+        let status = self.status();
+        if status.is_success() {
+            return Ok(self);
+        }
+
+        let url = self.url().clone();
+        let body = self.text().await.unwrap_or_default();
+        let body = body.trim();
+
+        if body.is_empty() {
+            bail!("{context}: HTTP status {status} for url ({url})");
+        }
+
+        bail!("{context}: HTTP status {status} for url ({url}): {body}");
+    }
+}
+
 // ── Login command with local callback server ────────────────────────────────
 
-/// Desktop redirect URI required by the official Minecraft client ID.
-pub const DESKTOP_REDIRECT_URI: &str = "https://login.live.com/oauth20_desktop.srf";
+/// Loopback path registered in the Microsoft Entra app as `http://localhost/callback`.
+pub const LOOPBACK_REDIRECT_PATH: &str = "/callback";
+/// Loopback redirect URI registered without a port. Microsoft ignores the localhost
+/// port during redirect URI matching for native applications.
+pub const REGISTERED_LOOPBACK_REDIRECT_URI: &str = "http://localhost/callback";
 
-/// Start Microsoft login using the desktop redirect flow.
+/// Start Microsoft login using Authorization Code Flow with PKCE.
 ///
-/// 1. Opens a local page that redirects to Microsoft login.
-/// 2. After login, Microsoft redirects to oauth20_desktop.srf?code=...
-/// 3. A JS snippet on the local intermediate page catches the code and
-///    POSTs it back to our local server.
-///
-/// Since the desktop.srf page is on a different origin we can't read its
-/// URL from JS. Instead, we open the MS auth URL directly and serve a
-/// local "paste your URL" page as fallback. Actually, the cleanest
-/// approach: open auth URL directly, start a local server, and after
-/// the desktop.srf redirect the browser shows a blank-ish page with the
-/// code in the address bar. We show a small local page asking the user
-/// to copy-paste it. But even better: we use the Tauri webview to open
-/// a window and watch navigation.
-///
-/// Simplest robust approach: open a Tauri dialog/window is complex.
-/// Let's use the approach that many open-source launchers use:
-/// Open auth URL directly → user logs in → lands on desktop.srf?code=...
-/// → we ask them to paste the URL back.
+/// Opens the system browser, receives the Microsoft redirect on localhost,
+/// validates state, exchanges the code, then continues through Xbox and
+/// Minecraft services.
 pub async fn run_microsoft_login(client_id: &str) -> Result<MinecraftLoginResult> {
     use tokio::net::TcpListener;
 
+    let listener = TcpListener::bind("localhost:0")
+        .await
+        .context("failed to bind local OAuth callback server")?;
+    let port = listener.local_addr()?.port();
+
     let config = MicrosoftOAuthConfig {
         client_id: client_id.to_string(),
-        redirect_uri: DESKTOP_REDIRECT_URI.to_string(),
+        redirect_uri: default_loopback_redirect_uri(port),
         scopes: vec!["XboxLive.signin".into(), "offline_access".into()],
     };
 
     let oauth_client = MicrosoftOAuthClient::new();
     let session = oauth_client.start_session(&config)?;
 
-    // Start local server that:
-    // 1. Serves a page with JS that opens the MS auth URL in the same tab
-    // 2. After MS login, redirect lands on desktop.srf?code=...&state=...
-    // 3. The page shows instructions to copy the URL
-    // 4. A second local endpoint receives the pasted URL
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .context("failed to bind local OAuth server")?;
-    let port = listener.local_addr()?.port();
+    open::that(session.authorization_url.as_str()).context("failed to open system browser")?;
 
-    let auth_url = session.authorization_url.to_string();
-
-    // Open the local helper page in the browser.
-    open::that(format!("http://127.0.0.1:{port}/login"))
-        .context("failed to open system browser")?;
-
-    // Serve requests until we get the callback URL.
-    let callback_url = serve_login_flow(&listener, &auth_url, port).await?;
-
-    // Parse and exchange.
+    let callback_url = serve_loopback_callback(&listener, port).await?;
     let callback = parse_authorization_callback(&callback_url, &session.state)?;
     let ms_tokens = oauth_client
         .exchange_authorization_code(&config, &callback, &session.code_verifier)
@@ -681,36 +684,9 @@ pub async fn run_microsoft_login(client_id: &str) -> Result<MinecraftLoginResult
         .await
 }
 
-async fn serve_login_flow(
-    listener: &tokio::net::TcpListener,
-    auth_url: &str,
-    port: u16,
-) -> Result<String> {
+async fn serve_loopback_callback(listener: &tokio::net::TcpListener, port: u16) -> Result<String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let login_page = format!(
-        r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>Cubic Launcher Login</title></head>
-<body style="font-family:system-ui;background:#1e1e2e;color:#cdd6f4;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
-<div style="text-align:center;max-width:500px;padding:20px">
-<h2 style="margin-bottom:8px">Cubic Launcher</h2>
-<p style="color:#a6adc8;margin-bottom:20px">Click the button below to sign in with Microsoft. After logging in, you'll be redirected to a page — <b>copy the full URL</b> from your browser's address bar and paste it below.</p>
-<a href="{auth_url}" style="display:inline-block;background:#89b4fa;color:#1e1e2e;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:600;margin-bottom:24px">Sign in with Microsoft</a>
-<div style="margin-top:16px">
-<input id="url" type="text" placeholder="Paste the redirect URL here..." style="width:100%;padding:10px;border-radius:6px;border:1px solid #45475a;background:#313244;color:#cdd6f4;font-size:14px;box-sizing:border-box" />
-<button onclick="submit()" style="margin-top:8px;width:100%;padding:10px;border-radius:6px;border:none;background:#a6e3a1;color:#1e1e2e;font-weight:600;font-size:14px;cursor:pointer">Complete Login</button>
-<p id="err" style="color:#f38ba8;margin-top:8px;font-size:13px"></p>
-</div>
-</div>
-<script>
-function submit(){{
-  var u=document.getElementById('url').value.trim();
-  if(!u||!u.includes('code=')){{ document.getElementById('err').textContent='Paste the full URL that contains "code=" in it.'; return; }}
-  fetch('http://127.0.0.1:{port}/callback',{{method:'POST',body:u}}).then(function(){{
-    document.body.innerHTML='<div style="display:flex;align-items:center;justify-content:center;height:100vh"><h2>Login Successful! You can close this tab.</h2></div>';
-  }}).catch(function(e){{ document.getElementById('err').textContent='Error: '+e; }});
-}}
-</script></body></html>"#
-    );
 
     loop {
         let (mut stream, _) =
@@ -725,38 +701,47 @@ function submit(){{
 
         let first_line = request.lines().next().unwrap_or("");
 
-        if first_line.starts_with("GET /login") {
-            // Serve the login helper page.
+        if let Some(callback_url) = callback_url_from_request_line(first_line, port) {
+            let body = success_callback_page();
             let resp = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                login_page.len(),
-                login_page
+                body.len(),
+                body
             );
             let _ = stream.write_all(resp.as_bytes()).await;
-        } else if first_line.starts_with("POST /callback") {
-            // The body contains the pasted URL.
-            let body = request
-                .split("\r\n\r\n")
-                .nth(1)
-                .unwrap_or("")
-                .trim()
-                .to_string();
-
-            let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\nOK";
-            let _ = stream.write_all(resp.as_bytes()).await;
-
-            if body.contains("code=") {
-                return Ok(body);
-            }
-        } else if first_line.starts_with("OPTIONS") {
-            // CORS preflight.
-            let resp = "HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST\r\nAccess-Control-Allow-Headers: *\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-            let _ = stream.write_all(resp.as_bytes()).await;
+            return Ok(callback_url);
         } else {
             let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             let _ = stream.write_all(resp.as_bytes()).await;
         }
     }
+}
+
+fn callback_url_from_request_line(first_line: &str, port: u16) -> Option<String> {
+    let mut parts = first_line.split_whitespace();
+    let method = parts.next()?;
+    let target = parts.next()?;
+
+    let is_callback_target = target == LOOPBACK_REDIRECT_PATH
+        || target
+            .strip_prefix(LOOPBACK_REDIRECT_PATH)
+            .is_some_and(|suffix| suffix.starts_with('?'));
+
+    if method != "GET" || !is_callback_target {
+        return None;
+    }
+
+    Some(format!("http://localhost:{port}{target}"))
+}
+
+fn success_callback_page() -> &'static str {
+    r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>Cubic Launcher</title></head>
+<body style="font-family:system-ui;background:#101014;color:#f4f4f5;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
+<main style="text-align:center;max-width:420px;padding:24px">
+<h1 style="font-size:20px;margin:0 0 8px">Microsoft sign-in complete</h1>
+<p style="color:#a1a1aa;margin:0">You can close this tab and return to Cubic Launcher.</p>
+</main>
+</body></html>"#
 }
 
 pub fn microsoft_client_id_from_env(env_file_path: &Path) -> Result<Option<String>> {
@@ -779,6 +764,32 @@ pub fn microsoft_client_id_from_env(env_file_path: &Path) -> Result<Option<Strin
     Ok(None)
 }
 
+pub fn configured_microsoft_client_id(env_file_path: &Path) -> Result<Option<String>> {
+    Ok(microsoft_client_id_from_env(env_file_path)?
+        .or_else(microsoft_client_id_from_runtime_env)
+        .or_else(microsoft_client_id_from_build_env)
+        .or_else(|| Some(BUNDLED_MICROSOFT_CLIENT_ID.to_string())))
+}
+
+fn microsoft_client_id_from_runtime_env() -> Option<String> {
+    std::env::var("MICROSOFT_CLIENT_ID")
+        .ok()
+        .and_then(normalize_microsoft_client_id)
+}
+
+fn microsoft_client_id_from_build_env() -> Option<String> {
+    option_env!("MICROSOFT_CLIENT_ID").and_then(normalize_microsoft_client_id)
+}
+
+fn normalize_microsoft_client_id(value: impl AsRef<str>) -> Option<String> {
+    let trimmed = value.as_ref().trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::env;
@@ -791,10 +802,11 @@ mod tests {
     use crate::database::initialize_database;
 
     use super::{
-        build_authorization_url, build_pkce_code_challenge, default_agent_author_name,
-        default_loopback_redirect_uri, generate_url_safe_random_bytes, join_scopes,
-        microsoft_client_id_from_env, parse_authorization_callback, validate_oauth_config,
-        AccountRecord, AccountsRepository, MicrosoftOAuthClient, MicrosoftOAuthConfig,
+        build_authorization_url, build_pkce_code_challenge, callback_url_from_request_line,
+        default_agent_author_name, default_loopback_redirect_uri, generate_url_safe_random_bytes,
+        join_scopes, microsoft_client_id_from_env, parse_authorization_callback,
+        validate_oauth_config, AccountRecord, AccountsRepository, MicrosoftOAuthClient,
+        MicrosoftOAuthConfig,
     };
 
     fn unique_test_root() -> PathBuf {
@@ -849,7 +861,7 @@ mod tests {
     #[test]
     fn builds_authorization_url_with_expected_query_parameters() {
         let url = build_authorization_url(
-            "https://login.live.com/oauth20_authorize.srf",
+            "https://login.microsoftonline.com/consumers/oauth2/v2.0/authorize",
             &sample_config(),
             "state123",
             "challenge456",
@@ -903,8 +915,25 @@ mod tests {
         );
         assert_eq!(
             default_loopback_redirect_uri(43821),
-            "http://127.0.0.1:43821/callback"
+            "http://localhost:43821/callback"
         );
+    }
+
+    #[test]
+    fn builds_callback_url_from_loopback_request_line() {
+        let callback_url = callback_url_from_request_line(
+            "GET /callback?code=abc123&state=state123 HTTP/1.1",
+            43821,
+        )
+        .expect("callback url should be reconstructed");
+
+        assert_eq!(
+            callback_url,
+            "http://localhost:43821/callback?code=abc123&state=state123"
+        );
+        assert!(callback_url_from_request_line("GET /favicon.ico HTTP/1.1", 43821).is_none());
+        assert!(callback_url_from_request_line("GET /callbackevil HTTP/1.1", 43821).is_none());
+        assert!(callback_url_from_request_line("POST /callback HTTP/1.1", 43821).is_none());
     }
 
     #[test]

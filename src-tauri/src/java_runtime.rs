@@ -182,20 +182,17 @@ pub fn select_java_for_requirement(
     installations: &[JavaInstallation],
     required_version: u32,
 ) -> Option<JavaInstallation> {
-    // Prefer exact match, but accept any version >= required (Java is backward compatible).
-    // Among compatible versions, prefer the closest to the required version.
+    // Old Minecraft/Forge stacks are not reliably compatible with newer Java
+    // class libraries, even when Minecraft's manifest only states a minimum.
+    // Prefer a predictable exact runtime and let the launcher download it when
+    // it is missing.
     installations
         .iter()
-        .filter(|installation| installation.version >= required_version)
+        .filter(|installation| installation.version == required_version)
         .cloned()
         .min_by(|left, right| {
-            // Prefer exact match over higher versions.
-            let left_exact = left.version == required_version;
-            let right_exact = right.version == required_version;
-            right_exact
-                .cmp(&left_exact)
-                .then(left.version.cmp(&right.version))
-                .then(left.source.cmp(&right.source))
+            left.source
+                .cmp(&right.source)
                 .then(left.path.cmp(&right.path))
         })
 }
@@ -583,6 +580,21 @@ mod tests {
             select_java_for_requirement(&installations, 22).expect("Java 22 should be selected");
 
         assert_eq!(selected.version, 22);
+    }
+
+    #[test]
+    fn explicit_java_requirement_does_not_select_newer_runtime() {
+        let installations = vec![JavaInstallation {
+            path: PathBuf::from("C:/Java/jdk-21/bin/java.exe"),
+            version: 21,
+            auto_detected: true,
+            architecture: "x64".into(),
+            source: JavaInstallationSource::SystemPath,
+        }];
+
+        let selected = select_java_for_requirement(&installations, 17);
+
+        assert!(selected.is_none());
     }
 
     #[test]

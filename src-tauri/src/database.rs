@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS mod_cache (
     file_hash           TEXT,
     download_url        TEXT,
     is_local            BOOLEAN DEFAULT FALSE,
-    PRIMARY KEY (modrinth_version_id)
+    PRIMARY KEY (modrinth_version_id, mc_version, mod_loader)
 );
 
 CREATE TABLE IF NOT EXISTS modrinth_project_aliases (
@@ -90,6 +90,7 @@ pub fn initialize_database(database_path: &Path) -> Result<()> {
     let connection = Connection::open(database_path)?;
     connection.execute_batch(SCHEMA_SQL)?;
     migrate_mod_cache_schema(&connection)?;
+    migrate_mod_cache_target_key(&connection)?;
 
     Ok(())
 }
@@ -130,10 +131,77 @@ fn migrate_mod_cache_schema(connection: &Connection) -> Result<()> {
             file_hash           TEXT,
             download_url        TEXT,
             is_local            BOOLEAN DEFAULT FALSE,
-            PRIMARY KEY (modrinth_version_id)
+            PRIMARY KEY (modrinth_version_id, mc_version, mod_loader)
         );
 
         INSERT INTO mod_cache (
+            modrinth_project_id,
+            modrinth_version_id,
+            jar_filename,
+            mc_version,
+            mod_loader,
+            file_hash,
+            download_url,
+            is_local
+        )
+        SELECT
+            modrinth_project_id,
+            modrinth_version_id,
+            jar_filename,
+            mc_version,
+            mod_loader,
+            file_hash,
+            download_url,
+            is_local
+        FROM mod_cache_old;
+
+        DROP TABLE mod_cache_old;
+        "#,
+    )?;
+    transaction.commit()?;
+
+    Ok(())
+}
+
+fn migrate_mod_cache_target_key(connection: &Connection) -> Result<()> {
+    let table_sql: Option<String> = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'mod_cache'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+
+    let Some(table_sql) = table_sql else {
+        return Ok(());
+    };
+
+    let normalized = table_sql
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if normalized.contains("primary key (modrinth_version_id, mc_version, mod_loader)") {
+        return Ok(());
+    }
+
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute("ALTER TABLE mod_cache RENAME TO mod_cache_old", [])?;
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE mod_cache (
+            modrinth_project_id TEXT,
+            modrinth_version_id TEXT,
+            jar_filename        TEXT NOT NULL,
+            mc_version          TEXT NOT NULL,
+            mod_loader          TEXT NOT NULL,
+            file_hash           TEXT,
+            download_url        TEXT,
+            is_local            BOOLEAN DEFAULT FALSE,
+            PRIMARY KEY (modrinth_version_id, mc_version, mod_loader)
+        );
+
+        INSERT OR REPLACE INTO mod_cache (
             modrinth_project_id,
             modrinth_version_id,
             jar_filename,

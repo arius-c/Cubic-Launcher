@@ -14,6 +14,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
+use sha1::{Digest, Sha1};
+use tokio::io::AsyncWriteExt;
 
 use crate::dependencies::{DependencyLink, DependencyRequest, DependencySelector};
 use crate::instance_mods::CachedModJar;
@@ -83,6 +85,7 @@ pub(super) fn load_cached_mod_record_for_target(
 pub(super) fn load_cached_mod_record_by_version(
     launcher_paths: &LauncherPaths,
     version_id: &str,
+    target: &ResolutionTarget,
 ) -> Result<Option<ModCacheRecord>> {
     let connection = Connection::open(launcher_paths.database_path()).with_context(|| {
         format!(
@@ -91,7 +94,7 @@ pub(super) fn load_cached_mod_record_by_version(
         )
     })?;
     let repository = SqliteModCacheRepository::new(&connection, launcher_paths.mods_cache_dir());
-    repository.find_by_version_id(version_id)
+    repository.find_by_version_id(version_id, target)
 }
 
 pub(super) fn load_cached_dependency_requests(
@@ -175,7 +178,7 @@ pub(super) fn build_remote_acquisition_plan_from_artifacts(
             continue;
         }
 
-        match repository.find_by_version_id(&version.id)? {
+        match repository.find_by_version_id(&version.id, target)? {
             Some(record) => cached.push(record),
             None => to_download.push(pending_download_from_version(version, target)?),
         }
@@ -214,26 +217,23 @@ pub(super) async fn download_pending_artifacts(
         return Ok(());
     }
 
+    let total_bytes: u64 = artifacts.iter().map(|artifact| artifact.file_size).sum();
     let semaphore = Arc::new(tokio::sync::Semaphore::new(10));
     let mut tasks: tokio::task::JoinSet<Result<DownloadArtifact>> = tokio::task::JoinSet::new();
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
 
     for artifact in artifacts {
         let artifact = artifact.clone();
         let http_client = http_client.clone();
         let permit_source = semaphore.clone();
+        let progress_tx = progress_tx.clone();
         tasks.spawn(async move {
             // Permit is held through the await so concurrency stays bounded.
             let _permit = permit_source
                 .acquire_owned()
                 .await
                 .map_err(|error| anyhow::anyhow!("failed to acquire download permit: {error}"))?;
-            match &artifact.file_hash {
-                Some(hash) => crate::minecraft_downloader::download_file_verified(
-                    &http_client,
-                    &artifact.url,
-                    &artifact.destination_path,
-                    hash,
-                )
+            download_artifact_streaming(&http_client, &artifact, progress_tx)
                 .await
                 .with_context(|| {
                     format!(
@@ -241,52 +241,181 @@ pub(super) async fn download_pending_artifacts(
                         artifact.url,
                         artifact.destination_path.display()
                     )
-                })?,
-                None => download_file(&http_client, &artifact.url, &artifact.destination_path)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "failed to download '{}' to {}",
-                            artifact.url,
-                            artifact.destination_path.display()
-                        )
-                    })?,
-            }
+                })?;
             Ok(artifact)
         });
     }
+    drop(progress_tx);
 
     let mut completed: usize = 0;
-    while let Some(join_result) = tasks.join_next().await {
-        let artifact =
-            join_result.map_err(|error| anyhow::anyhow!("download task panicked: {error}"))??;
-        completed += 1;
+    let mut downloaded_bytes: u64 = 0;
+    let mut last_progress = 41u8;
+    while completed < total {
+        tokio::select! {
+            Some(delta) = progress_rx.recv() => {
+                downloaded_bytes = downloaded_bytes.saturating_add(delta);
+                if total_bytes > 0 {
+                    let progress = 42u8
+                        + ((16u64 * downloaded_bytes.min(total_bytes)) / total_bytes) as u8;
+                    if progress > last_progress {
+                        last_progress = progress;
+                        emit_progress(
+                            app_handle,
+                            "resolving",
+                            progress,
+                            "Downloading Mods",
+                            &format!(
+                                "Downloaded {} of {} ({completed} of {total} mods).",
+                                format_bytes(downloaded_bytes.min(total_bytes)),
+                                format_bytes(total_bytes),
+                            ),
+                        )?;
+                    }
+                }
+            }
+            Some(join_result) = tasks.join_next() => {
+                let artifact =
+                    join_result.map_err(|error| anyhow::anyhow!("download task panicked: {error}"))??;
+                completed += 1;
+                while let Ok(delta) = progress_rx.try_recv() {
+                    downloaded_bytes = downloaded_bytes.saturating_add(delta);
+                }
 
-        let progress = 42u8 + ((16usize * completed) / total) as u8;
-        emit_progress(
-            app_handle,
-            "resolving",
-            progress,
-            "Downloading Mods",
-            &format!("Downloaded {completed} of {total} mods."),
-        )?;
+                if total_bytes == 0 {
+                    let progress = 42u8 + ((16usize * completed) / total) as u8;
+                    emit_progress(
+                        app_handle,
+                        "resolving",
+                        progress,
+                        "Downloading Mods",
+                        &format!("Downloaded {completed} of {total} mods."),
+                    )?;
+                } else {
+                    emit_progress(
+                        app_handle,
+                        "resolving",
+                        last_progress.max(42),
+                        "Downloading Mods",
+                        &format!(
+                            "Downloaded {} of {} ({completed} of {total} mods).",
+                            format_bytes(downloaded_bytes.min(total_bytes)),
+                            format_bytes(total_bytes),
+                        ),
+                    )?;
+                }
 
-        emit_log(
-            app_handle,
-            ProcessLogStream::Stdout,
-            format!(
-                "[Download] Saved {} to {}",
-                artifact.filename,
-                artifact
-                    .destination_path
-                    .strip_prefix(default_directory)
-                    .unwrap_or(&artifact.destination_path)
-                    .display()
-            ),
-        )?;
+                emit_log(
+                    app_handle,
+                    ProcessLogStream::Stdout,
+                    format!(
+                        "[Download] Saved {} to {}",
+                        artifact.filename,
+                        artifact
+                            .destination_path
+                            .strip_prefix(default_directory)
+                            .unwrap_or(&artifact.destination_path)
+                            .display()
+                    ),
+                )?;
+            }
+            else => break,
+        }
     }
 
     Ok(())
+}
+
+async fn download_artifact_streaming(
+    http_client: &reqwest::Client,
+    artifact: &DownloadArtifact,
+    progress_tx: tokio::sync::mpsc::UnboundedSender<u64>,
+) -> Result<()> {
+    if let Some(parent) = artifact.destination_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    let response = http_client
+        .get(&artifact.url)
+        .send()
+        .await
+        .with_context(|| format!("failed to request {}", artifact.url))?
+        .error_for_status()
+        .with_context(|| format!("download request failed for {}", artifact.url))?;
+
+    let temp_path = artifact.destination_path.with_file_name(format!(
+        "{}.part",
+        artifact
+            .destination_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("download")
+    ));
+    let mut file = tokio::fs::File::create(&temp_path)
+        .await
+        .with_context(|| format!("failed to create {}", temp_path.display()))?;
+    let mut hasher = artifact.file_hash.as_ref().map(|_| Sha1::new());
+
+    let mut response = response;
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .with_context(|| format!("failed to read downloaded bytes from {}", artifact.url))?
+    {
+        file.write_all(&chunk)
+            .await
+            .with_context(|| format!("failed to write {}", temp_path.display()))?;
+        if let Some(hasher) = hasher.as_mut() {
+            hasher.update(&chunk);
+        }
+        let _ = progress_tx.send(chunk.len() as u64);
+    }
+    file.flush()
+        .await
+        .with_context(|| format!("failed to flush {}", temp_path.display()))?;
+    drop(file);
+
+    if let (Some(expected), Some(hasher)) = (&artifact.file_hash, hasher) {
+        let actual = format!("{:x}", hasher.finalize());
+        if !actual.eq_ignore_ascii_case(expected) {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            anyhow::bail!(
+                "SHA1 mismatch for {}: expected {}, got {}",
+                artifact.filename,
+                expected,
+                actual
+            );
+        }
+    }
+
+    tokio::fs::rename(&temp_path, &artifact.destination_path)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to move {} to {}",
+                temp_path.display(),
+                artifact.destination_path.display()
+            )
+        })?;
+
+    Ok(())
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let bytes = bytes as f64;
+    if bytes >= GIB {
+        format!("{:.1} GB", bytes / GIB)
+    } else if bytes >= MIB {
+        format!("{:.1} MB", bytes / MIB)
+    } else if bytes >= KIB {
+        format!("{:.1} KB", bytes / KIB)
+    } else {
+        format!("{} B", bytes as u64)
+    }
 }
 
 pub(super) async fn download_file(

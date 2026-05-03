@@ -14,7 +14,8 @@ import {
   removeFunctionalGroupMember,
   tagFilter, functionalGroups, tagFilterForcedExpanded,
   linksByModId, removeLink, cycleLinkDirection, removeIncompatibility,
-  setAdvancedPanelModId, selectedCount, resolvedModIds, onToggleEnabled,
+  setAdvancedPanelModId, selectedCount, resolvedModIds, resolvedTarget,
+  selectedModListName, selectedMcVersion, selectedModLoader, onToggleEnabled,
 } from "../store";
 import {
   ChevronRightIcon, AlertTriangleIcon, PackageIcon, XIcon, MaterialIcon,
@@ -45,6 +46,15 @@ export function ModRuleItem(props: ModRuleItemProps) {
   const containingGroup = () =>
     aestheticGroups().find(group => group.blockIds.includes(props.row.id)) ?? null;
   const isResolved = () => {
+    const target = resolvedTarget();
+    if (
+      target === null ||
+      target.modlistName !== selectedModListName() ||
+      target.mcVersion !== selectedMcVersion() ||
+      target.modLoader !== selectedModLoader()
+    ) {
+      return null;
+    }
     const ids = resolvedModIds();
     if (ids === null) return null; // resolution not yet run
     return ids.has(props.row.primaryModId ?? props.row.id);
@@ -144,7 +154,7 @@ export function ModRuleItem(props: ModRuleItemProps) {
           <div class="flex flex-wrap items-center gap-1.5">
             <span class={`truncate font-medium ${
               !props.row.enabled ? "text-muted-foreground line-through opacity-50" :
-              isResolved() === true ? "text-green-400" : isResolved() === false ? "text-red-400" : "text-foreground"
+              isResolved() === true ? "text-green-400" : isResolved() === false ? "text-red-400" : "text-muted-foreground"
             }`}>{props.row.name}</span>
 
             {/* Source badge */}

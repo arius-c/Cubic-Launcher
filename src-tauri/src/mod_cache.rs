@@ -9,10 +9,12 @@ use sha1::{Digest, Sha1};
 
 // Mod artifact cache and lookup helpers.
 //
-// Cache records are keyed by canonical Modrinth project/version ids, while
-// user rules can be stored as Modrinth slugs. The project alias table bridges
-// those identifiers so cache-only launch can reuse the same artifacts selected
-// by an online launch.
+// Cache records are keyed by canonical Modrinth project/version ids plus the
+// target Minecraft version and loader. The target is part of the key because
+// the same Modrinth version id can be reused across loaders while requiring a
+// different on-disk cache path. User rules can still be stored as Modrinth
+// slugs; the project alias table bridges those identifiers for cache-only
+// launch.
 use crate::modrinth::ModrinthVersion;
 use crate::resolver::ResolutionTarget;
 
@@ -37,6 +39,7 @@ pub struct PendingDownload {
     pub mod_loader: String,
     pub file_hash: Option<String>,
     pub download_url: String,
+    pub file_size: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,7 +101,11 @@ pub fn cached_artifact_path_for_pending_download(
 }
 
 pub trait ModCacheLookup {
-    fn find_by_version_id(&self, version_id: &str) -> Result<Option<ModCacheRecord>>;
+    fn find_by_version_id(
+        &self,
+        version_id: &str,
+        target: &ResolutionTarget,
+    ) -> Result<Option<ModCacheRecord>>;
 }
 
 pub struct SqliteModCacheRepository<'connection> {
@@ -133,11 +140,9 @@ impl<'connection> SqliteModCacheRepository<'connection> {
                 download_url,
                 is_local
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-            ON CONFLICT(modrinth_version_id) DO UPDATE SET
+            ON CONFLICT(modrinth_version_id, mc_version, mod_loader) DO UPDATE SET
                 modrinth_project_id = excluded.modrinth_project_id,
                 jar_filename = excluded.jar_filename,
-                mc_version = excluded.mc_version,
-                mod_loader = excluded.mod_loader,
                 file_hash = excluded.file_hash,
                 download_url = excluded.download_url,
                 is_local = excluded.is_local
@@ -269,7 +274,11 @@ impl<'connection> SqliteModCacheRepository<'connection> {
 }
 
 impl ModCacheLookup for SqliteModCacheRepository<'_> {
-    fn find_by_version_id(&self, version_id: &str) -> Result<Option<ModCacheRecord>> {
+    fn find_by_version_id(
+        &self,
+        version_id: &str,
+        target: &ResolutionTarget,
+    ) -> Result<Option<ModCacheRecord>> {
         let mut statement = self.connection.prepare(
             r#"
             SELECT
@@ -283,22 +292,31 @@ impl ModCacheLookup for SqliteModCacheRepository<'_> {
                 is_local
             FROM mod_cache
             WHERE modrinth_version_id = ?1
+              AND mc_version = ?2
+              AND mod_loader = ?3
             "#,
         )?;
 
         let record = statement
-            .query_row([version_id], |row| {
-                Ok(ModCacheRecord {
-                    modrinth_project_id: row.get(0)?,
-                    modrinth_version_id: row.get(1)?,
-                    jar_filename: row.get(2)?,
-                    mc_version: row.get(3)?,
-                    mod_loader: row.get(4)?,
-                    file_hash: row.get(5)?,
-                    download_url: row.get(6)?,
-                    is_local: row.get(7)?,
-                })
-            })
+            .query_row(
+                params![
+                    version_id,
+                    &target.minecraft_version,
+                    target.mod_loader.as_modrinth_loader(),
+                ],
+                |row| {
+                    Ok(ModCacheRecord {
+                        modrinth_project_id: row.get(0)?,
+                        modrinth_version_id: row.get(1)?,
+                        jar_filename: row.get(2)?,
+                        mc_version: row.get(3)?,
+                        mod_loader: row.get(4)?,
+                        file_hash: row.get(5)?,
+                        download_url: row.get(6)?,
+                        is_local: row.get(7)?,
+                    })
+                },
+            )
             .optional()?;
 
         match record {
@@ -409,7 +427,7 @@ pub fn build_mod_acquisition_plan(
             continue;
         }
 
-        match cache_lookup.find_by_version_id(&version.id)? {
+        match cache_lookup.find_by_version_id(&version.id, target)? {
             Some(record) => cached.push(record),
             None => to_download.push(pending_download_from_version(version, target)?),
         }
@@ -463,6 +481,7 @@ pub fn pending_download_from_version(
         mod_loader: target.mod_loader.as_modrinth_loader().to_string(),
         file_hash: primary_file.hashes.get("sha1").cloned(),
         download_url: primary_file.url.clone(),
+        file_size: primary_file.size,
     })
 }
 
@@ -533,7 +552,11 @@ mod tests {
     }
 
     impl ModCacheLookup for InMemoryLookup {
-        fn find_by_version_id(&self, version_id: &str) -> Result<Option<super::ModCacheRecord>> {
+        fn find_by_version_id(
+            &self,
+            version_id: &str,
+            _target: &ResolutionTarget,
+        ) -> Result<Option<super::ModCacheRecord>> {
             Ok(self
                 .records
                 .iter()
@@ -576,7 +599,7 @@ mod tests {
             .expect("cache record should insert");
 
         assert!(repository
-            .find_by_version_id("version-1")
+            .find_by_version_id("version-1", &target())
             .expect("lookup should succeed")
             .is_none());
 
@@ -591,7 +614,7 @@ mod tests {
         fs::write(&artifact_path, b"jar").expect("jar should be written");
 
         let record = repository
-            .find_by_version_id("version-1")
+            .find_by_version_id("version-1", &target())
             .expect("lookup should succeed")
             .expect("record should exist once file exists");
 
@@ -719,7 +742,7 @@ mod tests {
         fs::write(&legacy_path, legacy_bytes).expect("legacy file should be written for migration");
 
         let migrated = repository
-            .find_by_version_id("version-1")
+            .find_by_version_id("version-1", &target())
             .expect("lookup should succeed")
             .expect("record should be returned after migration");
 

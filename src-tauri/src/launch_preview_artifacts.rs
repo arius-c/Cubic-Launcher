@@ -9,7 +9,10 @@ use crate::launcher_paths::LauncherPaths;
 use crate::mod_cache::ModCacheRecord;
 use crate::modrinth::{ModrinthClient, ModrinthVersion};
 use crate::process_streaming::ProcessLogStream;
-use crate::resolver::{FailureReason, ModLoader, ResolutionResult, ResolutionTarget, RuleOutcome};
+use crate::resolver::{
+    version_rules_conflict, FailureReason, ModLoader, ResolutionResult, ResolutionTarget,
+    RuleOutcome,
+};
 use crate::rules::{ModList, ModSource, Rule, RULES_FILENAME};
 
 use super::{
@@ -35,11 +38,12 @@ pub(super) struct DownloadArtifact {
     pub(super) url: String,
     pub(super) destination_path: PathBuf,
     pub(super) file_hash: Option<String>,
+    pub(super) file_size: u64,
 }
 
 /// Extracts the artifact name from a jar filename by stripping the version suffix.
 /// e.g. "asm-9.6.jar" → "asm", "fabric-loader-0.16.jar" → "fabric-loader"
-pub(super) fn extract_artifact_name(filename: &str) -> String {
+pub(in crate::launch_preview) fn extract_artifact_name(filename: &str) -> String {
     let stem = filename.strip_suffix(".jar").unwrap_or(filename);
     // Find the last '-' followed by a digit — everything before it is the artifact name
     if let Some(pos) = stem.rfind(|c: char| c == '-').and_then(|i| {
@@ -58,10 +62,10 @@ pub(super) fn extract_artifact_name(filename: &str) -> String {
 pub(super) fn parse_mod_loader(value: &str) -> Result<ModLoader> {
     match value.trim().to_ascii_lowercase().as_str() {
         "fabric" => Ok(ModLoader::Fabric),
-        "quilt" => Ok(ModLoader::Quilt),
         "forge" => Ok(ModLoader::Forge),
         "neoforge" => Ok(ModLoader::NeoForge),
         "vanilla" => Ok(ModLoader::Vanilla),
+        "quilt" => bail!("Quilt is no longer supported by Cubic Launcher"),
         other => bail!("unsupported mod loader '{other}'"),
     }
 }
@@ -361,7 +365,6 @@ pub(super) fn alt_viable_for_launch(
     active_mods: &HashSet<String>,
     target: &ResolutionTarget,
 ) -> bool {
-    use crate::rules::VersionRuleKind;
     if !rule.enabled {
         return false;
     }
@@ -371,28 +374,7 @@ pub(super) fn alt_viable_for_launch(
     if rule.requires.iter().any(|id| !active_mods.contains(id)) {
         return false;
     }
-    for vr in &rule.version_rules {
-        let version_matches = vr
-            .mc_versions
-            .iter()
-            .any(|v| crate::modrinth::mc_version_matches(v, &target.minecraft_version));
-        let vr_loader = vr.loader.to_ascii_lowercase();
-        let loader_matches =
-            vr_loader == "any" || vr_loader == target.mod_loader.as_modrinth_loader();
-        match vr.kind {
-            VersionRuleKind::Only => {
-                if !(version_matches && loader_matches) {
-                    return false;
-                }
-            }
-            VersionRuleKind::Exclude => {
-                if version_matches && loader_matches {
-                    return false;
-                }
-            }
-        }
-    }
-    true
+    !version_rules_conflict(&rule.version_rules, target)
 }
 
 pub(super) fn collect_resolved_parent_versions(

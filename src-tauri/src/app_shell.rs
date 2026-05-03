@@ -10,7 +10,7 @@ use tauri::State;
 use crate::account_manager::{AccountManager, ManagedAccountProfile, ManagedAccountTokens};
 use crate::launcher_paths::LauncherPaths;
 use crate::microsoft_auth::{
-    microsoft_client_id_from_env, run_microsoft_login, AccountsRepository,
+    configured_microsoft_client_id, run_microsoft_login, AccountsRepository,
 };
 use crate::rules::{ModList, RULES_FILENAME};
 use crate::token_storage::KeyringSecretStore;
@@ -122,13 +122,19 @@ pub fn switch_active_account_command(
 pub async fn microsoft_login_command(
     launcher_paths: State<'_, LauncherPaths>,
 ) -> Result<String, String> {
-    // Use the official Minecraft launcher client ID by default.
-    // Can be overridden via .env file with MICROSOFT_CLIENT_ID=your-id.
-    const DEFAULT_CLIENT_ID: &str = "00000000402b5328";
     let env_path = launcher_paths.root_dir().join(".env");
-    let client_id = microsoft_client_id_from_env(&env_path)
+    let client_id = configured_microsoft_client_id(&env_path)
         .map_err(|e| e.to_string())?
-        .unwrap_or_else(|| DEFAULT_CLIENT_ID.to_string());
+        .ok_or_else(|| {
+            [
+                "Microsoft login is not configured.",
+                "Set MICROSOFT_CLIENT_ID in the launcher .env file, process environment,",
+                "or build environment to a public Microsoft Entra app registration",
+                "that allows personal Microsoft accounts and redirects to",
+                "http://localhost/callback.",
+            ]
+            .join(" ")
+        })?;
 
     let db_path = launcher_paths.database_path().to_path_buf();
 

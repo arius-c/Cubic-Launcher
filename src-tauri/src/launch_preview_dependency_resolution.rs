@@ -285,7 +285,8 @@ pub(super) async fn resolve_dependency_requests_with_cache_fallback(
                 }
             }
             DependencySelector::VersionId { version_id } => {
-                if let Some(record) = load_cached_mod_record_by_version(launcher_paths, version_id)?
+                if let Some(record) =
+                    load_cached_mod_record_by_version(launcher_paths, version_id, target)?
                 {
                     DependencyResolutionCandidate {
                         parent_mod_id: request.parent_mod_id.clone(),

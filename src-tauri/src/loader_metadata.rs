@@ -63,6 +63,7 @@ impl LoaderMetadataClient {
                 // MinecraftVersionData inside launch_preview after MC download.
                 main_class: String::new(),
                 libraries: vec![],
+                maven_files: vec![],
                 jvm_arguments: vec![],
                 game_arguments: vec![],
                 min_java_version: None,
@@ -320,6 +321,7 @@ pub struct LoaderMetadata {
     pub loader_version: String,
     pub main_class: String,
     pub libraries: Vec<LoaderLibrary>,
+    pub maven_files: Vec<LoaderLibrary>,
     pub jvm_arguments: Vec<String>,
     pub game_arguments: Vec<String>,
     pub min_java_version: Option<u32>,
@@ -456,6 +458,8 @@ pub struct PrismPackageVersionDetail {
     pub main_class: String,
     #[serde(default)]
     pub libraries: Vec<PrismLibrary>,
+    #[serde(rename = "mavenFiles", default)]
+    pub maven_files: Vec<PrismLibrary>,
     #[serde(rename = "minecraftArguments")]
     pub minecraft_arguments: Option<String>,
 }
@@ -621,6 +625,7 @@ fn loader_metadata_from_profile(
                 }),
             })
             .collect(),
+        maven_files: Vec::new(),
         jvm_arguments: arguments.jvm,
         game_arguments: arguments.game,
         min_java_version: None,
@@ -640,6 +645,22 @@ fn loader_metadata_from_prism(
         main_class: detail.main_class,
         libraries: detail
             .libraries
+            .into_iter()
+            .map(|library| LoaderLibrary {
+                name: library.name,
+                url: library.url,
+                download: library.downloads.and_then(|downloads| {
+                    downloads.artifact.map(|artifact| LibraryDownloadArtifact {
+                        url: artifact.url,
+                        path: artifact.path,
+                        sha1: artifact.sha1,
+                        size: artifact.size,
+                    })
+                }),
+            })
+            .collect(),
+        maven_files: detail
+            .maven_files
             .into_iter()
             .map(|library| LoaderLibrary {
                 name: library.name,
@@ -741,6 +762,19 @@ mod tests {
                   "path": "net/minecraftforge/forge/1.21.1-52.1.10/forge-1.21.1-52.1.10-universal.jar",
                   "sha1": "37e26f1dcd6c75537d9529145ce47c096ac08ed8",
                   "size": 2961514
+                }
+              }
+            }
+          ],
+          "mavenFiles": [
+            {
+              "name": "net.neoforged.installertools:installertools:4.0.6:fatjar",
+              "downloads": {
+                "artifact": {
+                  "url": "https://maven.neoforged.net/releases/net/neoforged/installertools/installertools/4.0.6/installertools-4.0.6-fatjar.jar",
+                  "path": "net/neoforged/installertools/installertools/4.0.6/installertools-4.0.6-fatjar.jar",
+                  "sha1": "17b145cf3a1816153d067316eeee9dc89bfd9bb2",
+                  "size": 770782
                 }
               }
             }
@@ -849,6 +883,11 @@ mod tests {
         );
         assert_eq!(metadata.loader_version, "52.1.10");
         assert_eq!(metadata.libraries.len(), 1);
+        assert_eq!(metadata.maven_files.len(), 1);
+        assert_eq!(
+            metadata.maven_files[0].name,
+            "net.neoforged.installertools:installertools:4.0.6:fatjar"
+        );
         assert!(metadata
             .game_arguments
             .contains(&"--launchTarget".to_string()));

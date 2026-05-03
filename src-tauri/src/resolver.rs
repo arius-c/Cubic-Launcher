@@ -251,12 +251,16 @@ fn try_alternatives(
 }
 
 /// Returns true if the version rules exclude this mod for the given target.
-fn version_rules_conflict(version_rules: &[VersionRule], target: &ResolutionTarget) -> bool {
+pub(crate) fn version_rules_conflict(
+    version_rules: &[VersionRule],
+    target: &ResolutionTarget,
+) -> bool {
     for vr in version_rules {
-        let version_matches = vr
-            .mc_versions
-            .iter()
-            .any(|v| crate::modrinth::mc_version_matches(v, &target.minecraft_version));
+        let version_matches = vr.mc_versions.is_empty()
+            || vr
+                .mc_versions
+                .iter()
+                .any(|v| crate::modrinth::mc_version_matches(v, &target.minecraft_version));
         let vr_loader = vr.loader.to_ascii_lowercase();
         let loader_matches =
             vr_loader == "any" || vr_loader == target.mod_loader.as_modrinth_loader();
@@ -304,10 +308,10 @@ fn find_rule_by_id<'a>(rule: &'a Rule, mod_id: &str) -> Option<&'a Rule> {
 fn parse_mod_loader(value: &str) -> Result<ModLoader> {
     match value.trim().to_ascii_lowercase().as_str() {
         "fabric" => Ok(ModLoader::Fabric),
-        "quilt" => Ok(ModLoader::Quilt),
         "forge" => Ok(ModLoader::Forge),
         "neoforge" => Ok(ModLoader::NeoForge),
         "vanilla" => Ok(ModLoader::Vanilla),
+        "quilt" => bail!("Quilt is no longer supported by Cubic Launcher"),
         other => bail!("unsupported mod loader '{other}'"),
     }
 }
@@ -331,6 +335,10 @@ pub async fn resolve_modlist_command(
         minecraft_version: mc_version,
         mod_loader: parse_mod_loader(&mod_loader).map_err(|e| e.to_string())?,
     };
+
+    if target.mod_loader == ModLoader::Vanilla {
+        return Ok(Vec::new());
+    }
 
     let result = resolve_modlist(&modlist, &target).map_err(|e| e.to_string())?;
 
@@ -494,6 +502,10 @@ pub async fn backfill_availability_command(
 
     let modlist = ModList::read_from_file(&rules_path).map_err(|e| e.to_string())?;
 
+    if parse_mod_loader(&mod_loader).map_err(|e| e.to_string())? == ModLoader::Vanilla {
+        return Ok(());
+    }
+
     let mut all_modrinth_ids: Vec<String> = Vec::new();
     fn collect_modrinth_ids(rules: &[Rule], out: &mut Vec<String>) {
         for rule in rules {
@@ -529,10 +541,9 @@ pub async fn backfill_availability_command(
         return Ok(());
     }
 
-    let loader = parse_mod_loader(&mod_loader).map_err(|e| e.to_string())?;
     let target = ResolutionTarget {
         minecraft_version: mc_version.clone(),
-        mod_loader: loader,
+        mod_loader: parse_mod_loader(&mod_loader).map_err(|e| e.to_string())?,
     };
 
     let client = ModrinthClient::new();
@@ -804,6 +815,32 @@ mod tests {
 
         let result = resolve_modlist(&ml, &target()).unwrap();
         assert!(!result.active_mods.contains("sodium"));
+    }
+
+    #[test]
+    fn version_rule_exclude_with_any_version() {
+        let mut rule = simple_rule("sodium");
+        rule.version_rules = vec![VersionRule {
+            kind: VersionRuleKind::Exclude,
+            mc_versions: vec![],
+            loader: "fabric".into(),
+        }];
+
+        let result = resolve_modlist(&modlist(vec![rule]), &target()).unwrap();
+        assert!(!result.active_mods.contains("sodium"));
+    }
+
+    #[test]
+    fn version_rule_only_with_any_version_matches_loader() {
+        let mut rule = simple_rule("sodium");
+        rule.version_rules = vec![VersionRule {
+            kind: VersionRuleKind::Only,
+            mc_versions: vec![],
+            loader: "fabric".into(),
+        }];
+
+        let result = resolve_modlist(&modlist(vec![rule]), &target()).unwrap();
+        assert!(result.active_mods.contains("sodium"));
     }
 
     #[test]
